@@ -116,14 +116,17 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
 
     Uses the explicit ``offload_backend`` selector.  When set to ``"auto"``,
     selects prefetch if ``offload_group_size > 0``, UVA if
-    ``cpu_offload_gb > 0``, otherwise noop.
+    ``cpu_offload_gb > 0``, otherwise noop. ``"cots"`` is never auto-selected
+    and must be requested explicitly.
     """
+    from vllm.model_executor.offloader.cots import CotsOffloader
     from vllm.model_executor.offloader.prefetch import PrefetchOffloader
     from vllm.model_executor.offloader.uva import UVAOffloader
 
     backend = offload_config.offload_backend
     uva = offload_config.uva
     prefetch = offload_config.prefetch
+    cots = offload_config.cots
 
     if backend == "auto":
         if prefetch.offload_group_size > 0:
@@ -146,5 +149,7 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
             cpu_offload_max_bytes=int(uva.cpu_offload_gb * 1024**3),
             cpu_offload_params=uva.cpu_offload_params,
         )
+    elif backend == "cots":
+        return CotsOffloader(config=cots)
     else:
         return NoopOffloader()

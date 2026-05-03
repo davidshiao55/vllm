@@ -30,7 +30,7 @@ class OffloadingConnectorStats(KVConnectorStats):
             self.reset()
 
     def reset(self):
-        self.data: dict[str, list[OffloadingOperationMetrics]] = {}
+        self.data: dict[str, list[dict]] = {}
 
     def aggregate(self, other: KVConnectorStats) -> KVConnectorStats:
         if not other.is_empty():
@@ -69,7 +69,10 @@ class OffloadingConnectorStats(KVConnectorStats):
     def record_transfer(self, num_bytes: int, time: float, transfer_type: TransferType):
         src, dst = transfer_type
         transfer_type_key = src + "_to_" + dst
-        op = OffloadingOperationMetrics(num_bytes, time)
+        # Store as dict: reduce()/observe() assume serialized form. In
+        # single-process mode no IPC serialization happens, so write dict
+        # directly.
+        op = {"op_size": num_bytes, "op_time": time}
         if transfer_type_key in self.data:
             self.data[transfer_type_key].append(op)
         else:

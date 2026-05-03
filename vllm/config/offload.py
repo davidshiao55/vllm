@@ -9,7 +9,7 @@ from pydantic import Field, model_validator
 
 from vllm.config.utils import config
 
-OffloadBackend = Literal["auto", "uva", "prefetch"]
+OffloadBackend = Literal["auto", "uva", "prefetch", "cots"]
 
 
 @config
@@ -77,6 +77,54 @@ class PrefetchOffloadConfig:
 
 
 @config
+class CotsOffloadConfig:
+    """Configuration for COTS collaborative CPU-GPU offloading (thesis backend).
+
+    Splits each WQKV / MLP1 / MLP2 weight along its tensor-parallel-native axis
+    so a fraction `f_cpu_store` of the bytes lives in pinned CPU memory and is
+    GEMM'd on the CPU each forward pass, in parallel with the GPU's compute on
+    the GPU-resident slice. Activation returns from CPU use an SM-issued UVA
+    copy kernel that bypasses the H2D copy engine. WO (`o_proj`) is NOT
+    offloaded in Phase 1/2.
+
+    See `David/Docs/implementation_roadmap.md` and `David/Docs/phase0_findings.md`
+    for the full design and the empirical numbers that justify it.
+    """
+
+    f_cpu_store: float = Field(default=0.0, ge=0.0, le=1.0)
+    """Fraction of WQKV / MLP1 / MLP2 weight bytes resident on CPU. Single
+    uniform scalar applied to all three sub-modules (matched-index invariant
+    between MLP1 col-parallel and MLP2 row-parallel is automatic under uniform
+    dispatch). Phase 1a default 0.0 means no offload. Typical thesis value at
+    7B B=1 decode is ~0.09 ("free" regime per phase0 §0.3.3)."""
+
+    kv_biased: bool = Field(default=True)
+    """If True, the WQKV column picker is biased toward K/V: K+V column groups
+    are assigned to CPU before any Q columns. Preserves the suffix-cache layout
+    and minimizes H2D contention with weight prefetch. See
+    `weight_offload_design.md §WQKV Column Choice`. If False, columns are
+    picked from the front of WQKV's output (Q first), useful only for
+    ablation."""
+
+    cpu_dtype: Literal["bfloat16"] = "bfloat16"
+    """CPU weight dtype. Locked to BF16: phase0 §0.3.2 confirmed F.linear with
+    BF16 weights uses oneDNN's optimized BF16 path (2x faster than FP32 at
+    small batch on AVX2 hardware), while torch.mm with BF16 falls back to a
+    naive scalar path that is 100x slower."""
+
+    cpu_num_threads: int = Field(default=16, ge=1)
+    """PyTorch CPU intra-op thread count. See `phase1a_findings.md §1.13b`."""
+
+    dry_run: bool = Field(default=False)
+    """Diagnostic: install all wrappers but skip the CPU GEMM in the worker.
+    Used by `bench_cots_dryrun_vs_none.py` to attribute the COTS-vs-none gap
+    into orchestration vs active CPU-work penalty (`phase1a_findings.md §1.14`).
+    Token output is garbage; only host bookkeeping cost is measured. Permanent
+    diagnostic — useful for verifying Phase 1c collapsed the orchestration
+    column and for catching future regressions in the COTS host path."""
+
+
+@config
 class OffloadConfig:
     """Configuration for model weight offloading to reduce GPU memory usage."""
 
@@ -86,6 +134,8 @@ class OffloadConfig:
       (prefetch if offload_group_size > 0, uva if cpu_offload_gb > 0).
     - "uva": UVA (Unified Virtual Addressing) zero-copy offloading.
     - "prefetch": Async prefetch with group-based layer offloading.
+    - "cots": Collaborative CPU-GPU offloading (thesis backend). Must be set
+      explicitly; "auto" never selects "cots".
     """
 
     uva: UVAOffloadConfig = Field(default_factory=UVAOffloadConfig)
@@ -93,6 +143,9 @@ class OffloadConfig:
 
     prefetch: PrefetchOffloadConfig = Field(default_factory=PrefetchOffloadConfig)
     """Parameters for prefetch offloading backend."""
+
+    cots: CotsOffloadConfig = Field(default_factory=CotsOffloadConfig)
+    """Parameters for COTS collaborative CPU-GPU offloading backend."""
 
     @model_validator(mode="after")
     def validate_offload_config(self) -> "OffloadConfig":
@@ -115,6 +168,7 @@ class OffloadConfig:
         # Warn if both backends have non-default values
         uva_active = self.uva.cpu_offload_gb > 0
         prefetch_active = self.prefetch.offload_group_size > 0
+        cots_active = self.cots.f_cpu_store > 0
         if self.offload_backend == "uva" and prefetch_active:
             warnings.warn(
                 "Prefetch offload fields are set but offload_backend='uva'. "
@@ -132,6 +186,26 @@ class OffloadConfig:
                 "Both UVA and prefetch offload fields are set with "
                 "offload_backend='auto'. Prefetch backend will be selected. "
                 "Set offload_backend explicitly to suppress this warning.",
+                stacklevel=2,
+            )
+
+        if self.offload_backend == "cots":
+            if uva_active:
+                raise ValueError(
+                    "offload_backend='cots' is incompatible with non-zero "
+                    "uva.cpu_offload_gb. Disable UVA when using cots."
+                )
+            if prefetch_active:
+                raise ValueError(
+                    "offload_backend='cots' is incompatible with non-zero "
+                    "prefetch.offload_group_size. Disable prefetch offload "
+                    "when using cots."
+                )
+        elif cots_active and self.offload_backend != "cots":
+            warnings.warn(
+                "cots.f_cpu_store is set but offload_backend is "
+                f"'{self.offload_backend}', not 'cots'. cots settings will "
+                "be ignored. Pass --offload-backend cots to enable.",
                 stacklevel=2,
             )
         return self

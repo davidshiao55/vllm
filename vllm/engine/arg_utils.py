@@ -37,6 +37,7 @@ from vllm.config import (
     CacheConfig,
     CompilationConfig,
     ConfigType,
+    CotsOffloadConfig,
     DeviceConfig,
     ECTransferConfig,
     EPLBConfig,
@@ -91,6 +92,7 @@ from vllm.config.parallel import (
 )
 from vllm.config.scheduler import SchedulerPolicy
 from vllm.config.utils import get_field
+from vllm.config.utils import replace as config_replace
 from vllm.config.vllm import OptimizationLevel, PerformanceMode
 from vllm.logger import init_logger, suppress_logging
 from vllm.platforms import CpuArchEnum, current_platform
@@ -465,6 +467,10 @@ class EngineArgs:
     offload_num_in_group: int = PrefetchOffloadConfig.offload_num_in_group
     offload_prefetch_step: int = PrefetchOffloadConfig.offload_prefetch_step
     offload_params: set[str] = get_field(PrefetchOffloadConfig, "offload_params")
+    cots_f_cpu_store: float = CotsOffloadConfig.f_cpu_store
+    cots_kv_biased: bool = CotsOffloadConfig.kv_biased
+    cots_cpu_num_threads: int = CotsOffloadConfig.cpu_num_threads
+    cots_dry_run: bool = CotsOffloadConfig.dry_run
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
     max_num_batched_tokens: int | None = None
@@ -1035,6 +1041,7 @@ class EngineArgs:
         offload_kwargs = get_kwargs(OffloadConfig)
         uva_kwargs = get_kwargs(UVAOffloadConfig)
         prefetch_kwargs = get_kwargs(PrefetchOffloadConfig)
+        cots_kwargs = get_kwargs(CotsOffloadConfig)
         offload_group = parser.add_argument_group(
             title="OffloadConfig",
             description=OffloadConfig.__doc__,
@@ -1061,6 +1068,12 @@ class EngineArgs:
         offload_group.add_argument(
             "--offload-params", **prefetch_kwargs["offload_params"]
         )
+        offload_group.add_argument("--cots-f-cpu-store", **cots_kwargs["f_cpu_store"])
+        offload_group.add_argument("--cots-kv-biased", **cots_kwargs["kv_biased"])
+        offload_group.add_argument(
+            "--cots-cpu-num-threads", **cots_kwargs["cpu_num_threads"]
+        )
+        offload_group.add_argument("--cots-dry-run", **cots_kwargs["dry_run"])
 
         # Multimodal related configs
         multimodal_kwargs = get_kwargs(MultiModalConfig)
@@ -1947,18 +1960,31 @@ class EngineArgs:
                 self.max_cudagraph_capture_size
             )
 
-        offload_config = OffloadConfig(
+        uva_offload_config = config_replace(
+            UVAOffloadConfig(),
+            cpu_offload_gb=self.cpu_offload_gb,
+            cpu_offload_params=self.cpu_offload_params,
+        )
+        prefetch_offload_config = config_replace(
+            PrefetchOffloadConfig(),
+            offload_group_size=self.offload_group_size,
+            offload_num_in_group=self.offload_num_in_group,
+            offload_prefetch_step=self.offload_prefetch_step,
+            offload_params=self.offload_params,
+        )
+        cots_offload_config = config_replace(
+            CotsOffloadConfig(),
+            f_cpu_store=self.cots_f_cpu_store,
+            kv_biased=self.cots_kv_biased,
+            cpu_num_threads=self.cots_cpu_num_threads,
+            dry_run=self.cots_dry_run,
+        )
+        offload_config = config_replace(
+            OffloadConfig(),
             offload_backend=self.offload_backend,
-            uva=UVAOffloadConfig(
-                cpu_offload_gb=self.cpu_offload_gb,
-                cpu_offload_params=self.cpu_offload_params,
-            ),
-            prefetch=PrefetchOffloadConfig(
-                offload_group_size=self.offload_group_size,
-                offload_num_in_group=self.offload_num_in_group,
-                offload_prefetch_step=self.offload_prefetch_step,
-                offload_params=self.offload_params,
-            ),
+            uva=uva_offload_config,
+            prefetch=prefetch_offload_config,
+            cots=cots_offload_config,
         )
 
         if self.gdn_prefill_backend is not None:
