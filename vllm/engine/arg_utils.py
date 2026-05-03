@@ -467,6 +467,7 @@ class EngineArgs:
     offload_num_in_group: int = PrefetchOffloadConfig.offload_num_in_group
     offload_prefetch_step: int = PrefetchOffloadConfig.offload_prefetch_step
     offload_params: set[str] = get_field(PrefetchOffloadConfig, "offload_params")
+    prefetch_dry_run: bool = PrefetchOffloadConfig.dry_run
     cots_f_cpu_store: float = CotsOffloadConfig.f_cpu_store
     cots_kv_biased: bool = CotsOffloadConfig.kv_biased
     cots_cpu_num_threads: int = CotsOffloadConfig.cpu_num_threads
@@ -1068,6 +1069,7 @@ class EngineArgs:
         offload_group.add_argument(
             "--offload-params", **prefetch_kwargs["offload_params"]
         )
+        offload_group.add_argument("--prefetch-dry-run", **prefetch_kwargs["dry_run"])
         offload_group.add_argument("--cots-f-cpu-store", **cots_kwargs["f_cpu_store"])
         offload_group.add_argument("--cots-kv-biased", **cots_kwargs["kv_biased"])
         offload_group.add_argument(
@@ -1971,6 +1973,7 @@ class EngineArgs:
             offload_num_in_group=self.offload_num_in_group,
             offload_prefetch_step=self.offload_prefetch_step,
             offload_params=self.offload_params,
+            dry_run=self.prefetch_dry_run,
         )
         cots_offload_config = config_replace(
             CotsOffloadConfig(),

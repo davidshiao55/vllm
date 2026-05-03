@@ -144,12 +144,14 @@ class PrefetchOffloader(BaseOffloader):
         num_in_group: int,
         prefetch_step: int,
         offload_params: set[str] | None = None,
+        dry_run: bool = False,
         mode: str = "cpu",
     ):
         self.group_size = group_size
         self.num_in_group = num_in_group
         self.prefetch_step = prefetch_step
         self.offload_params = offload_params or set()
+        self.dry_run = dry_run
         self.mode = mode
 
         # Copy stream for async H2D transfers
@@ -198,6 +200,7 @@ class PrefetchOffloader(BaseOffloader):
                         copy_stream=self.copy_stream,
                         whitelist_param_names=whitelist,
                         layer_idx=len(self.module_offloaders),
+                        dry_run=self.dry_run,
                     )
                 )
 
@@ -378,6 +381,7 @@ class _ModuleOffloader:
         copy_stream: torch.cuda.Stream,
         whitelist_param_names: list[str],
         layer_idx: int,
+        dry_run: bool = False,
     ):
         self.mode = mode
         self.module = module
@@ -385,6 +389,7 @@ class _ModuleOffloader:
         self.copy_stream = copy_stream
         self.layer_idx = layer_idx
         self.offloaded_bytes = 0
+        self._dry_run = dry_run
 
         # Event to signal when H2D copy to static buffer is complete.
         # Used for per-layer synchronization (both eager and capture modes).
@@ -534,7 +539,13 @@ class _ModuleOffloader:
                     "causes stream synchronization that breaks "
                     "event-based fork synchronization."
                 )
-                gpu_buffer.copy_(cpu_storage, non_blocking=True)
+                # Diagnostic: skip the actual H2D when dry_run is set so the
+                # bench can isolate orchestration cost from PCIe cost.
+                # The fork event + _copy_done_event recording stay
+                # unconditional below — we want stream/event bookkeeping
+                # cost in the dryrun arm. Token output is garbage in dryrun.
+                if not self._dry_run:
+                    gpu_buffer.copy_(cpu_storage, non_blocking=True)
 
         # Record completion event for _wait_for_layer to use
         self._copy_done_event.record(self.copy_stream)

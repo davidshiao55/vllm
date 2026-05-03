@@ -75,6 +75,16 @@ class PrefetchOffloadConfig:
     but not "mlp.experts.w13_weight_scale".
     """
 
+    dry_run: bool = Field(default=False)
+    """Diagnostic: install all prefetch wrappers (forward hooks, custom ops,
+    stream/event sync) but skip the actual H2D copy in
+    `_ModuleOffloader.start_onload_to_static()`. Used by
+    `bench_prefetch_vs_none.py` to attribute the prefetch-vs-none gap into
+    host orchestration vs unhidden PCIe transfer (`phase0_findings.md §0.10.3`).
+    Token output is garbage; only host bookkeeping + stream/event cost is
+    measured. Permanent diagnostic — useful as a regression sentinel on the
+    prefetch host path. Mirrors `CotsOffloadConfig.dry_run`."""
+
 
 @config
 class CotsOffloadConfig:
