@@ -85,6 +85,21 @@ class PrefetchOffloadConfig:
     measured. Permanent diagnostic — useful as a regression sentinel on the
     prefetch host path. Mirrors `CotsOffloadConfig.dry_run`."""
 
+    defer_wraparound: bool = Field(default=True)
+    """If True, defer the wrap-around prefetches (any prefetch whose target
+    layer is earlier in the model than the layer that scheduled it) from
+    the end of iter N to the beginning of iter N+1, via a pre-hook on the
+    first decoder layer. This avoids queueing the prefetch H2Ds onto CE0
+    ahead of iter N+1's per-step input-prep H2Ds, which would otherwise
+    FIFO-block them and propagate into the `prepare_inputs_event.synchronize()`
+    wait. See `phase0_findings.md §0.10.3` for diagnosis (CE0 contention)
+    and validation (UVA-routed input prep removes the same sync block).
+
+    Supports any `offload_prefetch_step` (K). For K > 1 the last K
+    offloaded layers each contribute a wrap-around prefetch; all are
+    drained in FIFO order by the first-decoder-layer pre-hook on the next
+    iter."""
+
 
 @config
 class CotsOffloadConfig:

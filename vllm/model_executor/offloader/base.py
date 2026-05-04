@@ -143,6 +143,7 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
             prefetch_step=prefetch.offload_prefetch_step,
             offload_params=prefetch.offload_params,
             dry_run=prefetch.dry_run,
+            defer_wraparound=prefetch.defer_wraparound,
             mode="cpu",
         )
     elif backend == "uva":
