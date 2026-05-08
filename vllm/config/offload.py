@@ -9,7 +9,7 @@ from pydantic import Field, model_validator
 
 from vllm.config.utils import config
 
-OffloadBackend = Literal["auto", "uva", "prefetch", "cots"]
+OffloadBackend = Literal["auto", "uva", "prefetch", "prefetch_defer", "cots"]
 
 
 @config
@@ -76,29 +76,10 @@ class PrefetchOffloadConfig:
     """
 
     dry_run: bool = Field(default=False)
-    """Diagnostic: install all prefetch wrappers (forward hooks, custom ops,
-    stream/event sync) but skip the actual H2D copy in
-    `_ModuleOffloader.start_onload_to_static()`. Used by
-    `bench_prefetch_vs_none.py` to attribute the prefetch-vs-none gap into
-    host orchestration vs unhidden PCIe transfer (`phase0_findings.md §0.10.3`).
-    Token output is garbage; only host bookkeeping + stream/event cost is
-    measured. Permanent diagnostic — useful as a regression sentinel on the
-    prefetch host path. Mirrors `CotsOffloadConfig.dry_run`."""
-
-    defer_wraparound: bool = Field(default=True)
-    """If True, defer the wrap-around prefetches (any prefetch whose target
-    layer is earlier in the model than the layer that scheduled it) from
-    the end of iter N to the beginning of iter N+1, via a pre-hook on the
-    first decoder layer. This avoids queueing the prefetch H2Ds onto CE0
-    ahead of iter N+1's per-step input-prep H2Ds, which would otherwise
-    FIFO-block them and propagate into the `prepare_inputs_event.synchronize()`
-    wait. See `phase0_findings.md §0.10.3` for diagnosis (CE0 contention)
-    and validation (UVA-routed input prep removes the same sync block).
-
-    Supports any `offload_prefetch_step` (K). For K > 1 the last K
-    offloaded layers each contribute a wrap-around prefetch; all are
-    drained in FIFO order by the first-decoder-layer pre-hook on the next
-    iter."""
+    """Diagnostic for `offload_backend="prefetch_defer"`: install wrappers
+    (forward hooks, custom ops, stream/event sync) but skip the actual H2D
+    copies. Token output is garbage; only host bookkeeping + stream/event cost
+    is measured. The stock `prefetch` backend ignores this field."""
 
 
 @config
@@ -122,6 +103,14 @@ class CotsOffloadConfig:
     between MLP1 col-parallel and MLP2 row-parallel is automatic under uniform
     dispatch). Phase 1a default 0.0 means no offload. Typical thesis value at
     7B B=1 decode is ~0.09 ("free" regime per phase0 §0.3.3)."""
+
+    f_prefetch: float = Field(default=0.0, ge=0.0, le=1.0)
+    """Manual fallback for the layer-ahead weight-prefetch fraction. Only
+    consulted when the offloader is constructed without a
+    `dispatch_table_factory`; the Planner's factory output overrides this
+    value entirely. Constraint: f_prefetch <= f_cpu_store (prefetch consumes
+    CPU-stored bytes; the f_cpu_compute = f_cpu_store - f_prefetch portion is
+    CPU-computed). Default 0.0 reproduces Phase 1a behavior bit-exactly."""
 
     kv_biased: bool = Field(default=True)
     """If True, the WQKV column picker is biased toward K/V: K+V column groups
@@ -158,7 +147,9 @@ class OffloadConfig:
     - "auto": Selects based on which sub-config has non-default values
       (prefetch if offload_group_size > 0, uva if cpu_offload_gb > 0).
     - "uva": UVA (Unified Virtual Addressing) zero-copy offloading.
-    - "prefetch": Async prefetch with group-based layer offloading.
+    - "prefetch": Stock async prefetch with group-based layer offloading.
+    - "prefetch_defer": Thesis native-prefetch baseline with deferred
+      wrap-around scheduling.
     - "cots": Collaborative CPU-GPU offloading (thesis backend). Must be set
       explicitly; "auto" never selects "cots".
     """
@@ -175,7 +166,8 @@ class OffloadConfig:
     @model_validator(mode="after")
     def validate_offload_config(self) -> "OffloadConfig":
         """Validate offload configuration constraints."""
-        if self.offload_backend == "prefetch" or self.prefetch.offload_group_size > 0:
+        prefetch_backend = self.offload_backend in ("prefetch", "prefetch_defer")
+        if prefetch_backend or self.prefetch.offload_group_size > 0:
             if self.prefetch.offload_num_in_group > self.prefetch.offload_group_size:
                 raise ValueError(
                     f"offload_num_in_group ({self.prefetch.offload_num_in_group})"
@@ -200,10 +192,17 @@ class OffloadConfig:
                 "Prefetch settings will be ignored.",
                 stacklevel=2,
             )
-        elif self.offload_backend == "prefetch" and uva_active:
+        elif prefetch_backend and uva_active:
             warnings.warn(
-                "UVA offload fields are set but offload_backend='prefetch'. "
-                "UVA settings will be ignored.",
+                "UVA offload fields are set but offload_backend="
+                f"'{self.offload_backend}'. UVA settings will be ignored.",
+                stacklevel=2,
+            )
+        elif self.offload_backend == "prefetch" and self.prefetch.dry_run:
+            warnings.warn(
+                "prefetch.dry_run is set but offload_backend='prefetch'. "
+                "The stock prefetch backend ignores dry_run; use "
+                "offload_backend='prefetch_defer' for the diagnostic.",
                 stacklevel=2,
             )
         elif self.offload_backend == "auto" and uva_active and prefetch_active:
@@ -211,6 +210,15 @@ class OffloadConfig:
                 "Both UVA and prefetch offload fields are set with "
                 "offload_backend='auto'. Prefetch backend will be selected. "
                 "Set offload_backend explicitly to suppress this warning.",
+                stacklevel=2,
+            )
+        elif (
+            self.offload_backend == "auto" and prefetch_active and self.prefetch.dry_run
+        ):
+            warnings.warn(
+                "prefetch.dry_run is set with offload_backend='auto'. Auto "
+                "selects the stock prefetch backend, which ignores dry_run; "
+                "use offload_backend='prefetch_defer' for the diagnostic.",
                 stacklevel=2,
             )
 
@@ -225,6 +233,12 @@ class OffloadConfig:
                     "offload_backend='cots' is incompatible with non-zero "
                     "prefetch.offload_group_size. Disable prefetch offload "
                     "when using cots."
+                )
+            if self.cots.f_prefetch > self.cots.f_cpu_store:
+                raise ValueError(
+                    f"cots.f_prefetch ({self.cots.f_prefetch}) must be <= "
+                    f"cots.f_cpu_store ({self.cots.f_cpu_store}); prefetch "
+                    f"consumes CPU-stored bytes."
                 )
         elif cots_active and self.offload_backend != "cots":
             warnings.warn(

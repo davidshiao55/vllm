@@ -144,16 +144,12 @@ class PrefetchOffloader(BaseOffloader):
         num_in_group: int,
         prefetch_step: int,
         offload_params: set[str] | None = None,
-        dry_run: bool = False,
-        defer_wraparound: bool = True,
         mode: str = "cpu",
     ):
         self.group_size = group_size
         self.num_in_group = num_in_group
         self.prefetch_step = prefetch_step
         self.offload_params = offload_params or set()
-        self.dry_run = dry_run
-        self.defer_wraparound = defer_wraparound
         self.mode = mode
 
         # Copy stream for async H2D transfers
@@ -163,23 +159,6 @@ class PrefetchOffloader(BaseOffloader):
         self.module_offloaders: list[_ModuleOffloader] = []
         self.buffer_pool: StaticBufferPool | None = None
         self.total_offloaded_bytes = 0
-
-        # Deferred wrap-around state. See phase0_findings.md §0.10.3:
-        #   * `first_decoder_module` is the first nn.Module yielded by
-        #     `modules_generator` in `wrap_modules` (NOT necessarily an
-        #     offloaded module). A forward pre-hook installed on it issues
-        #     the deferred wrap-around prefetches at the start of each
-        #     iter, after vLLM's per-step input-prep H2Ds have queued on
-        #     CE0.
-        #   * `pending_wraparound_indices` accumulates wrap-around indices
-        #     as the wrapped forwards of the last K offloaded layers run
-        #     (any layer whose `(index + K) >= N` would wrap). The list is
-        #     drained in FIFO order by the first-decoder-layer pre-hook on
-        #     the next iter. For K=1 it always holds at most one element;
-        #     for K>1 it holds up to K elements (one per wrap-around
-        #     layer).
-        self.first_decoder_module: nn.Module | None = None
-        self.pending_wraparound_indices: list[int] = []
 
     def wrap_modules(
         self,
@@ -219,37 +198,13 @@ class PrefetchOffloader(BaseOffloader):
                         copy_stream=self.copy_stream,
                         whitelist_param_names=whitelist,
                         layer_idx=len(self.module_offloaders),
-                        dry_run=self.dry_run,
                     )
                 )
 
         for index, module in enumerate(offload_modules):
             self._hook_module_forward(index, module)
 
-        # Install the first-decoder-layer pre-hook for deferred wrap-around.
-        # Fires at the start of every model forward, AFTER vLLM's input-prep
-        # H2Ds have been queued — so the deferred wrap-around start_prefetch
-        # lands on CE0 behind input prep instead of ahead of it. See
-        # phase0_findings.md §0.10.3.
-        if self.defer_wraparound and all_modules and self.module_offloaders:
-            self.first_decoder_module = all_modules[0]
-            self.first_decoder_module.register_forward_pre_hook(
-                self._first_decoder_pre_hook,
-                with_kwargs=True,
-            )
-
         return all_modules
-
-    def _first_decoder_pre_hook(self, module: nn.Module, args, kwargs):
-        """Fire deferred wrap-around prefetches at start of model forward."""
-        if not self.pending_wraparound_indices:
-            return
-        anchor = args[0] if args else kwargs.get("hidden_states")
-        if anchor is None and kwargs:
-            anchor = next(iter(kwargs.values()))
-        for idx in self.pending_wraparound_indices:
-            torch.ops.vllm.start_prefetch(anchor, idx)
-        self.pending_wraparound_indices.clear()
 
     def _hook_module_forward(self, index: int, module: nn.Module):
         """Hook module's forward with torch.compile-compatible sync."""
@@ -270,23 +225,12 @@ class PrefetchOffloader(BaseOffloader):
 
             # Start prefetch for next layer (circular)
             # mutates_args on output_tensor creates ordering dependency
-            n_offloaders = len(self.module_offloaders)
-            raw_next = index + self.prefetch_step
-            next_index = raw_next % n_offloaders
-            # Wrap-around case (raw_next >= n_offloaders): with
-            # defer_wraparound=True, skip the start_prefetch here and stash
-            # the index so the first decoder layer's pre-hook on the NEXT
-            # iter issues it instead. Keeps the 466 MB H2D off CE0 until
-            # after iter N+1's input-prep H2Ds have queued. See
-            # phase0_findings.md §0.10.3.
-            if self.defer_wraparound and raw_next >= n_offloaders:
-                self.pending_wraparound_indices.append(next_index)
+            next_index = (index + self.prefetch_step) % len(self.module_offloaders)
+            # Handle tuple output (e.g., (hidden_states, residual))
+            if isinstance(output, tuple):
+                torch.ops.vllm.start_prefetch(output[0], next_index)
             else:
-                # Handle tuple output (e.g., (hidden_states, residual))
-                if isinstance(output, tuple):
-                    torch.ops.vllm.start_prefetch(output[0], next_index)
-                else:
-                    torch.ops.vllm.start_prefetch(output, next_index)
+                torch.ops.vllm.start_prefetch(output, next_index)
 
             # No explicit offload needed - static buffers are reused implicitly
 
@@ -434,7 +378,6 @@ class _ModuleOffloader:
         copy_stream: torch.cuda.Stream,
         whitelist_param_names: list[str],
         layer_idx: int,
-        dry_run: bool = False,
     ):
         self.mode = mode
         self.module = module
@@ -442,7 +385,6 @@ class _ModuleOffloader:
         self.copy_stream = copy_stream
         self.layer_idx = layer_idx
         self.offloaded_bytes = 0
-        self._dry_run = dry_run
 
         # Event to signal when H2D copy to static buffer is complete.
         # Used for per-layer synchronization (both eager and capture modes).
@@ -592,13 +534,7 @@ class _ModuleOffloader:
                     "causes stream synchronization that breaks "
                     "event-based fork synchronization."
                 )
-                # Diagnostic: skip the actual H2D when dry_run is set so the
-                # bench can isolate orchestration cost from PCIe cost.
-                # The fork event + _copy_done_event recording stay
-                # unconditional below — we want stream/event bookkeeping
-                # cost in the dryrun arm. Token output is garbage in dryrun.
-                if not self._dry_run:
-                    gpu_buffer.copy_(cpu_storage, non_blocking=True)
+                gpu_buffer.copy_(cpu_storage, non_blocking=True)
 
         # Record completion event for _wait_for_layer to use
         self._copy_done_event.record(self.copy_stream)

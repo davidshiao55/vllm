@@ -24,6 +24,7 @@ class relation:
 BaseOffloader (ABC)
   * implemented by: UVAOffloader
   * implemented by: PrefetchOffloader
+  * implemented by: PrefetchDeferOffloader
     * uses: _ModuleOffloader
         * uses: _BaseParamOffloader (ABC)
             * implemented by: _CpuParamOffloader
@@ -62,6 +63,15 @@ class BaseOffloader(ABC):
         """
         return
 
+    def prepare_before_forward(self, num_tokens: int) -> None:  # noqa: B027
+        """Prepare offloader state for a model forward.
+
+        Called from eager pre-hooks and outside FULL CUDA graph capture/replay
+        so offloaders can repair runtime state that depends on the active
+        token bucket.
+        """
+        pass
+
     def sync_prev_onload(self) -> None:  # noqa: B027
         """Sync previous onload operations. Override in subclasses."""
         pass
@@ -76,6 +86,11 @@ class BaseOffloader(ABC):
 
     def _start_prefetch(self, layer_idx: int) -> None:  # noqa: B027
         """Start layer prefetch. Override in subclasses."""
+        pass
+
+    def _start_deferred_prefetch(self) -> None:  # noqa: B027
+        """Start the static deferred wraparound prefetch. Override in
+        backends that emit one (e.g., `PrefetchDeferOffloader`)."""
         pass
 
 
@@ -121,6 +136,7 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
     """
     from vllm.model_executor.offloader.cots import CotsOffloader
     from vllm.model_executor.offloader.prefetch import PrefetchOffloader
+    from vllm.model_executor.offloader.prefetch_defer import PrefetchDeferOffloader
     from vllm.model_executor.offloader.uva import UVAOffloader
 
     backend = offload_config.offload_backend
@@ -142,8 +158,15 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
             num_in_group=prefetch.offload_num_in_group,
             prefetch_step=prefetch.offload_prefetch_step,
             offload_params=prefetch.offload_params,
+            mode="cpu",
+        )
+    elif backend == "prefetch_defer":
+        return PrefetchDeferOffloader(
+            group_size=prefetch.offload_group_size,
+            num_in_group=prefetch.offload_num_in_group,
+            prefetch_step=prefetch.offload_prefetch_step,
+            offload_params=prefetch.offload_params,
             dry_run=prefetch.dry_run,
-            defer_wraparound=prefetch.defer_wraparound,
             mode="cpu",
         )
     elif backend == "uva":

@@ -216,16 +216,19 @@ class CudaGraphManager:
                             f"Graph already captured for {desc}"
                         )
                         graph = torch.cuda.CUDAGraph()
-                        # Sync offloader's copy stream before capture.
-                        # Ensure any pre-capture prefetches from offloader are complete.
-                        get_offloader().sync_prev_onload()
+                        offloader = get_offloader()
+                        # Repair any bucket-dependent state, then sync the
+                        # copy stream once. Stream ordering makes this drain
+                        # both previously queued copies and any repair H2Ds.
+                        offloader.prepare_before_forward(desc.num_tokens)
+                        offloader.sync_prev_onload()
                         with torch.cuda.graph(graph, self.pool):
                             forward_fn(CUDAGraphMode.NONE)
                             # Join offloader's copy stream after forward to avoid
                             # unjoined stream error. The last layer's start_prefetch
                             # forks copy_stream, but wait_prefetch only happens in
                             # the next forward pass.
-                            get_offloader().join_after_forward()
+                            offloader.join_after_forward()
                         self.graphs[desc] = graph
         self._graphs_captured = True
 
@@ -256,7 +259,13 @@ class CudaGraphManager:
         # H2D copies on copy_stream that the graph's captured events
         # cannot see. Without this, replay could overwrite static buffers
         # while those copies are still in flight.
-        get_offloader().sync_prev_onload()
+        offloader = get_offloader()
+        # FULL graph replay bypasses Python model hooks, so repair any
+        # active-bucket state that normally lives in forward pre-hooks.
+        # A single sync after repair drains both prior copy-stream work
+        # and any repair H2Ds before graph execution begins.
+        offloader.prepare_before_forward(desc.num_tokens)
+        offloader.sync_prev_onload()
         self.graphs[desc].replay()
 
 

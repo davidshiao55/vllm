@@ -41,6 +41,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Import prefetch_ops to register the prefetch custom ops at module load time.
+# COTS reuses the same ops as `PrefetchOffloader`
+# — they dispatch through `get_offloader()` and route to whichever backend
+# is registered as the current offloader (`base.py`).
+import vllm.model_executor.offloader.prefetch_ops  # noqa: F401
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.offloader.base import BaseOffloader
@@ -297,6 +302,8 @@ class CotsLinearHandle:
         # Per-shard split metadata for the loader closures.
         self.q_size = q_size
         self.kv_size = kv_size
+        self.head_dim = head_dim
+        self.kv_biased = kv_biased
         self.merged_partition_sizes = merged_partition_sizes
         self.n_q_tail = 0
         self.n_k = 0
@@ -332,6 +339,47 @@ class CotsLinearHandle:
         self.w_cpu: torch.Tensor | None = None
         # Membership flag set by the offloader's MLP-block recognition.
         self.in_block: bool = False
+        # Decoder-layer index. Set by the offloader after `_build_handles`.
+        # Phase 1b uses it for prefetch slot rotation (`layer_idx % K`).
+        self.layer_idx: int = -1
+        # Prefetch slot index = `layer_idx % CotsPrefetchBufferPool.K`. Set
+        # by the offloader when constructing the buffer pool.
+        self.slot_idx: int = -1
+        # Per-bucket prefetch geometry — populated by
+        # `apply_prefetch_split_per_bucket`. Phase 1b: every bucket gets
+        # the same value (uniform fill); Planner: per-bucket variation
+        # from the dispatch table.
+        self.n_prefetch_by_bucket: dict[int, int] = {}
+        self.n_cpu_compute_by_bucket: dict[int, int] = {}
+        self.prefetch_indices_cuda_by_bucket: dict[int, torch.Tensor] = {}
+        self.cpu_compute_indices_cuda_by_bucket: dict[int, torch.Tensor] = {}
+        self.max_n_prefetch: int = 0
+        # GPU prefetch buffer slot views — bound by the prefetch buffer pool
+        # (Step 3). Length K=2; layer i uses slot `i % K`. Each view is
+        # shape `(max_n_prefetch, in_dim)` for col/qkv or
+        # `(out_dim, max_n_prefetch)` for row, matching `w_cpu`'s layout.
+        self.w_prefetch_slots: list[torch.Tensor] = []
+        # Shape-group-shared per-slot state — buffer pool binds the SAME
+        # list to every handle in a group so writes are visible across
+        # all sharers of the physical slot.
+        # `prefetch_owner_in_slot[k]`: handle that last filled slot k
+        #   (None = empty). Operators assert owner is self before reading.
+        # `prefetch_available_rows_in_slot[k]`: how many leading prefix
+        #   rows of the slot are valid. Per-half row count for col
+        #   (`gate[:a]` AND `up[:a]` valid → available_rows == a); total
+        #   prefix rows for qkv/row. 0 = empty.
+        self.prefetch_owner_in_slot: list[CotsLinearHandle | None] = []
+        self.prefetch_available_rows_in_slot: list[int] = []
+        # Row-handle only: pinned-CPU duplicate of the prefetched-cols
+        # prefix in transposed layout (max_n_prefetch, out_dim). The
+        # primary w_cpu is (out_dim, n_cpu); narrowing it on dim 1
+        # yields a pitched (strided) H2D source that costs ~1.85x at
+        # f_prefetch=0.15 (microprobe at down_proj shape). This buffer
+        # makes the per-bucket H2D fully contiguous. Allocated by the
+        # offloader once max_n_prefetch is known; populated by
+        # _row_weight_loader. qkv/col prefetch via narrow(0, ...) is
+        # already contiguous and needs no duplicate.
+        self.w_row_prefetch_src_t: torch.Tensor | None = None
 
     # ------------------------------------------------------------------
     # Construction helpers — compute indices, snap n_cpu, build handle.
@@ -499,6 +547,106 @@ class CotsLinearHandle:
             return self._merged_col_weight_loader
         return self._qkv_weight_loader
 
+    # ------------------------------------------------------------------
+    # Per-bucket prefetch geometry. Populated after install. Loader closures
+    # are unaffected — `w_cpu` is loaded once with all CPU rows; the
+    # prefetch / CPU-compute split is a runtime view (`w_cpu.narrow(...)`).
+    # ------------------------------------------------------------------
+    def apply_prefetch_split_per_bucket(
+        self,
+        dispatch_table: dict[int, tuple[float, float]],
+    ) -> None:
+        """For each bucket in `dispatch_table`, compute `n_prefetch`,
+        `n_cpu_compute`, and the index tensors that scatter the three GPU
+        outputs (permanent + prefetched + CPU-on-GPU) into the canonical
+        layer output. Must be called after `install()` (uses CUDA-side
+        `cpu_indices_cuda` for index slicing).
+        """
+        assert self.cpu_indices_cuda is not None, "call install() first"
+        device = self.cpu_indices_cuda.device
+
+        self.n_prefetch_by_bucket.clear()
+        self.n_cpu_compute_by_bucket.clear()
+        self.prefetch_indices_cuda_by_bucket.clear()
+        self.cpu_compute_indices_cuda_by_bucket.clear()
+
+        for bucket, (_, f_prefetch) in dispatch_table.items():
+            n_pref, pref_idx, cpu_idx = self._compute_bucket_split(f_prefetch)
+            self.n_prefetch_by_bucket[bucket] = n_pref
+            self.n_cpu_compute_by_bucket[bucket] = self.n_cpu - n_pref
+            self.prefetch_indices_cuda_by_bucket[bucket] = pref_idx.to(device)
+            self.cpu_compute_indices_cuda_by_bucket[bucket] = cpu_idx.to(device)
+
+        self.max_n_prefetch = (
+            max(self.n_prefetch_by_bucket.values()) if dispatch_table else 0
+        )
+
+    def _compute_bucket_split(
+        self, f_prefetch: float
+    ) -> tuple[int, torch.Tensor, torch.Tensor]:
+        """Split `cpu_indices` into prefetched and CPU-computed subsets.
+
+        Returns `(n_prefetch, prefetch_indices_cpu, cpu_compute_indices_cpu)`.
+        Indices are still on CPU; the caller moves them to the device.
+
+        Layout invariants:
+          qkv: `cpu_indices` order is `[Q_tail | K_cpu | V_cpu]`. Prefetch
+            takes the first `n_pref` indices.
+          col: `cpu_indices` is `[gate_last_n_cpu_per_half | up_last_n_cpu_per_half]`.
+            Prefetch takes the FIRST `n_pref_per_half` of each half — keeps
+            the matched-index invariant with MLP2's input cols.
+          row: `cpu_indices` is the LAST `n_cpu` input cols. Prefetch takes
+            the first `n_pref` of those.
+
+        For qkv, n_pref is snapped via the same picker as n_cpu so its
+        snap grid matches: at f_prefetch == f_cpu_store the picker sees
+        identical input → returns identical (n_q, n_k, n_v) → n_pref ==
+        n_cpu by construction, no residual leak. col / row already share
+        the same `round(f * dim)` rule for both n_cpu and n_pref so they
+        align without extra work.
+        """
+        cap = self.n_cpu
+
+        if self.kind == "qkv":
+            assert self.q_size is not None and self.kv_size is not None
+            assert self.head_dim is not None
+            requested = int(round(f_prefetch * self.out_dim))
+            n_q, n_k, n_v = _qkv_kv_biased_counts(
+                self.q_size,
+                self.kv_size,
+                requested,
+                head_dim=self.head_dim,
+                kv_biased=self.kv_biased,
+            )
+            n_pref = min(n_q + n_k + n_v, cap)
+        elif self.kind == "col":
+            half = self.out_dim // 2
+            n_pref_per_half = min(int(round(f_prefetch * half)), self.n_cpu_per_half)
+            n_pref = 2 * n_pref_per_half
+        else:  # row
+            n_pref = min(int(round(f_prefetch * self.in_dim)), cap)
+
+        # Index extraction is per-kind and depends on `cpu_indices`'s layout.
+        if self.kind == "col":
+            n_pref_per_half = n_pref // 2
+            ncph = self.n_cpu_per_half
+            pref_idx = torch.cat(
+                [
+                    self.cpu_indices[:n_pref_per_half],
+                    self.cpu_indices[ncph : ncph + n_pref_per_half],
+                ]
+            )
+            cpu_idx = torch.cat(
+                [
+                    self.cpu_indices[n_pref_per_half:ncph],
+                    self.cpu_indices[ncph + n_pref_per_half :],
+                ]
+            )
+            return n_pref, pref_idx, cpu_idx
+
+        # qkv / row: prefetch is a contiguous prefix of cpu_indices.
+        return n_pref, self.cpu_indices[:n_pref], self.cpu_indices[n_pref:]
+
     # --- Loader closures (per-kind, accessing self by closure) ---
 
     def _row_weight_loader(self, param, loaded_weight):
@@ -514,6 +662,19 @@ class CotsLinearHandle:
         keep_gpu = self.in_dim - self.n_cpu
         param.data.copy_(loaded_weight[:, :keep_gpu], non_blocking=False)
         self.w_cpu.copy_(loaded_weight[:, keep_gpu:], non_blocking=False)
+        # Phase 1b row-prefetch fix: also populate the transposed pinned
+        # H2D source for the prefetched-cols prefix. The first
+        # max_n_prefetch input cols of the CPU portion match the runtime
+        # prefetch slice (`_compute_bucket_split` row branch), and per-
+        # bucket `n_prefetch <= max_n_prefetch`. One-shot transpose is
+        # paid here at load time so per-forward H2D is contiguous.
+        if self.w_row_prefetch_src_t is not None:
+            m = self.max_n_prefetch
+            src_block = loaded_weight[:, keep_gpu : keep_gpu + m]  # (out_dim, m)
+            self.w_row_prefetch_src_t.copy_(
+                src_block.transpose(0, 1).contiguous(),  # (m, out_dim)
+                non_blocking=False,
+            )
 
     def _merged_col_weight_loader(self, param, loaded_weight, loaded_shard_id=None):
         """MergedColumnParallelLinear (gate_up_proj): per-shard call
@@ -600,6 +761,342 @@ class CotsLinearHandle:
 
 
 # ---------------------------------------------------------------------------
+# Execution layer: CotsPrefetchBufferPool
+#
+# Layer-ahead weight-prefetch destination. Allocates K=2 GPU slot views per
+# offloaded handle so prefetch for layer i+1 can overlap with layer i's
+# compute (every layer is offloaded → K=2 is the minimum slot count for any
+# overlap; see `phase0_findings.md §0.10.1d` and the Phase 1b plan).
+# Slot shape mirrors `w_cpu`'s layout per kind:
+#   col / qkv : (max_n_prefetch, in_dim)   — prefetch dim 0
+#   row       : (out_dim, max_n_prefetch)  — prefetch dim 1 (pitched H2D)
+# Sized to `max_n_prefetch` (max across buckets); per-forward H2D narrows.
+# ---------------------------------------------------------------------------
+class CotsPrefetchBufferPool:
+    """K=2 slot rotation. K slots PER UNIQUE shape, SHARED across layers.
+
+    Mirrors `prefetch.py`'s `StaticBufferPool`: at G=1 (every layer
+    offloaded) all 28 qkv handles share the same K=2 qkv-shape slots,
+    rotated by `layer_idx % K`. Layer i and layer i+2 read/write the
+    same slot 0; the streamer's fork-event ordering ensures layer i+2's
+    H2D writes slot 0 only after layer i's GEMMs read it.
+
+    Pool size = K × Σ_unique_shape (slot_numel × dtype_bytes), NOT
+    K × Σ_handle. At Qwen2.5-7B with 28 offloaded layers and 3 unique
+    shapes per layer, this is 28× smaller than per-handle allocation
+    (which over-counts by N_layers).
+
+    Allocated inside `wrap_modules` (DeviceMemoryProfiler invariant —
+    `phase1a_findings.md §1.5`).
+    """
+
+    K = 2  # slot count, hard-coded — see Phase 1b plan §"Top-Level Decisions"
+
+    def __init__(
+        self,
+        handles: list[CotsLinearHandle],
+        device: torch.device,
+    ):
+        self.total_bytes = 0
+        self._buffer: torch.Tensor | None = None
+
+        # Group handles by (kind, slot_shape). Within a group, all handles
+        # share K slots, rotated at runtime by `handle.slot_idx`.
+        groups: dict[tuple, list[CotsLinearHandle]] = {}
+        for h in handles:
+            if h.max_n_prefetch == 0:
+                h.w_prefetch_slots = []
+                h.prefetch_owner_in_slot = []
+                h.prefetch_available_rows_in_slot = []
+                continue
+            if h.kind == "row":
+                # Phase 1b row-prefetch fix: transposed slot layout so
+                # H2D narrow(0, ...) is contiguous (matches the new
+                # w_row_prefetch_src_t source). Same numel as the prior
+                # (out_dim, max_n_prefetch) shape.
+                slot_shape = (h.max_n_prefetch, h.out_dim)
+            else:  # col, qkv
+                slot_shape = (h.max_n_prefetch, h.in_dim)
+            groups.setdefault((h.kind, slot_shape), []).append(h)
+
+        if not groups:
+            return
+
+        dtype = next(iter(groups.values()))[0].dtype
+        total_numel = sum(self.K * shape[0] * shape[1] for (_, shape) in groups)
+        self._buffer = torch.empty(total_numel, dtype=dtype, device=device)
+        self.total_bytes = self._buffer.numel() * self._buffer.element_size()
+
+        offset = 0
+        for (_, slot_shape), group_handles in groups.items():
+            slot_numel = slot_shape[0] * slot_shape[1]
+            shared_slots: list[torch.Tensor] = []
+            for _ in range(self.K):
+                view = self._buffer[offset : offset + slot_numel].view(*slot_shape)
+                shared_slots.append(view)
+                offset += slot_numel
+            # All handles in this shape group share the SAME K slots —
+            # rotation happens at the handle level via `slot_idx`. The
+            # owner / available-rows lists are also shared (same Python
+            # list object bound to every handle), so start() writes from
+            # one handle are visible to all sharers of the physical slot.
+            shared_owners: list[CotsLinearHandle | None] = [None] * self.K
+            shared_avail: list[int] = [0] * self.K
+            for h in group_handles:
+                h.w_prefetch_slots = shared_slots
+                h.prefetch_owner_in_slot = shared_owners
+                h.prefetch_available_rows_in_slot = shared_avail
+
+
+# ---------------------------------------------------------------------------
+# Execution layer: WeightPrefetchStreamer
+#
+# Layer-ahead H2D streamer. Owns the copy stream, per-layer copy-done events,
+# and the slot-rotation policy. Sibling of `CpuTaskRunner` in the execution
+# layer. `CotsOffloader`'s four `BaseOffloader` lifecycle methods delegate
+# to this class. No model knowledge — operates on opaque handles.
+# Phase 1c does not touch this class; cudaLaunchHostFunc is `CpuTaskRunner`'s
+# concern.
+# ---------------------------------------------------------------------------
+class WeightPrefetchStreamer:
+    """K=2 layer-ahead weight-prefetch streamer.
+
+    Methods are 1:1 ports of `prefetch.py`'s lifecycle (copy stream, fork
+    event, per-layer copy-done event, capture-vs-eager wait branching) but
+    operate on `CotsLinearHandle` directly — no module forward hooks or
+    `_ModuleOffloader` indirection. Layer ordering and hooks are owned by
+    `CotsOffloader`.
+    """
+
+    def __init__(
+        self,
+        n_layers: int,
+        dry_run: bool = False,
+    ):
+        self.copy_stream = torch.cuda.Stream()
+        self._copy_done_events: list[torch.cuda.Event] = [
+            torch.cuda.Event() for _ in range(n_layers)
+        ]
+        self._event_valid_for_eager: list[bool] = [False] * n_layers
+        self._prefetch_in_capture: list[bool] = [False] * n_layers
+        # Diagnostic: skip the actual H2D copy on the prefetch path while
+        # keeping all bookkeeping (events, slot tracking, fork_event). Lets
+        # `Bench 2` decompose collaborative-arm overhead into orchestration
+        # vs PCIe transfer. Same diagnostic role as `prefetch_defer.py`.
+        self._dry_run = dry_run
+        # Cached at the start of every model forward by the first-decoder
+        # pre-hook. Read by `start` to size the bucket-specific H2D.
+        self.current_bucket: int = 0
+        # Owned externally; offloader sets after constructing the pool.
+        self.buffer_pool: CotsPrefetchBufferPool | None = None
+
+    def set_current_bucket(
+        self, num_tokens: int, bucket_for: Callable[[int], int]
+    ) -> None:
+        self.current_bucket = bucket_for(num_tokens)
+
+    def start(self, layer_idx: int, handles: list[CotsLinearHandle]) -> None:
+        """Issue H2D for this layer's handles using `current_bucket`. One
+        memcpy per non-zero handle on `copy_stream`; single event records
+        at layer end so `wait(layer_idx)` is one event-sync."""
+        b = self.current_bucket
+        if not any(h.n_prefetch_by_bucket.get(b, 0) > 0 for h in handles):
+            # No-op for this bucket. Clear stale wait state from a previous
+            # bucket where this layer DID prefetch — otherwise wait(layer_idx)
+            # would sync on a stale done-event under per-bucket Planner
+            # strategies.
+            self._event_valid_for_eager[layer_idx] = False
+            self._prefetch_in_capture[layer_idx] = False
+            return
+
+        in_capture = torch.cuda.is_current_stream_capturing()
+        self._prefetch_in_capture[layer_idx] = in_capture
+
+        # Fork compute → copy_stream so the H2D is ordered after the
+        # producing compute (e.g., last layer's output, mutates_args contract
+        # on `start_prefetch`). Mirrors `prefetch.py:577-581`.
+        fork_event = torch.cuda.Event()
+        torch.cuda.current_stream().record_event(fork_event)
+        self.copy_stream.wait_event(fork_event)
+
+        with torch.cuda.stream(self.copy_stream):
+            for h in handles:
+                n = h.n_prefetch_by_bucket.get(b, 0)
+                if n == 0:
+                    continue
+                # dry_run: keep all bookkeeping (slot tracking, events,
+                # fork_event ordering) but skip the actual H2D so the
+                # measured cost is host orchestration only.
+                if not self._dry_run:
+                    if h.kind == "row":
+                        # Phase 1b row-prefetch fix: source is the pinned
+                        # transposed `w_row_prefetch_src_t` of shape
+                        # (max_n_prefetch, out_dim); slot is also
+                        # (max_n_prefetch, out_dim). Both narrow on dim 0
+                        # → contiguous H2D, ~1.85x faster than the prior
+                        # pitched `w_cpu.narrow(1, 0, n)`.
+                        assert h.w_row_prefetch_src_t is not None, (
+                            f"row handle {h.qualified_name} has prefetch "
+                            f"requested but w_row_prefetch_src_t is None"
+                        )
+                        src = h.w_row_prefetch_src_t.narrow(0, 0, n)
+                        dst = h.w_prefetch_slots[h.slot_idx].narrow(0, 0, n)
+                        dst.copy_(src, non_blocking=True)
+                    elif h.kind == "col":
+                        # MergedCol w_cpu layout is [gate_full | up_full].
+                        # Prefetch takes the first n_per_half rows of
+                        # EACH half (matched-index invariant). Slot
+                        # layout is FIXED-MAX `[gate_max | up_max]`
+                        # (Phase 1b → Phase 1c refactor): gate region
+                        # is `[0:max_half]`, up region is
+                        # `[max_half:2*max_half]`, regardless of the
+                        # active bucket. This makes max-fill at
+                        # post_init slice-safe and lets the operator
+                        # consume any active prefix `n_per_half` from
+                        # both regions independently.
+                        assert h.w_cpu is not None
+                        n_per_half = n // 2
+                        max_half = h.max_n_prefetch // 2
+                        n_cpu_per_half_total = h.n_cpu // 2
+                        slot = h.w_prefetch_slots[h.slot_idx]
+                        slot[:n_per_half, :].copy_(
+                            h.w_cpu[:n_per_half, :], non_blocking=True
+                        )
+                        slot[max_half : max_half + n_per_half, :].copy_(
+                            h.w_cpu[
+                                n_cpu_per_half_total : n_cpu_per_half_total
+                                + n_per_half,
+                                :,
+                            ],
+                            non_blocking=True,
+                        )
+                    else:  # qkv: w_cpu rows are [Q_tail | K | V]; prefetch
+                        # takes a contiguous prefix.
+                        assert h.w_cpu is not None
+                        src = h.w_cpu.narrow(0, 0, n)
+                        dst = h.w_prefetch_slots[h.slot_idx].narrow(0, 0, n)
+                        dst.copy_(src, non_blocking=True)
+                # Owner / available_rows on the shape-group-shared
+                # metadata. Owner = this handle: lets the operator
+                # assert it's reading its own weights, not another
+                # layer's that overwrote the shared physical slot via
+                # K=2 rotation. available_rows tracks how many leading
+                # prefix rows are valid (per-half for col, total for
+                # qkv/row).
+                h.prefetch_owner_in_slot[h.slot_idx] = h
+                if h.kind == "col":
+                    h.prefetch_available_rows_in_slot[h.slot_idx] = n // 2
+                else:
+                    h.prefetch_available_rows_in_slot[h.slot_idx] = n
+
+        self._copy_done_events[layer_idx].record(self.copy_stream)
+        self._event_valid_for_eager[layer_idx] = not in_capture
+
+    def prepare_for_forward_bucket(
+        self, layer_idx: int, handles: list[CotsLinearHandle]
+    ) -> None:
+        """Idempotent boundary repair for `layer_idx` at `current_bucket`.
+        Copies the missing suffix `[avail:required]` when the slot is
+        underfilled relative to the active bucket; no-op when already
+        sufficient. Owner mismatch is a hard error.
+
+        Phase 1c precondition: bucket dispatch is decided by the active
+        bucket (capture-time constant), not by slot state. This method
+        ensures the slot has enough valid rows for the captured operator
+        to read `slot[:n_pref, :]` safely. Runs OUTSIDE captured graphs
+        (in the pre-hook for eager; at the graph boundary for capture).
+        """
+        b = self.current_bucket
+        in_capture = torch.cuda.is_current_stream_capturing()
+        issued = False
+        for h in handles:
+            if h.max_n_prefetch == 0:
+                continue
+            n_pref = h.n_prefetch_by_bucket.get(b, 0)
+            required = (n_pref // 2) if h.kind == "col" else n_pref
+            if required == 0:
+                continue
+            avail = h.prefetch_available_rows_in_slot[h.slot_idx]
+            owner = h.prefetch_owner_in_slot[h.slot_idx]
+            if owner is not h:
+                raise AssertionError(
+                    f"prepare_for_forward_bucket: slot owner mismatch on "
+                    f"{h.qualified_name} slot {h.slot_idx} (owner={owner})"
+                )
+            if avail >= required:
+                continue
+            if not issued:
+                fork_event = torch.cuda.Event()
+                torch.cuda.current_stream().record_event(fork_event)
+                self.copy_stream.wait_event(fork_event)
+                issued = True
+            with torch.cuda.stream(self.copy_stream):
+                if not self._dry_run:
+                    if h.kind == "row":
+                        assert h.w_row_prefetch_src_t is not None
+                        src = h.w_row_prefetch_src_t[avail:required, :]
+                        h.w_prefetch_slots[h.slot_idx][avail:required, :].copy_(
+                            src, non_blocking=True
+                        )
+                    elif h.kind == "col":
+                        assert h.w_cpu is not None
+                        n_cpu_per_half_total = h.n_cpu // 2
+                        max_half = h.max_n_prefetch // 2
+                        slot = h.w_prefetch_slots[h.slot_idx]
+                        slot[avail:required, :].copy_(
+                            h.w_cpu[avail:required, :], non_blocking=True
+                        )
+                        slot[max_half + avail : max_half + required, :].copy_(
+                            h.w_cpu[
+                                n_cpu_per_half_total + avail : n_cpu_per_half_total
+                                + required,
+                                :,
+                            ],
+                            non_blocking=True,
+                        )
+                    else:  # qkv
+                        assert h.w_cpu is not None
+                        h.w_prefetch_slots[h.slot_idx][avail:required, :].copy_(
+                            h.w_cpu[avail:required, :], non_blocking=True
+                        )
+                h.prefetch_available_rows_in_slot[h.slot_idx] = required
+        if issued:
+            self._prefetch_in_capture[layer_idx] = in_capture
+            self._copy_done_events[layer_idx].record(self.copy_stream)
+            self._event_valid_for_eager[layer_idx] = not in_capture
+
+    def wait(self, layer_idx: int) -> None:
+        """Compute stream waits for this layer's prefetch. Branches on
+        capture state — port of `prefetch.py:299-329`."""
+        if torch.cuda.is_current_stream_capturing():
+            if not self._prefetch_in_capture[layer_idx]:
+                return
+            torch.cuda.current_stream().wait_event(self._copy_done_events[layer_idx])
+            self._prefetch_in_capture[layer_idx] = False
+        else:
+            if self._event_valid_for_eager[layer_idx]:
+                torch.cuda.current_stream().wait_event(
+                    self._copy_done_events[layer_idx]
+                )
+            else:
+                torch.cuda.current_stream().wait_stream(self.copy_stream)
+
+    def sync_prev_onload(self) -> None:
+        """Drain copy_stream into the compute stream — port of
+        `prefetch.py:331-338`."""
+        torch.cuda.current_stream().wait_stream(self.copy_stream)
+
+    def join_after_forward(self) -> None:
+        """Join any layers whose prefetch was started under capture but not
+        yet waited — port of `prefetch.py:345-364`. Handles full and
+        piecewise CUDA-graph modes."""
+        for i, in_capture in enumerate(self._prefetch_in_capture):
+            if in_capture:
+                torch.cuda.current_stream().wait_event(self._copy_done_events[i])
+                self._prefetch_in_capture[i] = False
+
+
+# ---------------------------------------------------------------------------
 # Execution layer: CpuTaskRunner
 #
 # Generic CPU work submitter. Phase 1a: thin wrapper around the global
@@ -675,21 +1172,24 @@ def _cpu_dryrun_noop(
 def _cpu_mlp_block_work(
     d2h_event: torch.cuda.Event,
     x_pinned: torch.Tensor,
-    w_mlp1_cpu: torch.Tensor,
+    w_gate_cpu: torch.Tensor,
+    w_up_cpu: torch.Tensor,
     w_mlp2_cpu: torch.Tensor,
-    n_cpu_per_half: int,
     y2_pinned: torch.Tensor,
 ) -> None:
-    """Fused MLP block: D2H wait → MLP1 → SwiGLU → MLP2.
+    """Fused MLP block: D2H wait → gate / up → SwiGLU → MLP2.
 
-    Matched-index invariant: CPU keeps `y1` and `z` locally — only `y2_pinned`
-    crosses to GPU via UVA. `y1` / `z` are worker-local transients (PyTorch
-    CPU caching allocator); not pinned and not pre-allocated. Phase 1c-
-    compatible: only `x_pinned` / `y2_pinned` / weights need stable addresses.
+    Gate and up are passed separately so Phase 1b can hand the worker
+    non-contiguous CPU-compute slices (each half's prefetched-row prefix
+    is excluded). Phase 1a behavior at `f_prefetch=0`: the slices reduce
+    to the full halves of `gu.w_cpu`. Matched-index invariant unchanged —
+    `gate_out` and `up_out` are worker-local; only `y2_pinned` crosses
+    to GPU via UVA.
     """
     d2h_event.synchronize()
-    y1 = F.linear(x_pinned, w_mlp1_cpu)
-    z = F.silu(y1[:, :n_cpu_per_half]) * y1[:, n_cpu_per_half:]
+    gate_out = F.linear(x_pinned, w_gate_cpu)
+    up_out = F.linear(x_pinned, w_up_cpu)
+    z = F.silu(gate_out) * up_out
     y2_pinned.copy_(F.linear(z, w_mlp2_cpu))
 
 
@@ -738,28 +1238,69 @@ class CotsQKVOp:
         h = self._handle
         assert h.w_cpu is not None
         num_tokens = x.shape[0]
-        # Phase 1a invariant: dispatch lookup must yield f_prefetch=0.
-        _, f_prefetch = offloader.lookup_dispatch(num_tokens)
-        assert f_prefetch == 0.0, (
-            f"Phase 1a: f_prefetch must be 0; got {f_prefetch} for {h.qualified_name}"
-        )
+        # Active-bucket dispatch: compute shape is decided by the bucket
+        # of the CURRENT forward (capture-time constant under Phase 1c
+        # graph capture), not by whatever was last filled into the slot.
+        # Slot state (owner + available_rows) is asserted as a runtime
+        # invariant, not used as a runtime lookup.
+        streamer = offloader._streamer
+        b = streamer.current_bucket if streamer is not None else None
+        if b is None or h.max_n_prefetch == 0:
+            n_pref = 0
+            n_cpu = h.n_cpu
+            cpu_idx = h.cpu_indices_cuda
+            pref_idx = cpu_idx  # unused when n_pref == 0
+        else:
+            n_pref = h.n_prefetch_by_bucket[b]
+            n_cpu = h.n_cpu_compute_by_bucket[b]
+            pref_idx = h.prefetch_indices_cuda_by_bucket[b]
+            cpu_idx = h.cpu_compute_indices_cuda_by_bucket[b]
+            if n_pref > 0:
+                assert h.prefetch_owner_in_slot[h.slot_idx] is h, (
+                    f"slot owner mismatch on {h.qualified_name} slot {h.slot_idx}"
+                )
+                assert h.prefetch_available_rows_in_slot[h.slot_idx] >= n_pref, (
+                    f"slot underfilled on {h.qualified_name}: have "
+                    f"{h.prefetch_available_rows_in_slot[h.slot_idx]}, "
+                    f"need {n_pref}"
+                )
 
-        x_in = offloader._x_pinned[: num_tokens * h.in_dim].view(num_tokens, h.in_dim)
-        y_out = offloader._y_pinned[: num_tokens * h.cpu_out_dim].view(
-            num_tokens, h.cpu_out_dim
-        )
-        y_dst = offloader._y_gpu[: num_tokens * h.cpu_out_dim].view(
-            num_tokens, h.cpu_out_dim
-        )
+        # CPU compute path skipped when n_cpu_compute == 0 (pure-prefetch).
+        y_dst: torch.Tensor | None = None
+        if n_cpu > 0:
+            x_in = offloader._x_pinned[: num_tokens * h.in_dim].view(
+                num_tokens, h.in_dim
+            )
+            y_out = offloader._y_pinned[: num_tokens * n_cpu].view(num_tokens, n_cpu)
+            y_dst = offloader._y_gpu[: num_tokens * n_cpu].view(num_tokens, n_cpu)
+            w_cpu_compute = h.w_cpu.narrow(0, n_pref, n_cpu)
+            self._runner.submit_with_d2h(
+                x, x_in, _cpu_gemm_into_after_event, w_cpu_compute, y_out
+            )
 
-        self._runner.submit_with_d2h(
-            x, x_in, _cpu_gemm_into_after_event, h.w_cpu, y_out
-        )
-        out_gpu_slice = F.linear(x, layer.weight, None)
-        self._runner.wait()
-        uva_copy_into_gpu(y_out, y_dst)
+        # GPU permanent slice. Skipped at f_cpu_store=1.0: F.linear on
+        # weight (0, in_dim) returns (B, 0) which crashes downstream
+        # custom CUDA ops (SiluAndMul) that can't handle zero-size.
+        out_perm: torch.Tensor | None = None
+        if layer.weight.shape[0] > 0:
+            out_perm = F.linear(x, layer.weight, None)
 
-        out = _scatter_col_outputs(out_gpu_slice, y_dst, h, num_tokens)
+        # GPU prefetched slice — runs concurrently on the same compute stream
+        # after `wait_prefetch` (issued by the layer-forward hook) has joined
+        # the copy stream's H2D.
+        out_pref: torch.Tensor | None = None
+        if n_pref > 0 and h.w_prefetch_slots:
+            slot_view = h.w_prefetch_slots[h.slot_idx].narrow(0, 0, n_pref)
+            out_pref = F.linear(x, slot_view, None)
+
+        if n_cpu > 0:
+            self._runner.wait()
+            assert y_dst is not None
+            uva_copy_into_gpu(y_out, y_dst)
+
+        out = _scatter_col_outputs_three_way(
+            out_perm, out_pref, y_dst, pref_idx, cpu_idx, h, num_tokens
+        )
         if bias is not None:
             out = out + bias
         return out
@@ -814,35 +1355,129 @@ class CotsSwiGLUMLPOp:
         assert offloader._y_pinned is not None
         assert offloader._y_gpu is not None
 
+        gu_h = self._gate_up
+        dn_h = self._down
+        assert gu_h.w_cpu is not None
+        assert dn_h.w_cpu is not None
         num_tokens = x.shape[0]
-        x_pinned = offloader._x_pinned[: num_tokens * self._in_dim].view(
-            num_tokens, self._in_dim
-        )
-        y2_pinned = offloader._y_pinned[: num_tokens * self._out_dim].view(
-            num_tokens, self._out_dim
-        )
-        y2_gpu = offloader._y_gpu[: num_tokens * self._out_dim].view(
-            num_tokens, self._out_dim
-        )
+        # Active-bucket dispatch (see CotsQKVOp.apply for rationale).
+        # Compute shape from the active bucket; slot state is asserted
+        # as a runtime invariant. gu and dn share the active bucket by
+        # construction, so no inter-handle bucket-equality check needed.
+        streamer = offloader._streamer
+        b = streamer.current_bucket if streamer is not None else None
+        if b is None or gu_h.max_n_prefetch == 0:
+            gu_n_pref = 0
+            dn_n_pref = 0
+            dn_n_cpu = dn_h.n_cpu
+        else:
+            gu_n_pref = gu_h.n_prefetch_by_bucket[b]
+            dn_n_pref = dn_h.n_prefetch_by_bucket[b]
+            dn_n_cpu = dn_h.n_cpu_compute_by_bucket[b]
+            if gu_n_pref > 0:
+                gu_n_per_half = gu_n_pref // 2
+                assert gu_h.prefetch_owner_in_slot[gu_h.slot_idx] is gu_h, (
+                    f"slot owner mismatch on {gu_h.qualified_name} slot {gu_h.slot_idx}"
+                )
+                assert (
+                    gu_h.prefetch_available_rows_in_slot[gu_h.slot_idx] >= gu_n_per_half
+                ), (
+                    f"col slot underfilled on {gu_h.qualified_name}: have "
+                    f"{gu_h.prefetch_available_rows_in_slot[gu_h.slot_idx]}, "
+                    f"need {gu_n_per_half}"
+                )
+            if dn_n_pref > 0:
+                assert dn_h.prefetch_owner_in_slot[dn_h.slot_idx] is dn_h, (
+                    f"slot owner mismatch on {dn_h.qualified_name} slot {dn_h.slot_idx}"
+                )
+                assert (
+                    dn_h.prefetch_available_rows_in_slot[dn_h.slot_idx] >= dn_n_pref
+                ), (
+                    f"row slot underfilled on {dn_h.qualified_name}: have "
+                    f"{dn_h.prefetch_available_rows_in_slot[dn_h.slot_idx]}, "
+                    f"need {dn_n_pref}"
+                )
 
-        self._runner.submit_with_d2h(
-            x,
-            x_pinned,
-            _cpu_mlp_block_work,
-            self._gate_up.w_cpu,
-            self._down.w_cpu,
-            self._n_cpu_per_half,
-            y2_pinned,
-        )
-        # GPU MLP block on its weight slices. F.linear bypasses the linears'
-        # (raise-guarded) quant_method.apply.
-        gpu_mlp1 = F.linear(x, self._gate_up_layer.weight, None)
-        gpu_silu = self._act_fn(gpu_mlp1)
-        out_gpu = F.linear(gpu_silu, self._down_layer.weight, None)
+        n_pref_per_half = gu_n_pref // 2
+        n_cpu_per_half_total = self._n_cpu_per_half  # original count per half
 
-        self._runner.wait()
-        uva_copy_into_gpu(y2_pinned, y2_gpu)
-        out_gpu.add_(y2_gpu)
+        # CPU compute path — skipped entirely when n_cpu_compute == 0
+        # (pure-prefetch case). Without this fast-path the runner / D2H /
+        # UVA overhead leaks into the prefetch-only regime.
+        y2_pinned: torch.Tensor | None = None
+        y2_gpu: torch.Tensor | None = None
+        if dn_n_cpu > 0:
+            x_pinned = offloader._x_pinned[: num_tokens * self._in_dim].view(
+                num_tokens, self._in_dim
+            )
+            y2_pinned = offloader._y_pinned[: num_tokens * self._out_dim].view(
+                num_tokens, self._out_dim
+            )
+            y2_gpu = offloader._y_gpu[: num_tokens * self._out_dim].view(
+                num_tokens, self._out_dim
+            )
+            # CPU compute slices: gate / up exclude the first `n_pref_per_half`
+            # rows of each half (those are prefetched). MLP2's input cols
+            # exclude the first `dn_n_pref` cols.
+            w_gate_compute = gu_h.w_cpu[n_pref_per_half:n_cpu_per_half_total, :]
+            w_up_compute = gu_h.w_cpu[
+                n_cpu_per_half_total + n_pref_per_half : 2 * n_cpu_per_half_total, :
+            ]
+            w_dn_compute = dn_h.w_cpu.narrow(1, dn_n_pref, dn_n_cpu)
+            self._runner.submit_with_d2h(
+                x,
+                x_pinned,
+                _cpu_mlp_block_work,
+                w_gate_compute,
+                w_up_compute,
+                w_dn_compute,
+                y2_pinned,
+            )
+
+        # GPU permanent MLP block. Skipped at f_cpu_store=1.0: gate_up's
+        # (0, in_dim) weight makes act_fn run on (B, 0) which crashes the
+        # CUDA SiluAndMul custom op.
+        out_gpu: torch.Tensor | None = None
+        if (
+            self._gate_up_layer.weight.shape[0] > 0
+            and self._down_layer.weight.shape[1] > 0
+        ):
+            gpu_mlp1 = F.linear(x, self._gate_up_layer.weight, None)
+            gpu_silu = self._act_fn(gpu_mlp1)
+            out_gpu = F.linear(gpu_silu, self._down_layer.weight, None)
+
+        # GPU prefetched MLP block — adds a row-parallel partial to out_gpu.
+        # Slot layout (Phase 1b → Phase 1c refactor): col slot is
+        # FIXED-MAX `[gate_max | up_max]`. Gate region is `[0:max_half]`,
+        # up region is `[max_half:2*max_half]`. The active bucket
+        # consumes a per-half prefix `[:n_per_half]` from each region;
+        # because gate and up are no longer adjacent in memory, MLP1
+        # is two separate F.linear instead of one fused [gate|up] GEMM,
+        # and silu*up is done explicitly (math-equivalent to
+        # SiluAndMul.forward_native). MLP2/down slot is transposed
+        # (Phase 1b row-prefetch fix): shape (dn_n_pref, out_dim).
+        if gu_n_pref > 0 and gu_h.w_prefetch_slots and dn_h.w_prefetch_slots:
+            n_per_half = gu_n_pref // 2
+            max_half = gu_h.max_n_prefetch // 2
+            gu_slot = gu_h.w_prefetch_slots[gu_h.slot_idx]
+            dn_slot = dn_h.w_prefetch_slots[dn_h.slot_idx]
+            gate_w = gu_slot[:n_per_half, :]
+            up_w = gu_slot[max_half : max_half + n_per_half, :]
+            pref_gate = F.linear(x, gate_w, None)
+            pref_up = F.linear(x, up_w, None)
+            pref_silu = F.silu(pref_gate) * pref_up
+            pref_out = pref_silu.matmul(dn_slot[:dn_n_pref, :])
+            out_gpu = pref_out if out_gpu is None else out_gpu.add_(pref_out)
+
+        if dn_n_cpu > 0:
+            self._runner.wait()
+            assert y2_pinned is not None and y2_gpu is not None
+            uva_copy_into_gpu(y2_pinned, y2_gpu)
+            # When CPU is the sole contributor, clone — y2_gpu is a shared
+            # activation buffer and would be clobbered by the next layer.
+            out_gpu = y2_gpu.clone() if out_gpu is None else out_gpu.add_(y2_gpu)
+
+        assert out_gpu is not None, "MLP block has no active path"
         return out_gpu
 
 
@@ -869,22 +1504,29 @@ class _RaiseOnDirectCall:
         )
 
 
-def _scatter_col_outputs(
-    out_gpu_slice: torch.Tensor,
-    out_cpu_on_gpu: torch.Tensor,
+def _scatter_col_outputs_three_way(
+    out_perm: torch.Tensor | None,
+    out_pref: torch.Tensor | None,
+    out_cpu_on_gpu: torch.Tensor | None,
+    pref_idx: torch.Tensor,
+    cpu_idx: torch.Tensor,
     handle: CotsLinearHandle,
     num_tokens: int,
 ) -> torch.Tensor:
-    """Combine GPU and CPU column slices into the canonical layer output."""
+    """Combine GPU permanent, GPU prefetched, and CPU-on-GPU column slices
+    into the canonical layer output. All three slices are optional:
+      `out_perm is None`     → skipped (f_cpu_store=1.0; permanent slice empty).
+      `out_pref is None`     → skipped (f_prefetch=0).
+      `out_cpu_on_gpu is None` → skipped (n_cpu_compute=0)."""
     assert handle.gpu_indices_cuda is not None
-    assert handle.cpu_indices_cuda is not None
-    out = torch.empty(
-        (num_tokens, handle.out_dim),
-        dtype=out_gpu_slice.dtype,
-        device=out_gpu_slice.device,
-    )
-    out.index_copy_(1, handle.gpu_indices_cuda, out_gpu_slice)
-    out.index_copy_(1, handle.cpu_indices_cuda, out_cpu_on_gpu)
+    ref = next(t for t in (out_perm, out_pref, out_cpu_on_gpu) if t is not None)
+    out = torch.empty((num_tokens, handle.out_dim), dtype=ref.dtype, device=ref.device)
+    if out_perm is not None:
+        out.index_copy_(1, handle.gpu_indices_cuda, out_perm)
+    if out_pref is not None:
+        out.index_copy_(1, pref_idx, out_pref)
+    if out_cpu_on_gpu is not None:
+        out.index_copy_(1, cpu_idx, out_cpu_on_gpu)
     return out
 
 
@@ -908,13 +1550,27 @@ class CotsOffloader(BaseOffloader):
     # `weight_offload_design.md §WO Split Axis Decision`.
     _OFFLOAD_SUFFIXES = ("qkv_proj", "gate_up_proj", "down_proj")
 
-    def __init__(self, config: CotsOffloadConfig):
+    def __init__(
+        self,
+        config: CotsOffloadConfig,
+        dispatch_table_factory: Callable[[list[int]], dict[int, tuple[float, float]]]
+        | None = None,
+    ):
         self.config = config
         self.f_cpu_store = float(config.f_cpu_store)
+        self.f_prefetch = float(config.f_prefetch)
         self.kv_biased = bool(config.kv_biased)
         self.dry_run = bool(config.dry_run)
+        # Optional injection point for the Planner. None → uniform fill
+        # from config in `post_init`.
+        self._dispatch_table_factory = dispatch_table_factory
         if not (0.0 <= self.f_cpu_store <= 1.0):
             raise ValueError(f"f_cpu_store must be in [0, 1], got {self.f_cpu_store}")
+        if self.f_prefetch > self.f_cpu_store:
+            raise ValueError(
+                f"f_prefetch ({self.f_prefetch}) must be <= "
+                f"f_cpu_store ({self.f_cpu_store})"
+            )
         # Only touch the process-wide PyTorch thread count when we actually
         # offload — `--cots-f-cpu-store=0` should be a clean control with
         # no side effects on CPU thread behavior. See `phase1a_findings.md
@@ -928,6 +1584,12 @@ class CotsOffloader(BaseOffloader):
         self._handles: list[CotsLinearHandle] = []
         self._fused_ops: list[CotsSwiGLUMLPOp] = []
 
+        # Per-layer tracking for prefetch hook installation. `_layer_modules[i]`
+        # is the i-th offloaded decoder layer; `_layer_handles[i]` is its
+        # handle list. Indices align with the streamer's per-layer events.
+        self._layer_modules: list[nn.Module] = []
+        self._layer_handles: list[list[CotsLinearHandle]] = []
+
         # Shared activation I/O buffers — allocated at the end of
         # wrap_modules (so vLLM's DeviceMemoryProfiler sees them in
         # `model_memory_usage`). Flat 1D so per-forward views are always
@@ -936,11 +1598,18 @@ class CotsOffloader(BaseOffloader):
         self._y_pinned: torch.Tensor | None = None
         self._y_gpu: torch.Tensor | None = None
 
-        # Dispatch table populated in post_init.
+        # Dispatch table populated in wrap_modules (Phase 1b: needed before
+        # the prefetch buffer pool is sized).
         self._dispatch_table: dict[int, tuple[float, float]] = {}
         self._capture_buckets: list[int] = []
         self._max_num_tokens: int = 0
         self._eager_fallback_entry: tuple[float, float] = (0.0, 0.0)
+
+        # Prefetch infrastructure — allocated in wrap_modules iff
+        # `f_prefetch > 0`. Phase 1a behavior (`f_prefetch == 0`) leaves
+        # both at None and skips hook installation.
+        self._prefetch_buffer_pool: CotsPrefetchBufferPool | None = None
+        self._streamer: WeightPrefetchStreamer | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle: wrap_modules → (weight loading) → post_init.
@@ -960,15 +1629,27 @@ class CotsOffloader(BaseOffloader):
         if self.f_cpu_store > 0.0:
             self._check_pin_memory_available()
 
+        # Resolved early so per-bucket geometry can be built before the
+        # prefetch buffer pool is sized.
+        self._resolve_capture_buckets()
+
         modules: list[nn.Module] = []
+        layer_idx = 0
         for layer in modules_generator:
             modules.append(layer)
             if self.f_cpu_store == 0.0:
                 continue
             layer_handles = self._build_handles(layer)
+            if not layer_handles:
+                continue
+            for h in layer_handles:
+                h.layer_idx = layer_idx
             self._install_qkv_ops(layer_handles)
             self._install_mlp_ops(layer, layer_handles)
             self._check_no_orphan_col_row(layer_handles)
+            self._layer_modules.append(layer)
+            self._layer_handles.append(layer_handles)
+            layer_idx += 1
 
         if self.f_cpu_store == 0.0:
             logger.info_once(
@@ -980,12 +1661,28 @@ class CotsOffloader(BaseOffloader):
         # know the worst-case shapes). All GPU allocations stay inside this
         # method (DeviceMemoryProfiler context).
         self._allocate_activation_buffers()
+
+        # Phase 1b: build dispatch table, populate per-handle prefetch
+        # geometry, and (if f_prefetch > 0) allocate the streamer + buffer
+        # pool and install layer-level prefetch hooks. Phase 1a (f_prefetch=0)
+        # leaves all of this no-op'd.
+        self._build_dispatch_table()
+        for h in self._handles:
+            h.apply_prefetch_split_per_bucket(self._dispatch_table)
+        # Install based on effective dispatch table, not config knob — a
+        # Planner-emitted table can request prefetch even when config
+        # f_prefetch == 0.
+        if any(h.max_n_prefetch > 0 for h in self._handles):
+            self._install_prefetch_machinery()
+
         logger.info_once(
             "CotsOffloader: wrapped %d linear modules and %d fused MLP blocks "
-            "(f_cpu_store=%.4f, kv_biased=%s, cpu_num_threads=%d, dry_run=%s).",
+            "(f_cpu_store=%.4f, f_prefetch=%.4f, kv_biased=%s, "
+            "cpu_num_threads=%d, dry_run=%s).",
             len(self._handles),
             len(self._fused_ops),
             self.f_cpu_store,
+            self.f_prefetch,
             self.kv_biased,
             self.config.cpu_num_threads,
             self.dry_run,
@@ -1182,6 +1879,158 @@ class CotsOffloader(BaseOffloader):
                     f"exclude this linear from offload."
                 )
 
+    # --- Phase 1b: dispatch table + prefetch machinery installation ---
+
+    def _build_dispatch_table(self) -> None:
+        """Construct `_dispatch_table`. Uses the injected factory if present,
+        otherwise uniform fill from config (`f_cpu_store - f_prefetch`,
+        `f_prefetch`)."""
+        if self._dispatch_table_factory is not None:
+            self._dispatch_table = self._dispatch_table_factory(self._capture_buckets)
+        else:
+            pair = (self.f_cpu_store - self.f_prefetch, self.f_prefetch)
+            self._dispatch_table = {b: pair for b in self._capture_buckets}
+
+    def _install_prefetch_machinery(self) -> None:
+        """Phase 1b: allocate buffer pool, stamp slot indices, allocate
+        streamer, install layer-level forward hooks, register first-decoder
+        pre-hook for bucket caching + layer-0 repair."""
+        device = torch.device("cuda")
+        self._prefetch_buffer_pool = CotsPrefetchBufferPool(self._handles, device)
+        for h in self._handles:
+            if h.layer_idx >= 0:
+                h.slot_idx = h.layer_idx % CotsPrefetchBufferPool.K
+
+        # Row-handle only: allocate the transposed pinned-CPU prefetch
+        # source. See CotsLinearHandle.w_row_prefetch_src_t for the
+        # contiguous-vs-pitched-H2D rationale. Skipped when
+        # max_n_prefetch == 0 so f_prefetch=0.0 is bit-exact to Phase 1a.
+        for h in self._handles:
+            if h.kind == "row" and h.max_n_prefetch > 0:
+                h.w_row_prefetch_src_t = torch.empty(
+                    (h.max_n_prefetch, h.out_dim),
+                    dtype=h.dtype,
+                    device="cpu",
+                    pin_memory=is_pin_memory_available(),
+                )
+
+        n_layers = len(self._layer_modules)
+        self._streamer = WeightPrefetchStreamer(n_layers=n_layers, dry_run=self.dry_run)
+        self._streamer.buffer_pool = self._prefetch_buffer_pool
+
+        for i, layer in enumerate(self._layer_modules):
+            self._hook_layer_forward(i, layer)
+
+        if self._layer_modules:
+            self._layer_modules[0].register_forward_pre_hook(
+                self._first_decoder_pre_hook, with_kwargs=True
+            )
+
+    def _hook_layer_forward(self, index: int, layer: nn.Module) -> None:
+        """Wrap the decoder layer's `forward` with pre-compute scheduling.
+
+        For layer i: wait for layer i's prefetched weights, start prefetch
+        for layer i+1, then run layer i. With K=2 slot rotation, i reads
+        slot i%2 while i+1 writes slot (i+1)%2, so the H2D overlaps with
+        layer i compute without a wraparound special case.
+        """
+        original_forward = layer.forward
+        n_layers = len(self._layer_modules)
+
+        layer_has_prefetch = any(
+            h.max_n_prefetch > 0 for h in self._layer_handles[index]
+        )
+        next_idx = (index + 1) % n_layers if n_layers > 0 else 0
+        next_has_prefetch = (
+            n_layers > 1
+            and next_idx != index
+            and any(h.max_n_prefetch > 0 for h in self._layer_handles[next_idx])
+        )
+
+        def forward(*args, **kwargs):
+            layer.forward = original_forward
+            anchor = args[0] if args else next(iter(kwargs.values()))
+            if layer_has_prefetch:
+                torch.ops.vllm.wait_prefetch(anchor, index)
+            if next_has_prefetch:
+                torch.ops.vllm.start_prefetch(anchor, next_idx)
+            output = original_forward(*args, **kwargs)
+            layer.forward = forward
+            return output
+
+        layer.forward = forward
+
+    def _first_decoder_pre_hook(self, module, args, kwargs):
+        """Fires at the start of every model forward. Sets the active
+        bucket and repairs layer 0's slot if it's underfilled relative to
+        the active bucket.
+
+        Layer 0 is the only slot consumed before the current forward can
+        issue a prefetch for it; all other layers are prefetched by their
+        predecessor's pre-compute hook. The same repair is called at the
+        Phase 1c FULL CUDA graph boundary.
+        """
+        del module
+        anchor = args[0] if args else next(iter(kwargs.values()))
+        self.prepare_before_forward(anchor.shape[0])
+
+    def _bucket_for(self, num_tokens: int) -> int:
+        """Bisect-up lookup on `_capture_buckets`. Returns the bucket key
+        (matches `lookup_dispatch`'s rounding semantics, `planner_design.md
+        §4.5`). Out-of-range returns the largest captured bucket."""
+        from bisect import bisect_left
+
+        i = bisect_left(self._capture_buckets, num_tokens)
+        if i >= len(self._capture_buckets):
+            return self._capture_buckets[-1]
+        return self._capture_buckets[i]
+
+    # --- BaseOffloader lifecycle delegation ---
+
+    def prepare_before_forward(self, num_tokens: int) -> None:
+        """Repair active-bucket state before a forward starts.
+
+        This is deliberately limited to layer 0. Steady-state next-layer
+        prefetches are emitted inside each layer wrapper so FULL CUDA graph
+        capture records them as graph nodes rather than relying on replay-time
+        Python state.
+        """
+        if self._streamer is None:
+            return
+        self._streamer.set_current_bucket(num_tokens, self._bucket_for)
+        if self._layer_handles:
+            self._streamer.prepare_for_forward_bucket(0, self._layer_handles[0])
+
+    def _start_prefetch(self, layer_idx: int) -> None:
+        if self._streamer is not None:
+            self._streamer.start(layer_idx, self._layer_handles[layer_idx])
+
+    def _wait_for_layer(self, layer_idx: int) -> None:
+        if self._streamer is not None:
+            self._streamer.wait(layer_idx)
+
+    def sync_prev_onload(self) -> None:
+        if self._streamer is not None:
+            self._streamer.sync_prev_onload()
+
+    def join_after_forward(self) -> None:
+        if self._streamer is not None:
+            self._streamer.join_after_forward()
+
+    # --- Capture-bucket resolution ---
+
+    def _resolve_capture_buckets(self) -> None:
+        from vllm.config import get_current_vllm_config
+
+        vllm_config = get_current_vllm_config()
+        self._max_num_tokens = int(vllm_config.scheduler_config.max_num_batched_tokens)
+        capture_sizes = list(
+            vllm_config.compilation_config.cudagraph_capture_sizes or []
+        )
+        if not capture_sizes:
+            capture_sizes = [self._max_num_tokens]
+        self._capture_buckets = sorted(set(capture_sizes))
+
     # --- Activation buffer allocation ---
 
     def _allocate_activation_buffers(self) -> None:
@@ -1190,13 +2039,9 @@ class CotsOffloader(BaseOffloader):
         """
         if not self._handles:
             return
-        from vllm.config import get_current_vllm_config
-
-        vllm_config = get_current_vllm_config()
         device = torch.device("cuda")
         max_in_dim = max(h.cpu_in_dim for h in self._handles)
         max_cpu_out_dim = max(h.cpu_out_dim for h in self._handles)
-        self._max_num_tokens = int(vllm_config.scheduler_config.max_num_batched_tokens)
         dtype = self._handles[0].dtype
         x_capacity = self._max_num_tokens * max_in_dim
         y_capacity = self._max_num_tokens * max_cpu_out_dim
@@ -1217,11 +2062,10 @@ class CotsOffloader(BaseOffloader):
     # --- post_init: bookkeeping only ---
 
     def post_init(self) -> None:
-        """Verify enforce_eager and build the per-bucket dispatch table.
-
-        No GPU allocations or data movement — those happen in `wrap_modules`
-        so vLLM's DeviceMemoryProfiler sees them in `model_memory_usage`.
-        """
+        """Verify enforce_eager and finalize bookkeeping. The dispatch table
+        and per-bucket geometry are built in `wrap_modules` (Phase 1b — they
+        must exist before the prefetch buffer pool is sized inside the
+        DeviceMemoryProfiler context)."""
         if not self._handles:
             return
         from vllm.config import get_current_vllm_config
@@ -1229,26 +2073,58 @@ class CotsOffloader(BaseOffloader):
         vllm_config = get_current_vllm_config()
         if not vllm_config.model_config.enforce_eager:
             raise RuntimeError(
-                "CotsOffloader (Phase 1a) requires enforce_eager=True. "
+                "CotsOffloader requires enforce_eager=True. "
                 "CUDA graph capture is deferred to Phase 1c (was Phase 4)."
             )
 
-        capture_sizes = list(
-            vllm_config.compilation_config.cudagraph_capture_sizes or []
-        )
-        if not capture_sizes:
-            capture_sizes = [self._max_num_tokens]
-        self._capture_buckets = sorted(set(capture_sizes))
-        self._dispatch_table = {
-            b: (self.f_cpu_store, 0.0) for b in self._capture_buckets
-        }
-        self._eager_fallback_entry = (self.f_cpu_store, 0.0)
+        self._eager_fallback_entry = self._dispatch_table[self._capture_buckets[-1]]
 
-        for bucket, (_, f_prefetch) in self._dispatch_table.items():
-            assert f_prefetch == 0.0, (
-                f"Phase 1a: bucket {bucket} has non-zero f_prefetch "
-                f"({f_prefetch}). Prefetch is Phase 1b."
-            )
+        # Post-init max-fill for layer 0. It is consumed before the current
+        # forward can issue any pre-compute prefetch; every later layer is
+        # prefetched by its predecessor's wrapper. Fill to max_n_prefetch
+        # (per-half for col, total for qkv/row); active-bucket dispatch
+        # consumes only the needed prefix.
+        if self._streamer is not None and self._layer_handles:
+            fork_event = torch.cuda.Event()
+            torch.cuda.current_stream().record_event(fork_event)
+            self._streamer.copy_stream.wait_event(fork_event)
+            with torch.cuda.stream(self._streamer.copy_stream):
+                for h in self._layer_handles[0]:
+                    if h.max_n_prefetch == 0:
+                        continue
+                    if h.kind == "col":
+                        assert h.w_cpu is not None
+                        max_half = h.max_n_prefetch // 2
+                        n_cpu_per_half_total = h.n_cpu // 2
+                        slot = h.w_prefetch_slots[h.slot_idx]
+                        slot[:max_half, :].copy_(
+                            h.w_cpu[:max_half, :], non_blocking=True
+                        )
+                        slot[max_half : 2 * max_half, :].copy_(
+                            h.w_cpu[
+                                n_cpu_per_half_total : n_cpu_per_half_total + max_half,
+                                :,
+                            ],
+                            non_blocking=True,
+                        )
+                        h.prefetch_available_rows_in_slot[h.slot_idx] = max_half
+                    elif h.kind == "row":
+                        assert h.w_row_prefetch_src_t is not None
+                        m = h.max_n_prefetch
+                        h.w_prefetch_slots[h.slot_idx][:m, :].copy_(
+                            h.w_row_prefetch_src_t[:m, :],
+                            non_blocking=True,
+                        )
+                        h.prefetch_available_rows_in_slot[h.slot_idx] = m
+                    else:  # qkv
+                        assert h.w_cpu is not None
+                        m = h.max_n_prefetch
+                        h.w_prefetch_slots[h.slot_idx][:m, :].copy_(
+                            h.w_cpu[:m, :], non_blocking=True
+                        )
+                        h.prefetch_available_rows_in_slot[h.slot_idx] = m
+                    h.prefetch_owner_in_slot[h.slot_idx] = h
+            self._streamer.copy_stream.synchronize()
 
         total_offloaded = sum(
             h.w_cpu.numel() * h.w_cpu.element_size()
@@ -1258,12 +2134,24 @@ class CotsOffloader(BaseOffloader):
         assert self._x_pinned is not None
         assert self._y_pinned is not None
         assert self._y_gpu is not None
+
+        # Prefetch summary (zero / disabled when f_prefetch == 0).
+        if self._prefetch_buffer_pool is not None:
+            prefetch_gb = self._prefetch_buffer_pool.total_bytes / 1e9
+            f_pref_per_bucket = sorted(
+                {f_pref for _, f_pref in self._dispatch_table.values()}
+            )
+        else:
+            prefetch_gb = 0.0
+            f_pref_per_bucket = [0.0]
+
         logger.info(
             "[CotsOffloader] Initialized: %d offloaded linears, "
             "%d fused MLP blocks, "
             "GPU memory saved (weights): %.4f GB, "
             "shared activation buffers: %.4f GB pinned input + "
             "%.4f GB pinned output + %.4f GB GPU UVA-dest, "
+            "prefetch buffer pool: %.4f GB (K=%d, f_prefetch values: %s), "
             "dispatch buckets: %s",
             len(self._handles),
             len(self._fused_ops),
@@ -1271,7 +2159,43 @@ class CotsOffloader(BaseOffloader):
             self._x_pinned.numel() * self._x_pinned.element_size() / 1e9,
             self._y_pinned.numel() * self._y_pinned.element_size() / 1e9,
             self._y_gpu.numel() * self._y_gpu.element_size() / 1e9,
+            prefetch_gb,
+            CotsPrefetchBufferPool.K,
+            f_pref_per_bucket,
             self._capture_buckets,
+        )
+
+        # Effective routing breakdown — actual bytes routed through each
+        # path, accounting for head-aligned snapping and per-kind geometry.
+        # Reported at the largest capture bucket (worst case for prefetch
+        # buffer sizing).
+        bucket = self._capture_buckets[-1]
+        elem = self._handles[0].dtype.itemsize
+        per_kind_pref = {"qkv": 0, "col": 0, "row": 0}
+        per_kind_cpu = {"qkv": 0, "col": 0, "row": 0}
+        for h in self._handles:
+            n_pref = h.n_prefetch_by_bucket.get(bucket, 0)
+            n_cpu = h.n_cpu_compute_by_bucket.get(bucket, 0)
+            other_dim = h.in_dim if h.kind != "row" else h.out_dim
+            per_kind_pref[h.kind] += n_pref * other_dim * elem
+            per_kind_cpu[h.kind] += n_cpu * other_dim * elem
+        total_pref = sum(per_kind_pref.values())
+        total_cpu = sum(per_kind_cpu.values())
+        logger.info(
+            "[CotsOffloader] Effective routing @ bucket=%d:\n"
+            "  qkv:  prefetched=%.4f GiB, cpu-computed=%.4f GiB\n"
+            "  col:  prefetched=%.4f GiB, cpu-computed=%.4f GiB\n"
+            "  row:  prefetched=%.4f GiB, cpu-computed=%.4f GiB\n"
+            "  total: prefetched=%.4f GiB, cpu-computed=%.4f GiB",
+            bucket,
+            per_kind_pref["qkv"] / 1024**3,
+            per_kind_cpu["qkv"] / 1024**3,
+            per_kind_pref["col"] / 1024**3,
+            per_kind_cpu["col"] / 1024**3,
+            per_kind_pref["row"] / 1024**3,
+            per_kind_cpu["row"] / 1024**3,
+            total_pref / 1024**3,
+            total_cpu / 1024**3,
         )
 
     # --- Runtime: dispatch lookup ---
