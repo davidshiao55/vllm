@@ -1567,12 +1567,14 @@ def _make_runner(config: CotsOffloadConfig) -> PythonCotsRunner | NativeCotsRunn
     instance, which is the structural prerequisite for the native
     runner's per-offloader slab pool + runner_id.
     """
-    # Default fallback "python" matches `CotsOffloadConfig.cpu_runner`
-    # (vllm/config/offload.py) through Stage 4. Stage 5 will flip both
-    # together once graph capture is verified end-to-end. Picking
-    # "native" here would let an old config shim (no `cpu_runner`
-    # field) silently route through the unwired native path during
-    # Stage 2/3/4 and fail at the operator call site.
+    # CotsOffloadConfig.cpu_runner now defaults to "native" (Stage 5
+    # production path). The fallback here intentionally stays "python"
+    # for legacy config shims that lack the field entirely — those
+    # have never been exercised under the native runner's slab/install
+    # path, so silently routing them through native would surface
+    # untested code paths at the operator call site. New config
+    # objects always carry the `cpu_runner` field via pydantic so the
+    # fallback only fires for hand-rolled stub configs in tests.
     cpu_runner = getattr(config, "cpu_runner", "python")
     dry_run = bool(getattr(config, "dry_run", False))
     if cpu_runner == "python":
@@ -2854,20 +2856,39 @@ class CotsOffloader(BaseOffloader):
     # --- post_init: bookkeeping only ---
 
     def post_init(self) -> None:
-        """Verify enforce_eager and finalize bookkeeping. The dispatch table
-        and per-bucket geometry are built in `wrap_modules` (Phase 1b — they
-        must exist before the prefetch buffer pool is sized inside the
-        DeviceMemoryProfiler context)."""
+        """Verify enforce_eager (conditional on runner) and finalize
+        bookkeeping. The dispatch table and per-bucket geometry are
+        built in `wrap_modules` (Phase 1b — they must exist before the
+        prefetch buffer pool is sized inside the DeviceMemoryProfiler
+        context)."""
         if not self._handles:
             return
         from vllm.config import get_current_vllm_config
 
         vllm_config = get_current_vllm_config()
+        # Phase 1c Stage 5: the `enforce_eager` requirement is now
+        # CONDITIONAL on runner type:
+        #   * cpu_runner='native': the C++ `cudaLaunchHostFunc`
+        #     substrate IS graph-capturable (CUDA Graph host-function
+        #     nodes, supported since CUDA 11.1). `enforce_eager=False`
+        #     is permitted and is the production path that delivers
+        #     the §1.14 orch collapse.
+        #   * cpu_runner='python': the `ThreadPoolExecutor.submit` /
+        #     `future.result()` substrate is NOT graph-capturable —
+        #     capturing it would silently produce wrong results, not
+        #     just a slower one. Hard fail until the user either
+        #     enables enforce_eager or switches to the native runner.
         if not vllm_config.model_config.enforce_eager:
-            raise RuntimeError(
-                "CotsOffloader requires enforce_eager=True. "
-                "CUDA graph capture is deferred to Phase 1c (was Phase 4)."
-            )
+            cpu_runner = getattr(self.config, "cpu_runner", "python")
+            if cpu_runner != "native":
+                raise RuntimeError(
+                    "CotsOffloader: cpu_runner='python' requires "
+                    "enforce_eager=True — Python runner uses "
+                    "ThreadPoolExecutor + future.result() which is NOT "
+                    "graph-capturable. Either set enforce_eager=True or "
+                    "switch to cpu_runner='native' (the Phase 1c "
+                    "production path; supports CUDA Graph capture)."
+                )
 
         self._eager_fallback_entry = self._dispatch_table[self._capture_buckets[-1]]
 

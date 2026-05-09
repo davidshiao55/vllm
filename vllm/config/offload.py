@@ -157,20 +157,19 @@ class CotsOffloadConfig:
 
     Only consulted by `cpu_runner='native'`."""
 
-    cpu_runner: Literal["native", "python"] = "python"
-    """Phase 1c kill-switch. "native" routes CPU work through
-    `cudaLaunchHostFunc` + a C++ `TaskQueue` worker (the production
-    Phase 1c substrate; supports CUDA Graph capture once
-    `enforce_eager=False`). "python" keeps the Phase 1a/1b
-    `ThreadPoolExecutor` substrate for A/B diagnostics — that path is
-    NOT graph-capturable, so `cpu_runner="python"` requires
-    `enforce_eager=True` and will be rejected at engine launch
-    otherwise. The default flips to "native" at Phase 1c Stage 5
-    once graph capture is verified end-to-end; until then it stays
-    "python" so existing Phase 1a/1b workflows are unchanged. Slated
-    for deprecation one quarter post-Phase-1c. See
-    `David/Docs/implementation_roadmap.md` Phase 1c and the approved
-    plan at /root/.claude/plans/pleaes-implement-phase1c-in-quizzical-mist.md."""
+    cpu_runner: Literal["native", "python"] = "native"
+    """Phase 1c runner selector — production default flipped at Stage
+    5 once CUDA Graph capture was verified end-to-end. "native" routes
+    CPU work through `cudaLaunchHostFunc` + a C++ `TaskQueue` worker;
+    supports `enforce_eager=False` (production decode path) and
+    delivers the §1.14 orch collapse. "python" is the kill-switch:
+    keeps the Phase 1a/1b `ThreadPoolExecutor` substrate for A/B
+    diagnostics. That path is NOT graph-capturable, so
+    `cpu_runner="python"` requires `enforce_eager=True` and is
+    rejected at engine launch otherwise. Slated for deprecation one
+    quarter post-Phase-1c. See `David/Docs/implementation_roadmap.md`
+    Phase 1c and the approved plan at
+    /root/.claude/plans/pleaes-implement-phase1c-in-quizzical-mist.md."""
 
     dry_run: bool = Field(default=False)
     """Diagnostic: install all wrappers but skip the CPU GEMM in the worker.
