@@ -1288,13 +1288,11 @@ class PythonCotsRunner:
         self._future: Future | None = None
         self._dry_run = dry_run
         self._callbacks: dict[tuple[int, int, str], PyCotsCallback] = {}
-        self._bucket_for_fallback: Callable[[int], int] | None = None
         self._installed = False
 
     def install(
         self,
         callbacks: dict[tuple[int, int, str], PyCotsCallback],
-        bucket_for_fallback: Callable[[int], int] | None = None,
     ) -> None:
         """Register the per-(layer, bucket, op_kind) work closures.
 
@@ -1304,13 +1302,18 @@ class PythonCotsRunner:
         D2H event sync runs, no real CPU GEMM) — the runner's
         submit/wait shape is identical either way so timing-sensitive
         diagnostics can A/B by toggling `dry_run`.
+
+        §1c.19: this method intentionally does NOT take a
+        `bucket_for_fallback` callable. Operators are required to
+        resolve `op_descriptor[1]` to a non-None int before calling
+        `submit_with_d2h` (matches the NativeCotsRunner contract so
+        operators don't branch on runner type).
         """
         if self._installed:
             raise RuntimeError(
                 "PythonCotsRunner.install() called twice on the same instance"
             )
         self._callbacks = dict(callbacks)
-        self._bucket_for_fallback = bucket_for_fallback
         self._installed = True
 
     def submit_with_d2h(
@@ -1318,35 +1321,30 @@ class PythonCotsRunner:
         x_gpu: torch.Tensor,
         x_pinned: torch.Tensor,
         y_pinned: torch.Tensor,
-        op_descriptor: tuple[int, int | None, str],
+        op_descriptor: tuple[int, int, str],
     ) -> None:
         """Phase 1c uniform facade. D2H copies `x_gpu` into `x_pinned`,
         records an event ordering the H2D, and submits the work closure
         that fills `y_pinned`. Both runners share this signature so
         operators don't branch on runner type.
+
+        §1c.19: `op_descriptor[1]` MUST be a resolved int. Operators
+        run `offloader._bucket_for(num_tokens)` themselves before
+        invoking the runner — the runner facade carries no
+        offloader-bound state.
         """
-        # Lazy bucket-fallback (plan §design-decision 11): if the
-        # operator hasn't seen `prepare_before_forward` set the active
-        # bucket yet (e.g., a code path that bypassed the pre-hook), we
-        # rebuild the descriptor from `_bucket_for(num_tokens)` here so
-        # the slab/closure lookup never sees `bucket=None`. Bind a
-        # fresh-typed local so mypy can narrow `int | None` -> `int`
-        # for the dict lookup.
-        layer_idx, raw_bucket, op_kind = op_descriptor
-        if raw_bucket is None:
-            assert self._bucket_for_fallback is not None, (
-                "PythonCotsRunner: op_descriptor bucket is None and "
-                "bucket_for_fallback was not registered at install"
-            )
-            raw_bucket = self._bucket_for_fallback(int(x_gpu.shape[0]))
-        resolved: tuple[int, int, str] = (layer_idx, raw_bucket, op_kind)
+        layer_idx, bucket, op_kind = op_descriptor
+        assert isinstance(bucket, int), (
+            "PythonCotsRunner.submit_with_d2h: op_descriptor[1] must be "
+            "a resolved int bucket. See phase1c_findings.md §1c.19."
+        )
         x_pinned.copy_(x_gpu, non_blocking=True)
         event = torch.cuda.Event()
         event.record()
         if self._dry_run:
             cb: PyCotsCallback = _cpu_dryrun_noop
         else:
-            cb = self._callbacks[resolved]
+            cb = self._callbacks[(layer_idx, bucket, op_kind)]
         self._future = _get_executor().submit(cb, event, x_pinned, y_pinned)
 
     def wait_and_uva(
@@ -1407,12 +1405,16 @@ class NativeCotsRunner:
     kind = "native"
 
     def __init__(self, dry_run: bool = False) -> None:
-        # Lazy imports: cots_ops imports _cots_C which is built only on
-        # CUDA; users on CPU-only / ROCm builds shouldn't hit ImportError
-        # just by importing this module. The registry helpers live in
-        # cots_ops alongside the custom-op registration.
+        # Lazy import: _cots_C is built only on CUDA. Users on CPU-only
+        # / ROCm builds shouldn't hit ImportError just by importing this
+        # module — the runner type is constructed only when the offload
+        # config selects `cpu_runner='native'`. Any reference we hold
+        # to the pybind handle is on the cots_ops registry, NOT on this
+        # runner's `__dict__` (§1c.19): if the handle were stored on
+        # `self`, Dynamo's guard serialization would walk it and try to
+        # pickle a `CotsCpuInfer`, which is unpicklable.
         try:
-            from vllm import _cots_C  # noqa: F401 — used via attr below
+            from vllm import _cots_C
         except ImportError as e:
             raise RuntimeError(
                 "NativeCotsRunner requires the `vllm._cots_C` extension, "
@@ -1421,12 +1423,12 @@ class NativeCotsRunner:
             ) from e
         from vllm.model_executor.offloader import cots_ops
 
-        self._infer = _cots_C.CotsCpuInfer()
-        self._dry_run = dry_run
-        # Strong reference to the cots_ops module so the registry's weak
-        # entries don't get GC-collected while this runner is alive.
-        self._cots_ops = cots_ops
-        self._runner_id: int = cots_ops._register_runner(self)
+        # Hand the freshly-constructed handle to the registry; the
+        # registry's strong reference is now the SOLE owner. The local
+        # variable goes out of scope at the end of __init__, so nothing
+        # in `self.__dict__` references it.
+        self._runner_id: int = cots_ops._register_infer(_cots_C.CotsCpuInfer())
+        self._dry_run: bool = bool(dry_run)
         # Stage 3 will populate this from CotsOffloader._build_slab_table.
         # Format: {(layer_idx, bucket, op_kind): task_id}.
         self._task_id_for: dict[tuple[int, int, str], int] = {}
@@ -1437,7 +1439,6 @@ class NativeCotsRunner:
         slab_specs: list[NativeSlabSpec],
         scratch_max_tokens: int,
         scratch_max_intermediate_per_half: int,
-        bucket_for_fallback: Callable[[int], int] | None = None,
     ) -> None:
         """Allocate the C++ slab pool, populate slabs, and build the
         op_descriptor -> task_id map. Called once at offloader
@@ -1451,21 +1452,31 @@ class NativeCotsRunner:
         runtime path exercises the full host-callback round-trip but
         skips real GEMM (mirrors Phase 1a/1b's PythonCotsRunner dry_run
         diagnostic, see phase1a_findings.md §1.14).
+
+        §1c.19: this method intentionally does NOT take a
+        `bucket_for_fallback` callable. Operators are required to
+        resolve `op_descriptor[1]` to a non-None int before calling
+        `submit_with_d2h` — passing a bound method here would drag
+        the offloader into Dynamo's guard graph and break pickling.
         """
+        from vllm.model_executor.offloader import cots_ops
+
         if self._installed:
             raise RuntimeError(
                 "NativeCotsRunner.install() called twice on the same instance"
             )
         n_slabs = len(slab_specs)
-        self._infer.install(
-            n_slabs=int(n_slabs),
-            scratch_max_tokens=int(scratch_max_tokens),
-            scratch_max_intermediate_per_half=int(scratch_max_intermediate_per_half),
+        cots_ops.install_infer(
+            self._runner_id,
+            n_slabs=n_slabs,
+            scratch_max_tokens=scratch_max_tokens,
+            scratch_max_intermediate_per_half=scratch_max_intermediate_per_half,
         )
         for tid, spec in enumerate(slab_specs):
             self._task_id_for[spec.op_descriptor] = tid
-            spec.populate(self._infer, tid, dry_run=self._dry_run)
-        self._bucket_for_fallback = bucket_for_fallback
+            cots_ops.populate_slab_via_spec(
+                self._runner_id, spec, tid, dry_run=self._dry_run
+            )
         self._installed = True
 
     def submit_with_d2h(
@@ -1473,7 +1484,7 @@ class NativeCotsRunner:
         x_gpu: torch.Tensor,
         x_pinned: torch.Tensor,
         y_pinned: torch.Tensor,
-        op_descriptor: tuple[int, int | None, str],
+        op_descriptor: tuple[int, int, str],
     ) -> None:
         """Phase 1c uniform facade. Issues a non-blocking D2H of x_gpu
         into x_pinned on the current CUDA stream, then routes through
@@ -1483,19 +1494,21 @@ class NativeCotsRunner:
         x_gpu (preserves the overlap window). The custom op's impl
         looks up the per-runner pybind handle by runner_id and invokes
         `submit_on_stream(task_id, num_tokens, stream)` on it.
+
+        §1c.19: `op_descriptor[1]` MUST be a resolved int. Operators
+        call `offloader._bucket_for(num_tokens)` themselves before
+        invoking the runner, so the runner facade contains no
+        offloader-bound references and stays Dynamo-pickleable.
         """
-        # Lazy bucket-fallback (plan §design-decision 11): same shape
-        # as PythonCotsRunner. Bind a fresh-typed local so mypy
-        # narrows `int | None` -> `int` for the dict lookup.
-        layer_idx, raw_bucket, op_kind = op_descriptor
-        if raw_bucket is None:
-            assert self._bucket_for_fallback is not None, (
-                "NativeCotsRunner: op_descriptor bucket is None and "
-                "bucket_for_fallback was not registered at install"
-            )
-            raw_bucket = self._bucket_for_fallback(int(x_gpu.shape[0]))
-        resolved: tuple[int, int, str] = (layer_idx, raw_bucket, op_kind)
-        task_id = self._task_id_for[resolved]
+        layer_idx, bucket, op_kind = op_descriptor
+        # Defensive — operator callers always resolve. Cheap to validate.
+        assert isinstance(bucket, int), (
+            "NativeCotsRunner.submit_with_d2h: op_descriptor[1] must be "
+            "a resolved int bucket. Operators are responsible for "
+            "running offloader._bucket_for(num_tokens) BEFORE calling "
+            "the runner. See phase1c_findings.md §1c.19."
+        )
+        task_id = self._task_id_for[(layer_idx, bucket, op_kind)]
         num_tokens = int(x_gpu.shape[0])
         # D2H first; the cots_submit_gemm op's `mutates_args=["x_gpu",
         # "y_pinned"]` keeps the cudaLaunchHostFunc enqueue ordered
@@ -1526,12 +1539,16 @@ class NativeCotsRunner:
 
     def close(self) -> None:
         """Drain any in-flight worker task and drop the registry entry.
-        Idempotent; safe to call from teardown."""
+        Idempotent; safe to call from teardown. Both the drain and the
+        unregister go through cots_ops helpers so this runner facade
+        never has to dereference the pybind handle directly (see
+        §1c.19)."""
+        from vllm.model_executor.offloader import cots_ops
+
         try:
-            if self._infer is not None:
-                self._infer.sync_blocking()
+            cots_ops.sync_blocking(self._runner_id)
         finally:
-            self._cots_ops._unregister_runner(self._runner_id)
+            cots_ops._unregister_infer(self._runner_id)
 
     def __del__(self) -> None:
         # Best-effort registry cleanup if the user forgot to call close().
@@ -1550,9 +1567,13 @@ class NativeCotsRunner:
         #
         # `try/except: pass` rather than `contextlib.suppress` because at
         # interpreter shutdown `contextlib` itself can be None;
-        # try/except is the only finalizer-safe form.
+        # try/except is the only finalizer-safe form. Lazy-import the
+        # registry module too — interpreter shutdown can already have
+        # cleared it.
         try:  # noqa: SIM105
-            self._cots_ops._unregister_runner(self._runner_id)
+            from vllm.model_executor.offloader import cots_ops
+
+            cots_ops._unregister_infer(self._runner_id)
         except Exception:  # noqa: BLE001
             pass
 
@@ -1694,15 +1715,20 @@ class CotsQKVOp:
         # yet (e.g., test that bypasses the hook), fall back to
         # `_bucket_for(num_tokens)` here. The runner's lazy descriptor
         # rebuild is still a defense-in-depth backup.
+        # §1c.19: resolve bucket to a non-None int up-front. The runner
+        # facade does NOT carry a `bucket_for_fallback` callable anymore
+        # (that bound method dragged the offloader into Dynamo's guard
+        # graph); operators are responsible for handing the runner a
+        # fully-resolved descriptor.
         b = offloader._current_bucket
+        if b is None:
+            b = offloader._bucket_for(num_tokens)
         if h.max_n_prefetch == 0:
             n_pref = 0
             n_cpu = h.n_cpu
             cpu_idx = h.cpu_indices_cuda
             pref_idx = cpu_idx  # unused when n_pref == 0
         else:
-            if b is None:
-                b = offloader._bucket_for(num_tokens)
             n_pref = h.n_prefetch_by_bucket[b]
             n_cpu = h.n_cpu_compute_by_bucket[b]
             pref_idx = h.prefetch_indices_cuda_by_bucket[b]
@@ -1728,10 +1754,8 @@ class CotsQKVOp:
             y_dst = offloader._y_gpu[: num_tokens * n_cpu].view(num_tokens, n_cpu)
             # Phase 1c Stage 3 uniform facade: no callback / weight
             # passed inline — the runner has those captured at install
-            # time per (layer_idx, bucket, op_kind). `b` may be None
-            # here (no streamer + pre-hook hasn't fired yet); the
-            # runner's lazy fallback resolves it before the slab/closure
-            # lookup.
+            # time per (layer_idx, bucket, op_kind). Bucket is already
+            # an int by construction above (§1c.19).
             self._runner.submit_with_d2h(x, x_in, y_out, (h.layer_idx, b, "qkv"))
 
         # GPU permanent slice. Skipped at f_cpu_store=1.0: F.linear on
@@ -1827,11 +1851,13 @@ class CotsSwiGLUMLPOp:
         num_tokens = x.shape[0]
         # Phase 1c Stage 3: bucket from offloader, not streamer (see
         # CotsQKVOp.apply for the resolution rationale). gu and dn
-        # share the active bucket by construction.
+        # share the active bucket by construction. §1c.19: resolve to
+        # a non-None int up-front; the runner facade no longer carries
+        # a fallback callable.
         b = offloader._current_bucket
-        if gu_h.max_n_prefetch > 0 and b is None:
+        if b is None:
             b = offloader._bucket_for(num_tokens)
-        if b is None or gu_h.max_n_prefetch == 0:
+        if gu_h.max_n_prefetch == 0:
             gu_n_pref = 0
             dn_n_pref = 0
             dn_n_cpu = dn_h.n_cpu
@@ -2655,7 +2681,7 @@ class CotsOffloader(BaseOffloader):
         self._validate_thread_policy()
         if isinstance(self._runner, PythonCotsRunner):
             callbacks = self._build_python_callbacks()
-            self._runner.install(callbacks, bucket_for_fallback=self._bucket_for)
+            self._runner.install(callbacks)
         elif isinstance(self._runner, NativeCotsRunner):
             slab_specs = self._build_native_slab_specs()
             # Worst-case scratch: max(n_cpu_per_half) over all fused MLP
@@ -2670,15 +2696,19 @@ class CotsOffloader(BaseOffloader):
                 slab_specs=slab_specs,
                 scratch_max_tokens=int(self._max_num_tokens),
                 scratch_max_intermediate_per_half=int(max_inter_per_half),
-                bucket_for_fallback=self._bucket_for,
             )
             # Stage 4: optional worker-thread CPU affinity. The C++
             # `set_worker_affinity` packs cpu IDs into a uint64 bitmask,
             # intersects with the process's `sched_getaffinity` mask,
             # and warns-and-skips on empty intersection. None / empty
             # list means "no opinion" — leave the kernel default.
+            # §1c.19: routed through the cots_ops registry helper so
+            # the offloader doesn't need to dereference
+            # `runner._infer` (which no longer exists on the runner).
             cpu_affinity = getattr(self.config, "cpu_worker_affinity", None)
             if cpu_affinity:
+                from vllm.model_executor.offloader import cots_ops
+
                 mask = 0
                 for cpu_id in cpu_affinity:
                     if not (0 <= int(cpu_id) < 64):
@@ -2687,7 +2717,7 @@ class CotsOffloader(BaseOffloader):
                             f"{cpu_id}; must be in [0, 64)"
                         )
                     mask |= 1 << int(cpu_id)
-                self._runner._infer.set_worker_affinity(mask)
+                cots_ops.set_worker_affinity(self._runner._runner_id, mask)
 
     def _install_bucket_prehook(self) -> None:
         """Phase 1c (Stage 3): install the first-decoder pre-hook

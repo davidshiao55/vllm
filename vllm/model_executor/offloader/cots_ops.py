@@ -19,52 +19,114 @@ Schemas (see /root/.claude/plans/pleaes-implement-phase1c-in-quizzical-mist.md
       mutates_args=["y_gpu", "gpu_anchor_a", "gpu_anchor_b"]
       Two distinct anchors pin sync AFTER each independent GPU GEMM.
 
-Multi-engine safety: each NativeCotsRunner registers itself in
-`_COTS_RUNNERS` (a module-private WeakValueDictionary) under a unique
-runner_id; the op impls look up the right runner by id, so two
-offloaders (e.g., FastTTS gen + ver) coexist with independent slab
-pools and no C++ singleton.
+§1c.19 split (see `phase1c_findings.md §1c.19`): the registry stores
+the `CotsCpuInfer` pybind handle DIRECTLY by runner_id, NOT a
+`NativeCotsRunner` instance. The compile-visible runner is a thin
+facade with only pickleable state (runner_id, task_id map, flags);
+the unpicklable C++ handle lives here. Custom op impls and the
+offloader's install/teardown helpers all dereference the registry.
 """
 
 from __future__ import annotations
 
 import itertools
-import weakref
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 from vllm.utils.torch_utils import direct_register_custom_op
 
-# Module-private runner registry. Weak refs so a runner that's been
-# torn down (e.g., engine shutdown) is auto-cleared without leaking.
-_COTS_RUNNERS: weakref.WeakValueDictionary[int, object] = weakref.WeakValueDictionary()
+if TYPE_CHECKING:
+    # Type-only import; avoids forcing _cots_C at module load on
+    # non-CUDA builds.
+    from vllm import _cots_C  # noqa: F401
+
+# Module-private infer registry. Strong refs (NOT weak) — the registry
+# IS the storage for the `CotsCpuInfer` instance. NativeCotsRunner's
+# `__del__` / `close()` is the only thing that removes entries; if a
+# runner is GC'd without close() the __del__ unregisters there.
+_COTS_INFER: dict[int, Any] = {}
 _NEXT_RUNNER_ID = itertools.count(1)
 
 
-def _register_runner(runner: object) -> int:
-    """Register a NativeCotsRunner instance and return its runner_id.
-    Caller must hold a strong reference to `runner` for the lifetime of
-    any in-flight op call (the registry is weak)."""
+def _register_infer(infer: Any) -> int:
+    """Register a `CotsCpuInfer` instance and return a fresh runner_id.
+    The registry takes ownership of the strong reference; the caller
+    should retain only the runner_id. See §1c.19 for the rationale."""
     rid = next(_NEXT_RUNNER_ID)
-    _COTS_RUNNERS[rid] = runner
+    _COTS_INFER[rid] = infer
     return rid
 
 
-def _unregister_runner(runner_id: int) -> None:
+def _unregister_infer(runner_id: int) -> None:
     """Drop the registry entry for a runner. Idempotent."""
-    _COTS_RUNNERS.pop(runner_id, None)
+    _COTS_INFER.pop(runner_id, None)
 
 
-def _lookup_runner(runner_id: int, op_name: str) -> object:
-    runner = _COTS_RUNNERS.get(runner_id)
-    if runner is None:
+def _lookup_infer(runner_id: int, op_name: str) -> Any:
+    """Resolve runner_id → `CotsCpuInfer` instance. Raises a clear
+    error if the runner was already torn down."""
+    infer = _COTS_INFER.get(runner_id)
+    if infer is None:
         raise RuntimeError(
             f"{op_name}: runner_id={runner_id} not in registry "
-            f"(known ids: {list(_COTS_RUNNERS.keys())}). The owning "
+            f"(known ids: {list(_COTS_INFER.keys())}). The owning "
             f"NativeCotsRunner was likely torn down before its "
             f"in-flight ops drained."
         )
-    return runner
+    return infer
+
+
+# Offloader-side install/teardown helpers. These all run OUTSIDE the
+# compiled forward path, so they can dereference the pybind handle
+# freely. They exist so the runner facade itself never has to hold
+# the handle on its `__dict__`.
+
+
+def install_infer(
+    runner_id: int,
+    n_slabs: int,
+    scratch_max_tokens: int,
+    scratch_max_intermediate_per_half: int,
+) -> None:
+    """Allocate the C++ slab pool. Called once at offloader post_init."""
+    infer = _lookup_infer(runner_id, "install_infer")
+    infer.install(
+        n_slabs=int(n_slabs),
+        scratch_max_tokens=int(scratch_max_tokens),
+        scratch_max_intermediate_per_half=int(scratch_max_intermediate_per_half),
+    )
+
+
+def populate_slab_via_spec(
+    runner_id: int,
+    spec: Any,
+    task_id: int,
+    *,
+    dry_run: bool,
+) -> None:
+    """Populate slot `task_id` via the spec's `populate(infer, ...)`
+    method. The spec carries the per-op pointer + stride layout (QKV
+    vs MLP vs dryrun); the helper just hands it the resolved infer."""
+    infer = _lookup_infer(runner_id, "populate_slab_via_spec")
+    spec.populate(infer, task_id, dry_run=dry_run)
+
+
+def set_worker_affinity(runner_id: int, mask: int) -> None:
+    """Pin the worker thread to a CPU set (uint64 bitmask). One-shot
+    call from `CotsOffloader.post_init` after install."""
+    infer = _lookup_infer(runner_id, "set_worker_affinity")
+    infer.set_worker_affinity(int(mask))
+
+
+def sync_blocking(runner_id: int) -> None:
+    """Drain any in-flight worker task synchronously. Called from
+    `NativeCotsRunner.close()`."""
+    infer = _COTS_INFER.get(runner_id)
+    if infer is None:
+        # Already torn down — nothing to drain.
+        return
+    infer.sync_blocking()
 
 
 # --- vllm.cots_submit_gemm -------------------------------------------------
@@ -85,9 +147,9 @@ def _cots_submit_gemm_impl(
     torch.compile sees x_pinned as use-after-mutate and keeps that
     ordering. We just enqueue the GEMM task on the current CUDA stream.
     """
-    runner = _lookup_runner(runner_id, "cots_submit_gemm")
+    infer = _lookup_infer(runner_id, "cots_submit_gemm")
     stream = torch.cuda.current_stream().cuda_stream
-    runner._infer.submit_on_stream(task_id, num_tokens, stream)  # type: ignore[attr-defined]
+    infer.submit_on_stream(task_id, num_tokens, stream)
 
 
 def _cots_submit_gemm_fake(
@@ -121,9 +183,9 @@ def _cots_sync_then_uva_impl(
     GPU GEMMs produced; mutating them pins this op AFTER both
     independent GEMMs (out_perm, out_pref).
     """
-    runner = _lookup_runner(runner_id, "cots_sync_then_uva")
+    infer = _lookup_infer(runner_id, "cots_sync_then_uva")
     stream = torch.cuda.current_stream().cuda_stream
-    runner._infer.sync_on_stream(stream)  # type: ignore[attr-defined]
+    infer.sync_on_stream(stream)
     # Lazy import to avoid a top-level circular import (cots.py imports
     # this module via cots_ops and we'd loop on `from .cots import ...`).
     from vllm.model_executor.offloader.cots import uva_copy_into_gpu
