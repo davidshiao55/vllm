@@ -1003,6 +1003,49 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
 endif()
 
 #
+# _cots_C extension (Phase 1c — COTS native CPU runner)
+#
+# Pure CXX extension: no CUDA kernels, only the CUDA Runtime API
+# (cudaLaunchHostFunc) for host-callback dispatch. Exposes a stateful
+# pybind11 class (CotsCpuInfer), so we intentionally do NOT use USE_SABI 3
+# — the existing stable-ABI extensions in this repo register torch ops via
+# REGISTER_EXTENSION (csrc/core/registration.h) rather than a pybind class
+# with state. Standard Python ABI is the safe path.
+#
+# CUDA-only: the host-callback design depends on `cudaLaunchHostFunc`,
+# which is a CUDA Runtime API; ROCm/HIP have a different host-callback
+# story and are out of Phase 1c scope. Gate the whole extension on
+# VLLM_GPU_LANG == "CUDA" so ROCm builds skip it cleanly. See
+# David/Docs/implementation_roadmap.md Phase 1c and the approved plan
+# at /root/.claude/plans/pleaes-implement-phase1c-in-quizzical-mist.md.
+
+if(VLLM_GPU_LANG STREQUAL "CUDA")
+  set(VLLM_COTS_EXT_SRC
+    "csrc/cots/task_queue.cpp"
+    "csrc/cots/cots_cpu_infer.cpp"
+    "csrc/cots/cots_torch_bindings.cpp")
+
+  message(STATUS "Enabling cots_C extension.")
+  define_extension_target(
+    _cots_C
+    DESTINATION vllm
+    LANGUAGE CXX
+    SOURCES ${VLLM_COTS_EXT_SRC}
+    LIBRARIES CUDA::cudart
+    WITH_SOABI)
+
+  # Link torch_python so pybind11's at::Tensor type caster (defined in
+  # libtorch_python.so) is available. `define_extension_target`'s CXX
+  # branch links `torch ${TORCH_LIBRARIES}` which gives us torch_cpu /
+  # c10 but NOT torch_python — necessary for the pybind class methods
+  # that take at::Tensor arguments (e.g. run_at_linear_inline).
+  find_library(TORCH_PYTHON_LIBRARY torch_python
+               PATHS "${TORCH_INSTALL_PREFIX}/lib"
+               NO_DEFAULT_PATH REQUIRED)
+  target_link_libraries(_cots_C PRIVATE "${TORCH_PYTHON_LIBRARY}")
+endif()
+
+#
 # _moe_C extension
 #
 
