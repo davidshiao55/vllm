@@ -54,5 +54,16 @@ PYBIND11_MODULE(_cots_C, m) {
       .def("run_at_linear_inline", &CotsCpuInfer::run_at_linear_inline,
            py::arg("x"), py::arg("w"), py::arg("y_out"))
       .def("y_pinned_view", &CotsCpuInfer::y_pinned_view, py::arg("task_id"),
-           py::arg("num_tokens"));
+           py::arg("num_tokens"))
+      .def("get_counters",
+           [](const CotsCpuInfer& self) {
+             // §1c.21: return as a Python dict for ergonomic
+             // dump-and-print at the bench harness level.
+             py::dict out;
+             for (auto& [name, value] : self.get_counters()) {
+               out[py::str(name)] = value;
+             }
+             return out;
+           })
+      .def("reset_counters", &CotsCpuInfer::reset_counters);
 }

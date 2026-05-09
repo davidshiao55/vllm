@@ -45,7 +45,10 @@ offloader's install/teardown helpers all dereference the registry.
 
 from __future__ import annotations
 
+import atexit
 import itertools
+import os
+import sys
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -335,3 +338,31 @@ def register_cots_offloader_ops() -> None:
 # Register at module import time so `torch.ops.vllm.cots_*` exist as
 # soon as cots.py imports this module.
 register_cots_offloader_ops()
+
+
+# §1c.21: dump per-runner counters at process exit. Set
+# VLLM_COTS_DUMP_COUNTERS=1 to enable. The captured-graph hot-path
+# question we want answered is whether num_tokens at submit time is
+# stuck at the captured graph-bucket size (e.g., 256) under capture
+# vs the live decode count (e.g., 1) under eager. Printing a
+# histogram once at process teardown is enough — counters are
+# `relaxed` atomics with negligible per-call cost.
+def _dump_counters_at_exit() -> None:
+    if os.environ.get("VLLM_COTS_DUMP_COUNTERS", "0") != "1":
+        return
+    if not _COTS_INFER:
+        return
+    sys.stderr.write("\n[cots §1c.21 counters]\n")
+    for rid, infer in _COTS_INFER.items():
+        try:
+            counters = dict(infer.get_counters())
+        except Exception as e:
+            sys.stderr.write(f"  runner_id={rid}: get_counters failed: {e}\n")
+            continue
+        non_zero = {k: v for k, v in counters.items() if v != 0}
+        sys.stderr.write(f"  runner_id={rid}:\n")
+        for k, v in sorted(non_zero.items()):
+            sys.stderr.write(f"    {k}: {v}\n")
+
+
+atexit.register(_dump_counters_at_exit)

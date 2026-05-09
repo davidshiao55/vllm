@@ -16,10 +16,12 @@
 #include <c10/core/ScalarType.h>
 #include <cuda_runtime_api.h>
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "task_queue.h"
@@ -231,6 +233,25 @@ class CotsCpuInfer {
   // CotsCpuInfer instance).
   at::Tensor y_pinned_view(int64_t task_id, int32_t num_tokens) const;
 
+  // §1c.21 perf-investigation counters (focused). Tracks submit_count
+  // and a num_tokens histogram by op kind, plus D2H 1D/2D split.
+  // Reset via `reset_counters()` at the start of a measurement window;
+  // read via `get_counters()` after. All increments are
+  // `memory_order_relaxed` — observational, not load-bearing for
+  // correctness.
+  //
+  // Hypothesis being tested: under vLLM full CUDA graph replay, COTS
+  // sees `x_gpu.shape[0]` == captured graph-bucket size (e.g., 256)
+  // even at B=1 decode, so the worker does CPU GEMMs for ~256 tokens
+  // every step. The histogram pins this immediately — if
+  // capture-mode runs are dominated by `nt_gt_64` while eager runs
+  // sit in `nt_le_1`, the diagnosis is confirmed.
+  //
+  // Histogram bins are powers-of-2: nt_le_1, nt_le_2, nt_le_4,
+  // nt_le_8, nt_le_16, nt_le_32, nt_le_64, nt_gt_64.
+  std::vector<std::pair<std::string, int64_t>> get_counters() const;
+  void reset_counters();
+
  private:
   // Static dispatchers used by cudaLaunchHostFunc. Both must be
   // `void(*)(void*)`.
@@ -272,6 +293,22 @@ class CotsCpuInfer {
   std::atomic<bool> has_error_{false};
   std::mutex error_mtx_;
   std::string last_error_msg_;
+
+  // §1c.21 counters (see get_counters / reset_counters above). All
+  // increments use memory_order_relaxed — observational only.
+  std::atomic<int64_t> submit_count_qkv_{0};
+  std::atomic<int64_t> submit_count_mlp_{0};
+  std::atomic<int64_t> submit_count_dryrun_{0};
+  // 8-bin power-of-2 histogram per op kind (qkv | mlp | dryrun).
+  // Indices: 0=nt<=1, 1=nt<=2, 2=nt<=4, 3=nt<=8, 4=nt<=16, 5=nt<=32,
+  // 6=nt<=64, 7=nt>64.
+  std::array<std::atomic<int64_t>, 8> nt_hist_qkv_{};
+  std::array<std::atomic<int64_t>, 8> nt_hist_mlp_{};
+  std::array<std::atomic<int64_t>, 8> nt_hist_dryrun_{};
+  std::atomic<int64_t> d2h_1d_count_{0};
+  std::atomic<int64_t> d2h_2d_count_{0};
+  std::atomic<int64_t> d2h_1d_bytes_{0};
+  std::atomic<int64_t> d2h_2d_bytes_{0};
 };
 
 }  // namespace cots

@@ -182,6 +182,43 @@ void CotsCpuInfer::submit_on_stream(int64_t task_id, int32_t num_tokens,
               " exceeds scratch_max_tokens=", scratch_max_tokens_,
               " (would write past the pinned buffer's tail)");
   slab->num_tokens.store(num_tokens, std::memory_order_release);
+  // §1c.21 counters: bump submit_count + num_tokens histogram for
+  // this op kind. Bin index = position of msb of num_tokens, clamped
+  // to [0, 7]. nt<=1 → 0, nt<=2 → 1, ..., nt<=64 → 6, nt>64 → 7.
+  {
+    int hist_bin;
+    if (num_tokens <= 1)
+      hist_bin = 0;
+    else if (num_tokens <= 2)
+      hist_bin = 1;
+    else if (num_tokens <= 4)
+      hist_bin = 2;
+    else if (num_tokens <= 8)
+      hist_bin = 3;
+    else if (num_tokens <= 16)
+      hist_bin = 4;
+    else if (num_tokens <= 32)
+      hist_bin = 5;
+    else if (num_tokens <= 64)
+      hist_bin = 6;
+    else
+      hist_bin = 7;
+    switch (slab->op_kind) {
+      case TaskSlab::kQkv:
+        submit_count_qkv_.fetch_add(1, std::memory_order_relaxed);
+        nt_hist_qkv_[hist_bin].fetch_add(1, std::memory_order_relaxed);
+        break;
+      case TaskSlab::kMlpBlock:
+        submit_count_mlp_.fetch_add(1, std::memory_order_relaxed);
+        nt_hist_mlp_[hist_bin].fetch_add(1, std::memory_order_relaxed);
+        break;
+      case TaskSlab::kDryrunNoop:
+      default:
+        submit_count_dryrun_.fetch_add(1, std::memory_order_relaxed);
+        nt_hist_dryrun_[hist_bin].fetch_add(1, std::memory_order_relaxed);
+        break;
+    }
+  }
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   // §1c.20: D2H from x_gpu to slab's pinned input buffer.
   // Stride-aware: contiguous → 1D cudaMemcpyAsync, row-strided →
@@ -209,6 +246,9 @@ void CotsCpuInfer::submit_on_stream(int64_t task_id, int32_t num_tokens,
     if (x_stride0 == x_cols) {
       // Contiguous row layout — single 1D copy is fastest.
       const size_t bytes = static_cast<size_t>(num_tokens) * width_bytes;
+      d2h_1d_count_.fetch_add(1, std::memory_order_relaxed);
+      d2h_1d_bytes_.fetch_add(static_cast<int64_t>(bytes),
+                              std::memory_order_relaxed);
       copy_err = cudaMemcpyAsync(slab->x_pinned_ptr,
                                  reinterpret_cast<void*>(x_gpu_ptr), bytes,
                                  cudaMemcpyDeviceToHost, stream);
@@ -219,6 +259,10 @@ void CotsCpuInfer::submit_on_stream(int64_t task_id, int32_t num_tokens,
       // tightly-packed rows at the destination.
       const size_t src_pitch =
           static_cast<size_t>(x_stride0) * sizeof(at::BFloat16);
+      const size_t bytes_2d = width_bytes * static_cast<size_t>(num_tokens);
+      d2h_2d_count_.fetch_add(1, std::memory_order_relaxed);
+      d2h_2d_bytes_.fetch_add(static_cast<int64_t>(bytes_2d),
+                              std::memory_order_relaxed);
       copy_err = cudaMemcpy2DAsync(
           slab->x_pinned_ptr, /*dpitch=*/width_bytes,
           reinterpret_cast<void*>(x_gpu_ptr), /*spitch=*/src_pitch,
@@ -469,6 +513,55 @@ void CotsCpuInfer::RunSlabOnWorker(TaskSlab* slab) {
     last_error_msg_ = "[cots worker] unknown exception";
     has_error_.store(true, std::memory_order_release);
   }
+}
+
+// --- §1c.21 perf-investigation counters --------------------------------
+
+std::vector<std::pair<std::string, int64_t>> CotsCpuInfer::get_counters()
+    const {
+  std::vector<std::pair<std::string, int64_t>> out;
+  out.reserve(40);
+  auto load = [](const std::atomic<int64_t>& a) {
+    return a.load(std::memory_order_relaxed);
+  };
+  out.emplace_back("submit_count_qkv", load(submit_count_qkv_));
+  out.emplace_back("submit_count_mlp", load(submit_count_mlp_));
+  out.emplace_back("submit_count_dryrun", load(submit_count_dryrun_));
+  static const char* kBinNames[8] = {"nt_le_1",  "nt_le_2",  "nt_le_4",
+                                     "nt_le_8",  "nt_le_16", "nt_le_32",
+                                     "nt_le_64", "nt_gt_64"};
+  for (int i = 0; i < 8; ++i) {
+    out.emplace_back(std::string("nt_qkv_") + kBinNames[i],
+                     load(nt_hist_qkv_[i]));
+  }
+  for (int i = 0; i < 8; ++i) {
+    out.emplace_back(std::string("nt_mlp_") + kBinNames[i],
+                     load(nt_hist_mlp_[i]));
+  }
+  for (int i = 0; i < 8; ++i) {
+    out.emplace_back(std::string("nt_dryrun_") + kBinNames[i],
+                     load(nt_hist_dryrun_[i]));
+  }
+  out.emplace_back("d2h_1d_count", load(d2h_1d_count_));
+  out.emplace_back("d2h_2d_count", load(d2h_2d_count_));
+  out.emplace_back("d2h_1d_bytes", load(d2h_1d_bytes_));
+  out.emplace_back("d2h_2d_bytes", load(d2h_2d_bytes_));
+  return out;
+}
+
+void CotsCpuInfer::reset_counters() {
+  submit_count_qkv_.store(0, std::memory_order_relaxed);
+  submit_count_mlp_.store(0, std::memory_order_relaxed);
+  submit_count_dryrun_.store(0, std::memory_order_relaxed);
+  for (int i = 0; i < 8; ++i) {
+    nt_hist_qkv_[i].store(0, std::memory_order_relaxed);
+    nt_hist_mlp_[i].store(0, std::memory_order_relaxed);
+    nt_hist_dryrun_[i].store(0, std::memory_order_relaxed);
+  }
+  d2h_1d_count_.store(0, std::memory_order_relaxed);
+  d2h_2d_count_.store(0, std::memory_order_relaxed);
+  d2h_1d_bytes_.store(0, std::memory_order_relaxed);
+  d2h_2d_bytes_.store(0, std::memory_order_relaxed);
 }
 
 }  // namespace cots
