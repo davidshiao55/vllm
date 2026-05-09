@@ -231,6 +231,12 @@ class CudaGraphManager:
                             offloader.join_after_forward()
                         self.graphs[desc] = graph
         self._graphs_captured = True
+        # §1c.22: one-shot post-capture hook. Lets COTS (or other
+        # offloaders) reset instrumentation counters now that all
+        # bucket graphs are captured but before any measured replay.
+        # Default no-op; CotsOffloader gates the actual reset on
+        # `VLLM_COTS_RESET_COUNTERS_AFTER_CUDAGRAPH_CAPTURE=1`.
+        get_offloader().post_cudagraph_capture()
 
     def dispatch(
         self,

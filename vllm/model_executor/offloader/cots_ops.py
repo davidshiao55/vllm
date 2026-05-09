@@ -138,6 +138,21 @@ def set_worker_affinity(runner_id: int, mask: int) -> None:
     infer.set_worker_affinity(int(mask))
 
 
+def reset_all_counters() -> None:
+    """§1c.22: zero every CotsCpuInfer counter currently in the
+    registry. Used as the env-gated post-cudagraph-capture hook
+    (`VLLM_COTS_RESET_COUNTERS_AFTER_CUDAGRAPH_CAPTURE=1`) so the
+    byte-accounting bench artifact reflects ONLY the measured
+    replay, not capture-time activity."""
+    import contextlib
+
+    for infer in _COTS_INFER.values():
+        # Best-effort — a stale infer shouldn't break the reset
+        # for the rest.
+        with contextlib.suppress(Exception):
+            infer.reset_counters()
+
+
 def set_runtime_num_tokens(runner_id: int, n: int) -> None:
     """§1c.21 live-token plumb-through. Called by
     `CotsOffloader.set_runtime_num_tokens` (a thin override on the
@@ -300,6 +315,16 @@ def _cots_sync_then_uva_impl(
     # Build the CPU view over the slab pointer locally — never escapes
     # back to Python in a way Inductor would see.
     y_pinned = infer.y_pinned_view(task_id, num_tokens)
+    # §1c.22 measurement: bumps `uva_record_bytes` /
+    # `uva_record_count` — record-time only, since this Python impl
+    # runs once during graph capture but NOT on replay. For
+    # per-replay UVA bytes use `uva_replay_bucket_bytes_`
+    # (incremented in C++ RunSlabOnWorker which fires per replay).
+    # Compare record-time numbers against
+    # `worker_output_live_bytes` for the over-transfer ratio at
+    # the record/warmup scope; per-replay diagnostics need the
+    # corresponding `*_replay_bucket_bytes_` fields.
+    infer.note_uva_request(num_tokens, y_pinned.shape[1])
     # Lazy import to avoid a top-level circular import (cots.py imports
     # this module via cots_ops and we'd loop on `from .cots import ...`).
     from vllm.model_executor.offloader.cots import (

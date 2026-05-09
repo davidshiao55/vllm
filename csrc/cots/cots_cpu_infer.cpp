@@ -98,7 +98,21 @@ void CotsCpuInfer::check_error() {
   throw std::runtime_error(msg);
 }
 
+int32_t CotsCpuInfer::slab_bucket_capacity_tokens(int64_t task_id) const {
+  TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
+              "slab_bucket_capacity_tokens: task_id ", task_id,
+              " out of range");
+  return slabs_[task_id].bucket_capacity_tokens;
+}
+
+int32_t CotsCpuInfer::slab_num_tokens(int64_t task_id) const {
+  TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
+              "slab_num_tokens: task_id ", task_id, " out of range");
+  return slabs_[task_id].num_tokens.load(std::memory_order_acquire);
+}
+
 void CotsCpuInfer::populate_slab_qkv(int64_t task_id, int32_t n_threads,
+                                     int32_t bucket_capacity_tokens,
                                      uintptr_t x_pinned_ptr, int32_t in_dim,
                                      uintptr_t y_pinned_ptr,
                                      int32_t cpu_out_dim, uintptr_t w_cpu_ptr,
@@ -106,9 +120,13 @@ void CotsCpuInfer::populate_slab_qkv(int64_t task_id, int32_t n_threads,
   check_error();
   TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
               "populate_slab_qkv: task_id ", task_id, " out of range");
+  TORCH_CHECK(bucket_capacity_tokens >= 0,
+              "populate_slab_qkv: bucket_capacity_tokens=",
+              bucket_capacity_tokens, " < 0");
   TaskSlab& s = slabs_[task_id];
   s.op_kind = TaskSlab::kQkv;
   s.n_threads = n_threads;
+  s.bucket_capacity_tokens = bucket_capacity_tokens;
   s.x_pinned_ptr = reinterpret_cast<void*>(x_pinned_ptr);
   s.in_dim = in_dim;
   s.y_pinned_ptr = reinterpret_cast<void*>(y_pinned_ptr);
@@ -118,18 +136,22 @@ void CotsCpuInfer::populate_slab_qkv(int64_t task_id, int32_t n_threads,
 }
 
 void CotsCpuInfer::populate_slab_mlp(
-    int64_t task_id, int32_t n_threads, uintptr_t x_pinned_ptr, int32_t in_dim,
-    uintptr_t y_pinned_ptr, int32_t cpu_out_dim, uintptr_t w_gate_ptr,
-    int32_t w_gate_rows, uintptr_t w_up_ptr, int32_t w_up_rows,
-    uintptr_t w_down_ptr, int32_t w_down_rows, int32_t w_down_cols,
-    int64_t w_down_stride_row, int64_t w_down_stride_col,
-    int32_t intermediate_per_half) {
+    int64_t task_id, int32_t n_threads, int32_t bucket_capacity_tokens,
+    uintptr_t x_pinned_ptr, int32_t in_dim, uintptr_t y_pinned_ptr,
+    int32_t cpu_out_dim, uintptr_t w_gate_ptr, int32_t w_gate_rows,
+    uintptr_t w_up_ptr, int32_t w_up_rows, uintptr_t w_down_ptr,
+    int32_t w_down_rows, int32_t w_down_cols, int64_t w_down_stride_row,
+    int64_t w_down_stride_col, int32_t intermediate_per_half) {
   check_error();
   TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
               "populate_slab_mlp: task_id ", task_id, " out of range");
+  TORCH_CHECK(bucket_capacity_tokens >= 0,
+              "populate_slab_mlp: bucket_capacity_tokens=",
+              bucket_capacity_tokens, " < 0");
   TaskSlab& s = slabs_[task_id];
   s.op_kind = TaskSlab::kMlpBlock;
   s.n_threads = n_threads;
+  s.bucket_capacity_tokens = bucket_capacity_tokens;
   s.x_pinned_ptr = reinterpret_cast<void*>(x_pinned_ptr);
   s.in_dim = in_dim;
   s.y_pinned_ptr = reinterpret_cast<void*>(y_pinned_ptr);
@@ -146,14 +168,20 @@ void CotsCpuInfer::populate_slab_mlp(
   s.intermediate_per_half = intermediate_per_half;
 }
 
-void CotsCpuInfer::populate_slab_dryrun(int64_t task_id, uintptr_t x_pinned_ptr,
-                                        int32_t in_dim, uintptr_t y_pinned_ptr,
+void CotsCpuInfer::populate_slab_dryrun(int64_t task_id,
+                                        int32_t bucket_capacity_tokens,
+                                        uintptr_t x_pinned_ptr, int32_t in_dim,
+                                        uintptr_t y_pinned_ptr,
                                         int32_t cpu_out_dim) {
   check_error();
   TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
               "populate_slab_dryrun: task_id ", task_id, " out of range");
+  TORCH_CHECK(bucket_capacity_tokens >= 0,
+              "populate_slab_dryrun: bucket_capacity_tokens=",
+              bucket_capacity_tokens, " < 0");
   TaskSlab& s = slabs_[task_id];
   s.op_kind = TaskSlab::kDryrunNoop;
+  s.bucket_capacity_tokens = bucket_capacity_tokens;
   // §1c.20: dryrun must carry the x_pinned + y_pinned pointers so
   // submit_on_stream's D2H and sync's y_pinned_view both resolve.
   s.x_pinned_ptr = reinterpret_cast<void*>(x_pinned_ptr);
@@ -247,8 +275,8 @@ void CotsCpuInfer::submit_on_stream(int64_t task_id, int32_t num_tokens,
       // Contiguous row layout — single 1D copy is fastest.
       const size_t bytes = static_cast<size_t>(num_tokens) * width_bytes;
       d2h_1d_count_.fetch_add(1, std::memory_order_relaxed);
-      d2h_1d_bytes_.fetch_add(static_cast<int64_t>(bytes),
-                              std::memory_order_relaxed);
+      d2h_record_bytes_1d_.fetch_add(static_cast<int64_t>(bytes),
+                                     std::memory_order_relaxed);
       copy_err = cudaMemcpyAsync(slab->x_pinned_ptr,
                                  reinterpret_cast<void*>(x_gpu_ptr), bytes,
                                  cudaMemcpyDeviceToHost, stream);
@@ -261,8 +289,8 @@ void CotsCpuInfer::submit_on_stream(int64_t task_id, int32_t num_tokens,
           static_cast<size_t>(x_stride0) * sizeof(at::BFloat16);
       const size_t bytes_2d = width_bytes * static_cast<size_t>(num_tokens);
       d2h_2d_count_.fetch_add(1, std::memory_order_relaxed);
-      d2h_2d_bytes_.fetch_add(static_cast<int64_t>(bytes_2d),
-                              std::memory_order_relaxed);
+      d2h_record_bytes_2d_.fetch_add(static_cast<int64_t>(bytes_2d),
+                                     std::memory_order_relaxed);
       copy_err = cudaMemcpy2DAsync(
           slab->x_pinned_ptr, /*dpitch=*/width_bytes,
           reinterpret_cast<void*>(x_gpu_ptr), /*spitch=*/src_pitch,
@@ -485,21 +513,46 @@ void CotsCpuInfer::RunSlabOnWorker(TaskSlab* slab) {
       worker_effective_n_hist_[hist_bin].fetch_add(1,
                                                    std::memory_order_relaxed);
     }
-    // §1c.22 byte accounting: live-token bytes the worker actually
-    // reads (input) and writes (output) per fire. Compared against
-    // d2h_*_bytes (captured input transfer at bucket size) and
-    // the captured Triton UVA grid (output transfer at bucket size,
-    // not counted at this layer) the diff is the PCIe / UVA waste
-    // from over-sized captured copies under FULL graph mode.
-    if (n > 0) {
-      worker_input_bytes_used_.fetch_add(
-          static_cast<int64_t>(n) * static_cast<int64_t>(slab->in_dim) *
-              static_cast<int64_t>(sizeof(at::BFloat16)),
-          std::memory_order_relaxed);
-      worker_output_bytes_used_.fetch_add(
-          static_cast<int64_t>(n) * static_cast<int64_t>(slab->cpu_out_dim) *
-              static_cast<int64_t>(sizeof(at::BFloat16)),
-          std::memory_order_relaxed);
+    // §1c.22 byte accounting (replay-time). RunSlabOnWorker fires
+    // PER REPLAY because the captured host callback re-executes
+    // each time the graph replays. Two paired counters:
+    //
+    // - worker_*_live_bytes: bytes the worker actually reads/writes
+    //   for the live-token override (n).
+    // - *_replay_bucket_bytes: bytes attributable to the captured
+    //   cudaMemcpyAsync (input D2H) and Triton UVA kernel (output
+    //   H2D) — sized by the descriptor bucket capacity.
+    //
+    // §1c.22 review-fix: read the IMMUTABLE
+    // `bucket_capacity_tokens` populated at install time, NOT the
+    // mutable `slab->num_tokens` (which can be overwritten by later
+    // submit_on_stream calls during graph capture / PIECEWISE Python
+    // re-execution and is thus unreliable as a stable bucket
+    // estimate). bucket_capacity_tokens is still an ESTIMATE of the
+    // captured graph node's actual byte param — only authoritative
+    // value would come from inspecting the cuGraphNode at capture
+    // time, which is out of scope. Stable and descriptor-attributed
+    // is the best we can do without graph introspection.
+    const int64_t bucket_n = static_cast<int64_t>(slab->bucket_capacity_tokens);
+    if (slab->in_dim > 0) {
+      const int64_t row_bytes_in = static_cast<int64_t>(slab->in_dim) *
+                                   static_cast<int64_t>(sizeof(at::BFloat16));
+      d2h_replay_bucket_bytes_.fetch_add(bucket_n * row_bytes_in,
+                                         std::memory_order_relaxed);
+      if (n > 0) {
+        worker_input_live_bytes_.fetch_add(
+            static_cast<int64_t>(n) * row_bytes_in, std::memory_order_relaxed);
+      }
+    }
+    if (slab->cpu_out_dim > 0) {
+      const int64_t row_bytes_out = static_cast<int64_t>(slab->cpu_out_dim) *
+                                    static_cast<int64_t>(sizeof(at::BFloat16));
+      uva_replay_bucket_bytes_.fetch_add(bucket_n * row_bytes_out,
+                                         std::memory_order_relaxed);
+      if (n > 0) {
+        worker_output_live_bytes_.fetch_add(
+            static_cast<int64_t>(n) * row_bytes_out, std::memory_order_relaxed);
+      }
     }
 
     switch (slab->op_kind) {
@@ -572,6 +625,18 @@ void CotsCpuInfer::RunSlabOnWorker(TaskSlab* slab) {
 
 // --- §1c.21 live-token override ---------------------------------------
 
+void CotsCpuInfer::note_uva_request(int32_t num_tokens, int32_t cpu_out_dim) {
+  // §1c.22 bookkeeping. No bound checks beyond non-negativity —
+  // this is a measurement-only path; the actual UVA kernel does
+  // its own validation.
+  if (num_tokens <= 0 || cpu_out_dim <= 0) return;
+  const int64_t bytes = static_cast<int64_t>(num_tokens) *
+                        static_cast<int64_t>(cpu_out_dim) *
+                        static_cast<int64_t>(sizeof(at::BFloat16));
+  uva_record_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+  uva_record_count_.fetch_add(1, std::memory_order_relaxed);
+}
+
 void CotsCpuInfer::set_runtime_num_tokens(int32_t n) {
   TORCH_CHECK(n >= 0, "set_runtime_num_tokens: n=", n,
               " < 0; pass 0 to clear the override.");
@@ -612,18 +677,29 @@ std::vector<std::pair<std::string, int64_t>> CotsCpuInfer::get_counters()
     out.emplace_back(std::string("nt_dryrun_") + kBinNames[i],
                      load(nt_hist_dryrun_[i]));
   }
+  // §1c.22 — record-time counters (capture/warmup only).
   out.emplace_back("d2h_1d_count", load(d2h_1d_count_));
   out.emplace_back("d2h_2d_count", load(d2h_2d_count_));
-  out.emplace_back("d2h_1d_bytes", load(d2h_1d_bytes_));
-  out.emplace_back("d2h_2d_bytes", load(d2h_2d_bytes_));
+  out.emplace_back("d2h_record_bytes_1d", load(d2h_record_bytes_1d_));
+  out.emplace_back("d2h_record_bytes_2d", load(d2h_record_bytes_2d_));
+  // §1c.22 — replay-time counters (incremented in RunSlabOnWorker
+  // which fires per replay because the captured host callback
+  // re-executes). Apples-to-apples with worker_*_live_bytes.
+  out.emplace_back("d2h_replay_bucket_bytes", load(d2h_replay_bucket_bytes_));
+  out.emplace_back("uva_replay_bucket_bytes", load(uva_replay_bucket_bytes_));
   out.emplace_back("runtime_set_calls", load(runtime_set_calls_));
   out.emplace_back("runtime_last_value", load(runtime_last_value_));
   for (int i = 0; i < 8; ++i) {
     out.emplace_back(std::string("worker_eff_n_") + kBinNames[i],
                      load(worker_effective_n_hist_[i]));
   }
-  out.emplace_back("worker_input_bytes_used", load(worker_input_bytes_used_));
-  out.emplace_back("worker_output_bytes_used", load(worker_output_bytes_used_));
+  out.emplace_back("worker_input_live_bytes", load(worker_input_live_bytes_));
+  out.emplace_back("worker_output_live_bytes", load(worker_output_live_bytes_));
+  // §1c.22 — record-time UVA accounting (captured Triton grid
+  // size, set once during graph capture by Python-side
+  // note_uva_request).
+  out.emplace_back("uva_record_bytes", load(uva_record_bytes_));
+  out.emplace_back("uva_record_count", load(uva_record_count_));
   return out;
 }
 
@@ -638,15 +714,19 @@ void CotsCpuInfer::reset_counters() {
   }
   d2h_1d_count_.store(0, std::memory_order_relaxed);
   d2h_2d_count_.store(0, std::memory_order_relaxed);
-  d2h_1d_bytes_.store(0, std::memory_order_relaxed);
-  d2h_2d_bytes_.store(0, std::memory_order_relaxed);
+  d2h_record_bytes_1d_.store(0, std::memory_order_relaxed);
+  d2h_record_bytes_2d_.store(0, std::memory_order_relaxed);
   runtime_set_calls_.store(0, std::memory_order_relaxed);
   runtime_last_value_.store(0, std::memory_order_relaxed);
   for (int i = 0; i < 8; ++i) {
     worker_effective_n_hist_[i].store(0, std::memory_order_relaxed);
   }
-  worker_input_bytes_used_.store(0, std::memory_order_relaxed);
-  worker_output_bytes_used_.store(0, std::memory_order_relaxed);
+  worker_input_live_bytes_.store(0, std::memory_order_relaxed);
+  worker_output_live_bytes_.store(0, std::memory_order_relaxed);
+  uva_record_bytes_.store(0, std::memory_order_relaxed);
+  uva_record_count_.store(0, std::memory_order_relaxed);
+  d2h_replay_bucket_bytes_.store(0, std::memory_order_relaxed);
+  uva_replay_bucket_bytes_.store(0, std::memory_order_relaxed);
 }
 
 }  // namespace cots

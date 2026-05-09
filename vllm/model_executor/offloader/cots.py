@@ -1268,6 +1268,12 @@ class _NativeSlabSpecQkv(NativeSlabSpec):
         self.w_cpu_rows = w_cpu_rows
 
     def populate(self, infer: object, task_id: int, *, dry_run: bool) -> None:
+        # §1c.22 review-fix: bucket_capacity_tokens is the descriptor
+        # bucket (op_descriptor[1]). Stable for the slab's lifetime;
+        # what replay-time byte counters use to attribute bucket-sized
+        # captured copies. Distinct from `slab.num_tokens` which is
+        # mutable submit-time/captured state.
+        bucket_capacity_tokens = int(self.op_descriptor[1])
         if dry_run:
             # §1c.20: dryrun must pass x_pinned_ptr + in_dim (for the
             # D2H in submit_on_stream) AND y_pinned_ptr + cpu_out_dim
@@ -1276,6 +1282,7 @@ class _NativeSlabSpecQkv(NativeSlabSpec):
             # the GEMM.
             infer.populate_slab_dryrun(  # type: ignore[attr-defined]
                 task_id=task_id,
+                bucket_capacity_tokens=bucket_capacity_tokens,
                 x_pinned_ptr=self.x_pinned_ptr,
                 in_dim=self.in_dim,
                 y_pinned_ptr=self.y_pinned_ptr,
@@ -1285,6 +1292,7 @@ class _NativeSlabSpecQkv(NativeSlabSpec):
         infer.populate_slab_qkv(  # type: ignore[attr-defined]
             task_id=task_id,
             n_threads=self.n_threads,
+            bucket_capacity_tokens=bucket_capacity_tokens,
             x_pinned_ptr=self.x_pinned_ptr,
             in_dim=self.in_dim,
             y_pinned_ptr=self.y_pinned_ptr,
@@ -1333,6 +1341,8 @@ class _NativeSlabSpecMlp(NativeSlabSpec):
         self.intermediate_per_half = intermediate_per_half
 
     def populate(self, infer: object, task_id: int, *, dry_run: bool) -> None:
+        # §1c.22 review-fix: see _NativeSlabSpecQkv.populate.
+        bucket_capacity_tokens = int(self.op_descriptor[1])
         if dry_run:
             # §1c.20: dryrun must pass x_pinned_ptr + in_dim (for the
             # D2H in submit_on_stream) AND y_pinned_ptr + cpu_out_dim
@@ -1341,6 +1351,7 @@ class _NativeSlabSpecMlp(NativeSlabSpec):
             # the GEMM.
             infer.populate_slab_dryrun(  # type: ignore[attr-defined]
                 task_id=task_id,
+                bucket_capacity_tokens=bucket_capacity_tokens,
                 x_pinned_ptr=self.x_pinned_ptr,
                 in_dim=self.in_dim,
                 y_pinned_ptr=self.y_pinned_ptr,
@@ -1350,6 +1361,7 @@ class _NativeSlabSpecMlp(NativeSlabSpec):
         infer.populate_slab_mlp(  # type: ignore[attr-defined]
             task_id=task_id,
             n_threads=self.n_threads,
+            bucket_capacity_tokens=bucket_capacity_tokens,
             x_pinned_ptr=self.x_pinned_ptr,
             in_dim=self.in_dim,
             y_pinned_ptr=self.y_pinned_ptr,
@@ -1549,7 +1561,7 @@ class NativeCotsRunner:
     runtime is 1. The worker computes 1 row of GEMM even though the
     captured graph fired at the bucket size. Captured D2H copies
     bucket-sized bytes (PCIe waste tracked under
-    `worker_input_bytes_used` vs `d2h_*_bytes`); §1c.22 follow-up
+    `worker_input_live_bytes` vs `d2h_replay_bucket_bytes`); §1c.22 follow-up
     if material.
     """
 
@@ -3127,6 +3139,26 @@ class CotsOffloader(BaseOffloader):
         from vllm.model_executor.offloader import cots_ops
 
         cots_ops.set_runtime_num_tokens(self._runner._runner_id, int(actual_num_tokens))
+
+    def post_cudagraph_capture(self) -> None:
+        """§1c.22: env-gated counter reset after all bucket graphs are
+        captured. Set `VLLM_COTS_RESET_COUNTERS_AFTER_CUDAGRAPH_CAPTURE=1`
+        when running the byte-accounting bench so per-generate
+        diagnostics isolate replay-time activity from capture/warmup.
+        Default off — counters accumulate across capture + replay
+        (which is fine for most diagnostics, including the §1c.21
+        live-token confirmation)."""
+        import os
+
+        if (
+            os.environ.get("VLLM_COTS_RESET_COUNTERS_AFTER_CUDAGRAPH_CAPTURE", "0")
+            != "1"
+        ):
+            return
+        from vllm.model_executor.offloader import cots_ops
+
+        cots_ops.reset_all_counters()
+        logger.info("[cots §1c.22] reset_all_counters() fired post-cudagraph-capture")
 
     def _start_prefetch(self, layer_idx: int) -> None:
         if self._streamer is not None:

@@ -64,6 +64,26 @@ struct alignas(64) TaskSlab {
   // worker dequeue (CUDA stream ordering + cv_ notify in TaskQueue::enqueue).
   std::atomic<int32_t> num_tokens{0};
 
+  // §1c.22 review-fix: immutable bucket capacity, populated once at
+  // install time from the (layer, bucket, op_kind) descriptor and
+  // never written again. Replay-time byte accounting MUST read this
+  // (not `num_tokens`, which is captured/recorded state that can be
+  // overwritten by later submit_on_stream calls during graph replay
+  // or PIECEWISE Python re-execution). Two distinct concepts:
+  //   * `num_tokens` — submit-time/captured token count (what the
+  //     captured cudaMemcpyAsync was sized for at record time, but
+  //     can be touched by later writes).
+  //   * `bucket_capacity_tokens` — descriptor-bucket size, the value
+  //     vLLM rounded num_tokens UP to in order to pick this slab.
+  //     Stable for the lifetime of the slab. This is the
+  //     authoritative byte-budget the captured graph reserved.
+  // Note: this still ESTIMATES the captured-graph node byte count;
+  // the only authoritative value is the cudaMemcpyAsync param baked
+  // into the cuGraphNode at capture time. Without parsing the graph
+  // we can't be exact; bucket_capacity_tokens is the closest stable
+  // proxy.
+  int32_t bucket_capacity_tokens = 0;
+
   void* x_pinned_ptr = nullptr;
   int32_t in_dim = 0;
   void* y_pinned_ptr = nullptr;
@@ -121,19 +141,23 @@ class CotsCpuInfer {
   // AVX2 hardware), so passing `torch.dtype` over pybind would just be
   // a brittle int-enum dance. If we ever support fp16/fp32, take dtype
   // back as a parameter at that point.
+  // §1c.22 review-fix: populate_slab_* now takes `bucket_capacity_tokens`
+  // — the stable descriptor-bucket size — and stores it as immutable on
+  // the slab. Replay-time byte counters read this, NOT mutable num_tokens.
   void populate_slab_qkv(int64_t task_id, int32_t n_threads,
-                         uintptr_t x_pinned_ptr, int32_t in_dim,
-                         uintptr_t y_pinned_ptr, int32_t cpu_out_dim,
-                         uintptr_t w_cpu_ptr, int32_t w_cpu_rows);
+                         int32_t bucket_capacity_tokens, uintptr_t x_pinned_ptr,
+                         int32_t in_dim, uintptr_t y_pinned_ptr,
+                         int32_t cpu_out_dim, uintptr_t w_cpu_ptr,
+                         int32_t w_cpu_rows);
 
   void populate_slab_mlp(int64_t task_id, int32_t n_threads,
-                         uintptr_t x_pinned_ptr, int32_t in_dim,
-                         uintptr_t y_pinned_ptr, int32_t cpu_out_dim,
-                         uintptr_t w_gate_ptr, int32_t w_gate_rows,
-                         uintptr_t w_up_ptr, int32_t w_up_rows,
-                         uintptr_t w_down_ptr, int32_t w_down_rows,
-                         int32_t w_down_cols, int64_t w_down_stride_row,
-                         int64_t w_down_stride_col,
+                         int32_t bucket_capacity_tokens, uintptr_t x_pinned_ptr,
+                         int32_t in_dim, uintptr_t y_pinned_ptr,
+                         int32_t cpu_out_dim, uintptr_t w_gate_ptr,
+                         int32_t w_gate_rows, uintptr_t w_up_ptr,
+                         int32_t w_up_rows, uintptr_t w_down_ptr,
+                         int32_t w_down_rows, int32_t w_down_cols,
+                         int64_t w_down_stride_row, int64_t w_down_stride_col,
                          int32_t intermediate_per_half);
 
   // Populate a slab as a dryrun-noop. §1c.20: dryrun must still
@@ -143,9 +167,9 @@ class CotsCpuInfer {
   // skips the GEMM. The y_pinned values are uninitialized after
   // sync but that's exactly what dryrun means — the bench measures
   // orchestration overhead, not output correctness.
-  void populate_slab_dryrun(int64_t task_id, uintptr_t x_pinned_ptr,
-                            int32_t in_dim, uintptr_t y_pinned_ptr,
-                            int32_t cpu_out_dim);
+  void populate_slab_dryrun(int64_t task_id, int32_t bucket_capacity_tokens,
+                            uintptr_t x_pinned_ptr, int32_t in_dim,
+                            uintptr_t y_pinned_ptr, int32_t cpu_out_dim);
 
   // Submit a task on the *current* CUDA stream. §1c.20: bundles the
   // x_gpu → x_pinned D2H copy WITH the host-callback enqueue so
@@ -196,6 +220,14 @@ class CotsCpuInfer {
   int32_t last_observed_num_threads() const {
     return last_observed_num_threads_.load(std::memory_order_acquire);
   }
+
+  // §1c.22 review-fix test helpers: read the immutable
+  // `bucket_capacity_tokens` and the mutable `num_tokens` for a
+  // given slab. The pair lets test_bucket_capacity_immutable assert
+  // that `bucket_capacity_tokens` does NOT change when
+  // `runtime_num_tokens` or `slab.num_tokens` is mutated.
+  int32_t slab_bucket_capacity_tokens(int64_t task_id) const;
+  int32_t slab_num_tokens(int64_t task_id) const;
 
   // Worker exception surfacing. Each Python-side `submit*` / `sync*` call
   // checks has_error_ and re-raises last_error_msg_ as a Python
@@ -262,6 +294,12 @@ class CotsCpuInfer {
   // dominant cost the counter data showed was CPU GEMM work, which
   // this fix collapses.
   void set_runtime_num_tokens(int32_t n);
+
+  // §1c.22: invoked from `cots_sync_then_uva`'s Python impl to
+  // record the captured Triton kernel's bucket-sized H2D request
+  // (bytes = num_tokens × cpu_out_dim × bf16_size). Pure
+  // bookkeeping — no side effect on the kernel.
+  void note_uva_request(int32_t num_tokens, int32_t cpu_out_dim);
 
   // §1c.21 perf-investigation counters (focused). Tracks submit_count
   // and a num_tokens histogram by op kind, plus D2H 1D/2D split.
@@ -342,10 +380,35 @@ class CotsCpuInfer {
   std::array<std::atomic<int64_t>, 8> nt_hist_qkv_{};
   std::array<std::atomic<int64_t>, 8> nt_hist_mlp_{};
   std::array<std::atomic<int64_t>, 8> nt_hist_dryrun_{};
-  std::atomic<int64_t> d2h_1d_count_{0};
-  std::atomic<int64_t> d2h_2d_count_{0};
-  std::atomic<int64_t> d2h_1d_bytes_{0};
-  std::atomic<int64_t> d2h_2d_bytes_{0};
+  // §1c.22 review-fix: existing counters renamed for accuracy. Under
+  // CUDA Graph capture, `submit_on_stream` runs ONCE at graph
+  // record time; subsequent replays re-fire the captured
+  // cudaMemcpyAsync directly without re-entering the C++ method.
+  // So these record the RECORD-time activity, NOT per-replay
+  // activity. Compare against `*_replay_bucket_bytes_` (incremented
+  // at replay-time from `RunSlabOnWorker`) for the actual per-call
+  // PCIe traffic during decode.
+  std::atomic<int64_t> d2h_1d_count_{0};  // record-time
+  std::atomic<int64_t> d2h_2d_count_{0};  // record-time
+  std::atomic<int64_t> d2h_record_bytes_1d_{
+      0};  // record-time, was d2h_1d_bytes_
+  std::atomic<int64_t> d2h_record_bytes_2d_{
+      0};  // record-time, was d2h_2d_bytes_
+  // §1c.22: replay-time D2H / UVA bucket-byte accounting,
+  // incremented in RunSlabOnWorker (which executes per replay
+  // because the captured host callback fires per replay). Counts
+  //   slab.bucket_capacity_tokens × slab.in_dim  × sizeof(bfloat16)  for D2H
+  //   slab.bucket_capacity_tokens × slab.cpu_out_dim × sizeof(bfloat16)  for
+  //   UVA
+  // — the bucket-sized captured cudaMemcpyAsync (input) and Triton
+  // UVA grid (output) that re-fire at every replay. §1c.22
+  // review-fix: `bucket_capacity_tokens` is the IMMUTABLE
+  // descriptor bucket populated at install, NOT the mutable
+  // `slab.num_tokens` (which can be overwritten by later
+  // submit_on_stream calls). Apples-to-apples with the per-replay
+  // `worker_*_live_bytes_` counters below.
+  std::atomic<int64_t> d2h_replay_bucket_bytes_{0};
+  std::atomic<int64_t> uva_replay_bucket_bytes_{0};
 
   // §1c.21 fix-validation counters: distinct from the submit-time
   // num_tokens histogram. `runtime_set_calls_` counts how often
@@ -364,16 +427,26 @@ class CotsCpuInfer {
   // §1c.22 byte accounting — bucket-sized captured copies vs
   // live-token worker reads/writes. The captured cudaMemcpyAsync
   // (input D2H) and Triton UVA (output H2D) walk the full slab
-  // capacity, so their byte counts are tracked under d2h_*_bytes
-  // above. The "used" totals below are summed at worker fire time
-  // using the effective_n the worker actually processed
-  // (effective_n × in_dim × bf16_size for input;
-  // effective_n × cpu_out_dim × bf16_size for output). The diff
-  // (captured - used) is the wasted PCIe / UVA bandwidth at B=1
-  // decode under FULL capture; if material, motivates §1c.22's
-  // dynamic-size copy path.
-  std::atomic<int64_t> worker_input_bytes_used_{0};
-  std::atomic<int64_t> worker_output_bytes_used_{0};
+  // bucket capacity, so their byte counts are tracked under
+  // `d2h_replay_bucket_bytes_` / `uva_replay_bucket_bytes_` above
+  // (sized at `slab.bucket_capacity_tokens`, the immutable
+  // descriptor bucket). The "live" totals below are summed at
+  // worker fire time using the effective_n the worker actually
+  // processed (effective_n × in_dim × bf16 for input; effective_n
+  // × cpu_out_dim × bf16 for output). The diff
+  // (replay_bucket_bytes − live_bytes) is the wasted PCIe / UVA
+  // bandwidth at B=1 decode under FULL capture; if material,
+  // motivates §1c.23's live-masked transfer prototype.
+  std::atomic<int64_t> worker_input_live_bytes_{0};
+  std::atomic<int64_t> worker_output_live_bytes_{0};
+  // §1c.22: bucket-sized UVA H2D transfer requested at GRAPH
+  // RECORD time (captured Triton grid sized for bucket ×
+  // cpu_out_dim). Bumped by `note_uva_request(num_tokens,
+  // cpu_out_dim)` from `cots_sync_then_uva`'s Python impl, which
+  // runs once during graph capture, NOT at replay. For per-replay
+  // UVA bytes use `uva_replay_bucket_bytes_` above.
+  std::atomic<int64_t> uva_record_bytes_{0};
+  std::atomic<int64_t> uva_record_count_{0};
 };
 
 }  // namespace cots

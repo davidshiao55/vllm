@@ -6059,6 +6059,15 @@ class GPUModelRunner(
             cuda_graph_size / (1 << 30),
             scope="local",
         )
+        # §1c.22: one-shot post-capture hook on the v1 active path.
+        # The COTS offloader uses this to reset instrumentation
+        # counters when
+        # `VLLM_COTS_RESET_COUNTERS_AFTER_CUDAGRAPH_CAPTURE=1`, so
+        # subsequent measured replay activity is isolated from
+        # capture/warmup. Default no-op for offloaders that don't
+        # override; logs an info line when the reset actually runs.
+        offloader = get_offloader()
+        offloader.post_cudagraph_capture()
         return cuda_graph_size
 
     def _warmup_and_capture(
