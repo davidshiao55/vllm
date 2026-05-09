@@ -146,25 +146,91 @@ void CotsCpuInfer::populate_slab_mlp(
   s.intermediate_per_half = intermediate_per_half;
 }
 
-void CotsCpuInfer::populate_slab_dryrun(int64_t task_id) {
+void CotsCpuInfer::populate_slab_dryrun(int64_t task_id, uintptr_t x_pinned_ptr,
+                                        int32_t in_dim, uintptr_t y_pinned_ptr,
+                                        int32_t cpu_out_dim) {
   check_error();
   TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
               "populate_slab_dryrun: task_id ", task_id, " out of range");
   TaskSlab& s = slabs_[task_id];
   s.op_kind = TaskSlab::kDryrunNoop;
+  // §1c.20: dryrun must carry the x_pinned + y_pinned pointers so
+  // submit_on_stream's D2H and sync's y_pinned_view both resolve.
+  s.x_pinned_ptr = reinterpret_cast<void*>(x_pinned_ptr);
+  s.in_dim = in_dim;
+  s.y_pinned_ptr = reinterpret_cast<void*>(y_pinned_ptr);
+  s.cpu_out_dim = cpu_out_dim;
 }
 
 void CotsCpuInfer::submit_on_stream(int64_t task_id, int32_t num_tokens,
+                                    uintptr_t x_gpu_ptr, int64_t x_cols,
+                                    int64_t x_stride0, int64_t x_stride1,
                                     uintptr_t cuda_stream) {
   // Surface any prior worker error BEFORE queueing more work.
   check_error();
   TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
               "submit_on_stream: task_id ", task_id, " out of range");
   TaskSlab* slab = &slabs_[task_id];
+  TORCH_CHECK(num_tokens >= 0, "submit_on_stream: num_tokens=", num_tokens,
+              " < 0");
+  // §1c.20: bound check against scratch_max_tokens_ catches Planner
+  // mistakes where an oversized batch reaches a slab. Skipped when
+  // scratch_max_tokens_==0 (test fixtures that don't allocate scratch
+  // / don't run real tokens through the slab — diagnostic-only path).
+  TORCH_CHECK(scratch_max_tokens_ == 0 || num_tokens <= scratch_max_tokens_,
+              "submit_on_stream: num_tokens=", num_tokens,
+              " exceeds scratch_max_tokens=", scratch_max_tokens_,
+              " (would write past the pinned buffer's tail)");
   slab->num_tokens.store(num_tokens, std::memory_order_release);
-  cudaError_t err = cudaLaunchHostFunc(
-      reinterpret_cast<cudaStream_t>(cuda_stream),
-      &CotsCpuInfer::DispatchCallback, static_cast<void*>(slab));
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  // §1c.20: D2H from x_gpu to slab's pinned input buffer.
+  // Stride-aware: contiguous → 1D cudaMemcpyAsync, row-strided →
+  // 2D cudaMemcpy2DAsync. Both graph-capturable. Skipped when
+  // `x_gpu_ptr == 0` (test fixtures that exercise dispatch only).
+  if (x_gpu_ptr != 0) {
+    TORCH_CHECK(slab->x_pinned_ptr != nullptr,
+                "submit_on_stream: slab.x_pinned_ptr is null at task_id=",
+                task_id, " (slab not populated?)");
+    TORCH_CHECK(slab->in_dim > 0, "submit_on_stream: slab.in_dim is ",
+                slab->in_dim, " at task_id=", task_id);
+    TORCH_CHECK(
+        x_cols == slab->in_dim, "submit_on_stream: x_gpu.shape[1]=", x_cols,
+        " disagrees with slab.in_dim=", slab->in_dim, " at task_id=", task_id);
+    TORCH_CHECK(x_stride1 == 1, "submit_on_stream: x_gpu.stride(1)=", x_stride1,
+                " (must be 1 — no transposed-stride layouts; only "
+                "row-strided contiguous-along-feature inputs are "
+                "supported)");
+    TORCH_CHECK(x_stride0 >= x_cols,
+                "submit_on_stream: x_gpu.stride(0)=", x_stride0,
+                " < x_cols=", x_cols, " (rows would overlap; reject)");
+    const size_t width_bytes =
+        static_cast<size_t>(slab->in_dim) * sizeof(at::BFloat16);
+    cudaError_t copy_err;
+    if (x_stride0 == x_cols) {
+      // Contiguous row layout — single 1D copy is fastest.
+      const size_t bytes = static_cast<size_t>(num_tokens) * width_bytes;
+      copy_err = cudaMemcpyAsync(slab->x_pinned_ptr,
+                                 reinterpret_cast<void*>(x_gpu_ptr), bytes,
+                                 cudaMemcpyDeviceToHost, stream);
+    } else {
+      // Row-strided (e.g., a `[:, :hidden_dim]` slice over a wider
+      // base, or a hidden-state view that the model produced with
+      // padding). 2D copy walks rows at the source stride and writes
+      // tightly-packed rows at the destination.
+      const size_t src_pitch =
+          static_cast<size_t>(x_stride0) * sizeof(at::BFloat16);
+      copy_err = cudaMemcpy2DAsync(
+          slab->x_pinned_ptr, /*dpitch=*/width_bytes,
+          reinterpret_cast<void*>(x_gpu_ptr), /*spitch=*/src_pitch,
+          /*width=*/width_bytes, /*height=*/static_cast<size_t>(num_tokens),
+          cudaMemcpyDeviceToHost, stream);
+    }
+    TORCH_CHECK(copy_err == cudaSuccess, "submit_on_stream: D2H copy failed (",
+                (x_stride0 == x_cols ? "1D" : "2D"),
+                "): ", cudaGetErrorString(copy_err));
+  }
+  cudaError_t err = cudaLaunchHostFunc(stream, &CotsCpuInfer::DispatchCallback,
+                                       static_cast<void*>(slab));
   TORCH_CHECK(
       err == cudaSuccess,
       "cudaLaunchHostFunc(DispatchCallback) failed: ", cudaGetErrorString(err));
@@ -251,6 +317,44 @@ void CotsCpuInfer::run_at_linear_inline(at::Tensor x, at::Tensor w,
   c10::InferenceMode g;
   // c10::AutoDispatchBelowAutograd is implied by InferenceMode.
   y_out.copy_(at::linear(x, w));
+}
+
+at::Tensor CotsCpuInfer::y_pinned_view(int64_t task_id,
+                                       int32_t num_tokens) const {
+  // §1c.20: build an `at::from_blob` CPU tensor view over the slab's
+  // pinned output buffer. Used by `cots_sync_then_uva`'s impl on the
+  // captured-graph hot path so the CPU output tensor is NEVER a
+  // custom-op argument visible to Inductor.
+  if (task_id < 0 || task_id >= slab_count_) {
+    throw std::out_of_range(
+        "CotsCpuInfer::y_pinned_view: task_id=" + std::to_string(task_id) +
+        " out of range [0, " + std::to_string(slab_count_) + ")");
+  }
+  const TaskSlab& slab = slabs_[task_id];
+  if (slab.y_pinned_ptr == nullptr) {
+    throw std::runtime_error(
+        "CotsCpuInfer::y_pinned_view: slab.y_pinned_ptr is null at task_id=" +
+        std::to_string(task_id) + " (slab not populated?)");
+  }
+  if (num_tokens < 0) {
+    throw std::invalid_argument("CotsCpuInfer::y_pinned_view: num_tokens=" +
+                                std::to_string(num_tokens) + " < 0");
+  }
+  if (scratch_max_tokens_ != 0 && num_tokens > scratch_max_tokens_) {
+    throw std::invalid_argument(
+        "CotsCpuInfer::y_pinned_view: num_tokens=" +
+        std::to_string(num_tokens) +
+        " exceeds scratch_max_tokens=" + std::to_string(scratch_max_tokens_) +
+        " (would read past the pinned buffer's tail)");
+  }
+  // dtype is hard-coded bfloat16 (matches populate_slab_*'s contract).
+  // The pointer's underlying allocation came from `_y_pinned` (a
+  // `torch.empty(..., pin_memory=True)`) and is page-locked; we trust
+  // the install-time invariant rather than re-validating here.
+  auto options = at::TensorOptions().dtype(at::kBFloat16).device(at::kCPU);
+  auto sizes = std::array<int64_t, 2>{static_cast<int64_t>(num_tokens),
+                                      static_cast<int64_t>(slab.cpu_out_dim)};
+  return at::from_blob(slab.y_pinned_ptr, sizes, options);
 }
 
 // --- static cudaLaunchHostFunc callbacks -----------------------------------

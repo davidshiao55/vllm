@@ -33,9 +33,12 @@ PYBIND11_MODULE(_cots_C, m) {
            py::arg("w_down_cols"), py::arg("w_down_stride_row"),
            py::arg("w_down_stride_col"), py::arg("intermediate_per_half"))
       .def("populate_slab_dryrun", &CotsCpuInfer::populate_slab_dryrun,
-           py::arg("task_id"))
+           py::arg("task_id"), py::arg("x_pinned_ptr"), py::arg("in_dim"),
+           py::arg("y_pinned_ptr"), py::arg("cpu_out_dim"))
       .def("submit_on_stream", &CotsCpuInfer::submit_on_stream,
-           py::arg("task_id"), py::arg("num_tokens"), py::arg("cuda_stream"))
+           py::arg("task_id"), py::arg("num_tokens"), py::arg("x_gpu_ptr"),
+           py::arg("x_cols"), py::arg("x_stride0"), py::arg("x_stride1"),
+           py::arg("cuda_stream"))
       .def("sync_on_stream", &CotsCpuInfer::sync_on_stream,
            py::arg("cuda_stream"))
       .def("submit_dryrun_burst", &CotsCpuInfer::submit_dryrun_burst,
@@ -49,5 +52,7 @@ PYBIND11_MODULE(_cots_C, m) {
       .def("take_error", &CotsCpuInfer::take_error)
       .def("check_error", &CotsCpuInfer::check_error)
       .def("run_at_linear_inline", &CotsCpuInfer::run_at_linear_inline,
-           py::arg("x"), py::arg("w"), py::arg("y_out"));
+           py::arg("x"), py::arg("w"), py::arg("y_out"))
+      .def("y_pinned_view", &CotsCpuInfer::y_pinned_view, py::arg("task_id"),
+           py::arg("num_tokens"));
 }

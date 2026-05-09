@@ -8,16 +8,32 @@ each with a `mutates_args` list that declares barrier-installing
 dependencies so torch.compile / CUDA graph capture preserve the overlap
 ordering between submit, GPU GEMMs, sync, and UVA copy.
 
-Schemas (see /root/.claude/plans/pleaes-implement-phase1c-in-quizzical-mist.md
-"Op schemas with CUDA dispatch anchors AND barrier-installing mutates_args"):
+Final schemas after the §1c.20 simplification (see
+`phase1c_findings.md §1c.20`):
 
-  * vllm.cots_submit_gemm(x_gpu, x_pinned, y_pinned, runner_id, task_id, num_tokens)
-      mutates_args=["x_gpu", "y_pinned"]
-      x_gpu pins submit BEFORE every GPU GEMM that reads x_gpu.
+  * vllm.cots_submit_gemm(x_gpu, runner_id, task_id, num_tokens)
+      mutates_args=["x_gpu"]
+      x_gpu mutated → pins submit BEFORE every GPU GEMM that reads
+      x_gpu, AND provides the (submit → sync) edge consumed by
+      cots_sync_then_uva's `submit_anchor` read. The C++ impl
+      bundles `cudaMemcpyAsync(D2H)` from x_gpu to slab.x_pinned_ptr
+      with the host-callback enqueue.
 
-  * vllm.cots_sync_then_uva(y_pinned, y_gpu, gpu_anchor_a, gpu_anchor_b, runner_id)
+  * vllm.cots_sync_then_uva(y_gpu, gpu_anchor_a, gpu_anchor_b,
+                            submit_anchor, runner_id, task_id,
+                            num_tokens)
       mutates_args=["y_gpu", "gpu_anchor_a", "gpu_anchor_b"]
-      Two distinct anchors pin sync AFTER each independent GPU GEMM.
+      `gpu_anchor_a/_b` pin sync AFTER each independent GPU GEMM.
+      `submit_anchor` (read-only, == x_gpu) pins sync AFTER submit.
+      The impl reaches the slab's pinned output via
+      `CotsCpuInfer.y_pinned_view(task_id, num_tokens)`.
+
+Both ops accept ONLY CUDA tensors and scalar ids — no CPU tensor
+arguments. Inductor's functionalization on captured graphs
+materializes any CPU view it sees (in the worst case via a GPU
+intermediate + blocking GPU→CPU copy that CUDA Graph capture
+rejects with cudaErrorStreamCaptureUnsupported), so the design
+keeps pinned-buffer addresses entirely on the C++ side.
 
 §1c.19 split (see `phase1c_findings.md §1c.19`): the registry stores
 the `CotsCpuInfer` pybind handle DIRECTLY by runner_id, NOT a
@@ -131,44 +147,91 @@ def sync_blocking(runner_id: int) -> None:
 
 # --- vllm.cots_submit_gemm -------------------------------------------------
 #
-# §1c.20 schema: y_pinned is INTENTIONALLY not in this op's argument
-# list, and consequently not in `mutates_args`. The previous schema
-# (`mutates_args=["x_gpu", "y_pinned"]`) caused Inductor's
-# functionalization to allocate a fresh pageable CPU buffer
-# (`empty_strided_cpu`) and clone the pinned slice into it after this
-# op's mutation, then pass the clone to `cots_sync_then_uva` — which
-# broke `uva_copy_into_gpu`'s page-locked-storage requirement. The
-# worker writes to the pinned output via the slab-side pointer
-# populated at install time (`cots_ops.populate_slab_via_spec`), so
-# the compiler does not need to see the pinned buffer to enforce
-# correctness; the (submit → sync) data dependency rides on `x_gpu`
-# instead. See `phase1c_findings.md §1c.20`.
+# §1c.20 schema: BOTH y_pinned AND x_pinned are intentionally
+# excluded from this op's argument list. The earlier intermediate
+# schema (which kept x_pinned but dropped y_pinned) still hit
+# Inductor's CPU-tensor functionalization on the SUBMIT side: the
+# operator's `x_pinned.copy_(x_gpu, non_blocking=True)` was
+# expanded into (GPU intermediate → fresh pageable CPU →
+# `cpp_fused_copy_slice_view` into the pinned slice), where the
+# blocking GPU→CPU step is rejected under CUDA Graph capture. The
+# fix bundles the D2H into C++: `submit_on_stream(task_id,
+# num_tokens, x_gpu_ptr, stream)` issues `cudaMemcpyAsync(D2H)`
+# from x_gpu's data pointer to slab.x_pinned_ptr, then enqueues
+# the host callback. The custom op's only Python-visible tensor
+# argument is x_gpu (a CUDA tensor — Inductor handles GPU tensors
+# natively without CPU/GPU shuffles).
+# See `phase1c_findings.md §1c.20`.
 
 
 def _cots_submit_gemm_impl(
     x_gpu: torch.Tensor,
-    x_pinned: torch.Tensor,
     runner_id: int,
     task_id: int,
     num_tokens: int,
 ) -> None:
     """Real impl: dispatched to the per-runner pybind handle.
 
-    The host-side D2H `x_pinned.copy_(x_gpu, non_blocking=True)` happens
-    BEFORE this op is invoked (in NativeCotsRunner.submit_with_d2h);
-    torch.compile sees x_pinned as use-after-mutate and keeps that
-    ordering. We just enqueue the GEMM task on the current CUDA stream.
-    The worker writes to the pinned output via the slab pointer, NOT
-    through any tensor argument here (§1c.20).
+    §1c.20: bundles the x_gpu → slab.x_pinned_ptr D2H copy WITH the
+    host-callback enqueue, all on the current CUDA stream. x_pinned
+    is intentionally NOT a Python-side argument — Inductor's
+    functionalization materializes any CPU tensor visible in the
+    captured graph (in the worst case via a GPU intermediate +
+    blocking GPU→CPU copy that CUDA Graph capture rejects). Both
+    custom ops are now CUDA-tensors-and-scalars only; the worker
+    reaches the pinned input via the slab pointer populated at
+    install time.
+
+    Moving the D2H from Python `copy_(non_blocking=True)` to a raw
+    `cudaMemcpyAsync` loses Python's automatic shape/stride/dtype
+    handling, so we validate `x_gpu` here BEFORE handing the raw
+    pointer to C++. The slab's `in_dim` and `num_tokens` together
+    determine the byte count; mismatched shapes would silently copy
+    the wrong amount of data.
     """
+    assert x_gpu.is_cuda, f"cots_submit_gemm: x_gpu must be on CUDA, got {x_gpu.device}"
+    assert x_gpu.dtype == torch.bfloat16, (
+        f"cots_submit_gemm: x_gpu must be bfloat16 (matches slab dtype), "
+        f"got {x_gpu.dtype}"
+    )
+    assert x_gpu.dim() == 2, (
+        f"cots_submit_gemm: x_gpu must be 2D (num_tokens, in_dim); "
+        f"got shape {tuple(x_gpu.shape)}"
+    )
+    assert x_gpu.shape[0] == num_tokens, (
+        f"cots_submit_gemm: num_tokens mismatch — x_gpu.shape[0]="
+        f"{x_gpu.shape[0]}, num_tokens arg={num_tokens}"
+    )
+    # `stride(1) == 1` is the production contract — feature-dim
+    # contiguous, possibly row-strided. The C++ side handles the
+    # row-strided case via cudaMemcpy2DAsync; transposed/exotic
+    # layouts (stride(1) != 1) would need a separate copy plan and
+    # are rejected. Real Qwen2-style hidden_states tensors satisfy
+    # this even when they come from padded / sliced bases.
+    assert x_gpu.stride(1) == 1, (
+        f"cots_submit_gemm: x_gpu.stride(1)={x_gpu.stride(1)} (must be 1; "
+        f"no transposed-stride layouts in production decode). For "
+        f"row-strided inputs (stride(0) > shape[1]) the C++ D2H uses "
+        f"cudaMemcpy2DAsync."
+    )
     infer = _lookup_infer(runner_id, "cots_submit_gemm")
     stream = torch.cuda.current_stream().cuda_stream
-    infer.submit_on_stream(task_id, num_tokens, stream)
+    # Pass shape/stride so the C++ D2H can dispatch the right
+    # cudaMemcpy* variant — see CotsCpuInfer::submit_on_stream for
+    # the 1D-vs-2D branch.
+    infer.submit_on_stream(
+        task_id,
+        num_tokens,
+        x_gpu.data_ptr(),
+        x_gpu.shape[1],
+        x_gpu.stride(0),
+        x_gpu.stride(1),
+        stream,
+    )
 
 
 def _cots_submit_gemm_fake(
     x_gpu: torch.Tensor,
-    x_pinned: torch.Tensor,
     runner_id: int,
     task_id: int,
     num_tokens: int,
@@ -181,46 +244,57 @@ def _cots_submit_gemm_fake(
 
 
 def _cots_sync_then_uva_impl(
-    y_pinned: torch.Tensor,
     y_gpu: torch.Tensor,
     gpu_anchor_a: torch.Tensor,
     gpu_anchor_b: torch.Tensor,
     submit_anchor: torch.Tensor,
     runner_id: int,
+    task_id: int,
+    num_tokens: int,
 ) -> None:
     """Real impl: schedule the sync host callback then run the UVA copy.
 
-    Bundling sync + uva_copy into one op (instead of two ops registered
-    separately) gives torch.compile a single dependency-bearing entry —
-    the alternative would let it reorder the Triton UVA copy across
-    sync. `gpu_anchor_a` / `gpu_anchor_b` are CUDA tensors that the
-    GPU GEMMs produced; mutating them pins this op AFTER both
-    independent GEMMs (out_perm, out_pref).
+    `gpu_anchor_a` / `gpu_anchor_b` are CUDA tensors that the GPU
+    GEMMs produced; mutating them pins this op AFTER both independent
+    GEMMs (out_perm, out_pref). `submit_anchor` is `x_gpu` from the
+    matching `cots_submit_gemm`; reading it pins this op AFTER submit.
 
-    §1c.20: `submit_anchor` is `x_gpu` from the matching
-    `cots_submit_gemm`. Reading it pins this op AFTER submit without
-    requiring `y_pinned` to be in submit's `mutates_args` (which would
-    trigger Inductor's functionalization clone). `y_pinned` here is
-    read-only from the compiler's view; the runtime data was written by
-    the worker via the slab pointer.
+    §1c.20: `y_pinned` is intentionally NOT a parameter. Inductor's
+    functionalization materializes any CPU tensor visible in the
+    captured graph by allocating a fresh pageable CPU buffer and
+    cloning into it (in the worst case via a GPU intermediate +
+    blocking GPU→CPU copy that CUDA Graph capture rejects). The slab
+    pointer the worker wrote to IS the source of truth; we reach it
+    directly via the C++-side `y_pinned_view(task_id, num_tokens)`
+    helper. The Python-visible custom-op signature contains only CUDA
+    tensors and scalar ids, so Inductor has nothing CPU-side to
+    materialize. The trust boundary is install-time: the slab pointer
+    came from `_y_pinned`, allocated `pin_memory=True` and validated
+    there.
     """
     infer = _lookup_infer(runner_id, "cots_sync_then_uva")
     stream = torch.cuda.current_stream().cuda_stream
     infer.sync_on_stream(stream)
+    # Build the CPU view over the slab pointer locally — never escapes
+    # back to Python in a way Inductor would see.
+    y_pinned = infer.y_pinned_view(task_id, num_tokens)
     # Lazy import to avoid a top-level circular import (cots.py imports
     # this module via cots_ops and we'd loop on `from .cots import ...`).
-    from vllm.model_executor.offloader.cots import uva_copy_into_gpu
+    from vllm.model_executor.offloader.cots import (
+        _uva_copy_trusted_host_into_gpu,
+    )
 
-    uva_copy_into_gpu(y_pinned, y_gpu)
+    _uva_copy_trusted_host_into_gpu(y_pinned, y_gpu)
 
 
 def _cots_sync_then_uva_fake(
-    y_pinned: torch.Tensor,
     y_gpu: torch.Tensor,
     gpu_anchor_a: torch.Tensor,
     gpu_anchor_b: torch.Tensor,
     submit_anchor: torch.Tensor,
     runner_id: int,
+    task_id: int,
+    num_tokens: int,
 ) -> None:
     return
 
@@ -238,10 +312,9 @@ def register_cots_offloader_ops() -> None:
         # every subsequent GPU GEMM that reads x_gpu (F.linear
         # permanent / prefetched) to be ordered after submit, AND
         # `cots_sync_then_uva` reads x_gpu as `submit_anchor` to
-        # stay ordered after submit. y_pinned is intentionally NOT
-        # an arg here; the worker writes to the pinned output via
-        # the slab pointer, not through any tensor visible to the
-        # compiler.
+        # stay ordered after submit. NEITHER `x_pinned` NOR
+        # `y_pinned` appears in the op signature; both pinned
+        # buffers are reached via slab pointers in C++.
         mutates_args=["x_gpu"],
         fake_impl=_cots_submit_gemm_fake,
     )

@@ -134,18 +134,39 @@ class CotsCpuInfer {
                          int64_t w_down_stride_col,
                          int32_t intermediate_per_half);
 
-  void populate_slab_dryrun(int64_t task_id);
+  // Populate a slab as a dryrun-noop. §1c.20: dryrun must still
+  // carry x_pinned_ptr + in_dim (so submit_on_stream's D2H copy
+  // resolves) AND y_pinned_ptr + cpu_out_dim (so the captured-graph
+  // sync op's y_pinned_view call resolves) even though the worker
+  // skips the GEMM. The y_pinned values are uninitialized after
+  // sync but that's exactly what dryrun means — the bench measures
+  // orchestration overhead, not output correctness.
+  void populate_slab_dryrun(int64_t task_id, uintptr_t x_pinned_ptr,
+                            int32_t in_dim, uintptr_t y_pinned_ptr,
+                            int32_t cpu_out_dim);
 
-  // Submit a task on the *current* CUDA stream. Writes num_tokens into the
-  // slab and queues a cudaLaunchHostFunc node onto the supplied stream;
-  // when that host callback fires (after prior stream work completes), it
-  // enqueues the actual task body onto TaskQueue.
+  // Submit a task on the *current* CUDA stream. §1c.20: bundles the
+  // x_gpu → x_pinned D2H copy WITH the host-callback enqueue so
+  // neither x_pinned NOR x_gpu's view need to be Python tensors
+  // visible to Inductor in the captured graph. The D2H is
+  // stride-aware: when `x_stride0 == x_cols` (contiguous row layout)
+  // we issue a single 1D `cudaMemcpyAsync`; otherwise — the
+  // row-strided case real-model hidden-states paths can produce —
+  // we use `cudaMemcpy2DAsync` to walk rows correctly. Both are
+  // graph-capturable; the host callback we queue immediately after
+  // is strictly ordered behind the copy. `x_stride1 == 1` is
+  // required (no transposed-stride layouts in production decode).
   //
   // The Python custom-op `vllm.cots_submit_gemm` (registered in
-  // vllm/model_executor/offloader/cots_ops.py) translates to a call here
-  // with `stream = c10::cuda::getCurrentCUDAStream()`.
+  // vllm/model_executor/offloader/cots_ops.py) translates to a call
+  // here with `stream = c10::cuda::getCurrentCUDAStream()`,
+  // `x_gpu_ptr = x_gpu.data_ptr()`, and the shape/stride metadata
+  // pulled off the tensor. The torch.ops schema stays
+  // `(x_gpu, runner_id, task_id, num_tokens)` — Inductor only sees
+  // CUDA tensors + scalar ids.
   void submit_on_stream(int64_t task_id, int32_t num_tokens,
-                        uintptr_t cuda_stream);
+                        uintptr_t x_gpu_ptr, int64_t x_cols, int64_t x_stride0,
+                        int64_t x_stride1, uintptr_t cuda_stream);
 
   // Likewise for sync. Schedules `&sync_args_` (a stable member) as a host
   // callback on the supplied stream; the callback blocks the CUDA driver
@@ -197,6 +218,18 @@ class CotsCpuInfer {
   // perf BEFORE wiring through host callbacks. Argument tensors are
   // user-managed; this just calls into ATen.
   void run_at_linear_inline(at::Tensor x, at::Tensor w, at::Tensor y_out);
+
+  // §1c.20: produce an `at::from_blob` CPU tensor view over the slab's
+  // pinned output buffer for the given task. Trusted: the y_pinned_ptr
+  // came from `_y_pinned`, which was allocated with `pin_memory=True`
+  // and validated at install time — re-checking `is_pinned()` here
+  // would duplicate work. Used by `cots_sync_then_uva`'s impl to
+  // reach the worker's output WITHOUT exposing the CPU tensor as a
+  // graph input that Inductor would materialize via a CPU↔GPU
+  // shuffle. Shape: {num_tokens, slab.cpu_out_dim}, dtype bfloat16,
+  // contiguous. Caller must NOT outlive the slab (i.e., this
+  // CotsCpuInfer instance).
+  at::Tensor y_pinned_view(int64_t task_id, int32_t num_tokens) const;
 
  private:
   // Static dispatchers used by cudaLaunchHostFunc. Both must be
