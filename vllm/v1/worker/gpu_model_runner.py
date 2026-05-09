@@ -4015,9 +4015,8 @@ class GPUModelRunner(
         # captured graph-bucket size at `batch_desc.num_tokens`. The
         # captured graph shape stays at the bucket; only the worker's
         # row-count arithmetic shrinks. No-op for offloaders that
-        # don't override `set_runtime_num_tokens`.
-        from vllm.model_executor.offloader.base import get_offloader
-
+        # don't override `set_runtime_num_tokens`. `get_offloader` is
+        # imported at module scope (line 88).
         get_offloader().set_runtime_num_tokens(num_tokens_unpadded)
 
         # Use persistent buffers for CUDA graphs.

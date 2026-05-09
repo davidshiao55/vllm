@@ -140,11 +140,14 @@ def set_worker_affinity(runner_id: int, mask: int) -> None:
 
 def set_runtime_num_tokens(runner_id: int, n: int) -> None:
     """§1c.21 live-token plumb-through. Called by
-    `CotsOffloader.prepare_before_forward` BEFORE each captured graph
-    replay with the live unpadded token count from
-    `scheduler_output.total_num_scheduled_tokens`. The worker reads
-    the value on the next host-callback fire and uses it for
-    row-count arithmetic instead of the captured bucket size."""
+    `CotsOffloader.set_runtime_num_tokens` (a thin override on the
+    `BaseOffloader` lifecycle hook) which is invoked by
+    `gpu_model_runner.execute_model` BEFORE the
+    FULL/PIECEWISE/eager dispatch with the live unpadded token
+    count from `scheduler_output.total_num_scheduled_tokens`. The
+    worker reads the value on the next host-callback fire and uses
+    it for row-count arithmetic instead of the captured bucket
+    size."""
     infer = _COTS_INFER.get(runner_id)
     if infer is None:
         # Best-effort: a stale runner_id call here shouldn't crash —

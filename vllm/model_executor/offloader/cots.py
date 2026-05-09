@@ -1521,10 +1521,14 @@ class NativeCotsRunner:
     torch.compile and CUDA Graph capture honor the barrier-installing
     `mutates_args` declarations on `x_gpu` and `gpu_anchor_a/_b`.
 
-    Multi-engine safety: each instance registers itself in the
-    `cots_ops._COTS_RUNNERS` weak registry under a unique runner_id so
-    two offloaders (FastTTS gen + ver) coexist with independent slab
-    pools. `close()` drains the worker then unregisters.
+    Multi-engine safety: each instance allocates a `runner_id` and
+    the underlying `CotsCpuInfer` pybind handle is owned by the
+    `cots_ops._COTS_INFER` strong-ref registry (§1c.19 split — was a
+    `_COTS_RUNNERS` weak map prior). The runner facade itself only
+    holds the integer id + picklable state, so PyTorch's AOT compile
+    guard cache can serialize it. Two offloaders (FastTTS gen + ver)
+    coexist with independent slab pools. `close()` drains the worker
+    then unregisters.
 
     §1c.21 — TWO ROW COUNTS. After the live-token plumb-through fix,
     COTS distinguishes between:
@@ -3104,8 +3108,12 @@ class CotsOffloader(BaseOffloader):
         """§1c.21 fix: push the live unpadded token count to the C++
         worker so it sizes CPU GEMM work correctly even when vLLM
         replays a captured graph for a larger bucket. Called OUT OF
-        GRAPH by `cudagraph_utils.py` (capture and replay sites)
-        BEFORE `prepare_before_forward`.
+        GRAPH by `gpu_model_runner.execute_model` BEFORE the
+        FULL/PIECEWISE/eager dispatch (see vllm@5fecc800b) — that
+        site has access to `scheduler_output.total_num_scheduled_tokens`
+        which is the live unpadded count. `cudagraph_utils.run_fullgraph`
+        also accepts an explicit `actual_num_tokens` kwarg as a
+        secondary entry point.
 
         No-op when not using the native runner (PythonCotsRunner is
         eager-only and reads the live count directly off
@@ -3228,6 +3236,32 @@ class CotsOffloader(BaseOffloader):
                     "switch to cpu_runner='native' (the Phase 1c "
                     "production path; supports CUDA Graph capture)."
                 )
+
+        # §1c.21 review-fix: native runner is incompatible with vLLM
+        # microbatching/ubatching (DBO or ubatch_size > 1). The
+        # live-token override
+        # (`gpu_model_runner.execute_model → BaseOffloader.set_runtime_num_tokens`)
+        # currently sets ONE global value per scheduler batch. Under
+        # ubatching, a COTS operator runs on a per-ubatch slice but
+        # sees the override as the FULL batch token count, which can
+        # over-compute (the worker would read past the per-ubatch
+        # x_pinned slice into stale data) or trip the
+        # `runtime_num_tokens > slab.num_tokens` hard-fail. Hard-fail
+        # at construction with a clear message until §1c.23 plumbs
+        # per-ubatch live counts.
+        cpu_runner = getattr(self.config, "cpu_runner", "python")
+        if cpu_runner == "native" and vllm_config.parallel_config.use_ubatching:
+            raise RuntimeError(
+                "CotsOffloader: cpu_runner='native' is currently "
+                "incompatible with vLLM microbatching/ubatching "
+                "(`enable_dbo` or `ubatch_size > 1`). The live-token "
+                "override sets one global runtime_num_tokens per "
+                "scheduler batch; under ubatching a per-ubatch slice "
+                "would over-compute against the full-batch override. "
+                "Either disable ubatching or use cpu_runner='python' "
+                "with enforce_eager=True. Tracking under "
+                "phase1c_findings.md §1c.23."
+            )
 
         self._eager_fallback_entry = self._dispatch_table[self._capture_buckets[-1]]
 
