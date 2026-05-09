@@ -33,6 +33,7 @@ for the design rationale and empirical numbers.
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Callable, Generator
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING
@@ -1097,19 +1098,44 @@ class WeightPrefetchStreamer:
 
 
 # ---------------------------------------------------------------------------
-# Execution layer: CpuTaskRunner
+# Execution layer: PythonCotsRunner / NativeCotsRunner
 #
-# Generic CPU work submitter. Phase 1a: thin wrapper around the global
-# ThreadPoolExecutor + a CUDA event handshake for D2H ordering.
-# Phase 1c (was Phase 4): replace internals with cudaLaunchHostFunc binding
-# to a C++ CPUInfer (kt-kernel/cpu_backend/cpuinfer.h:78-116). Operator code
-# uses `submit_with_d2h` / `wait` and is unaffected by the swap.
+# Phase 1a/1b shipped a single `CpuTaskRunner` (Python `ThreadPoolExecutor`
+# + `future.result()`). Phase 1c splits this into two runners that share an
+# operator-side facade (added incrementally — Stage 2 keeps the legacy
+# `submit_with_d2h(fn, *args)` shape on PythonCotsRunner so operators don't
+# break; Stage 3 flips operators to the uniform facade and wires
+# NativeCotsRunner end-to-end).
+#
+#   * PythonCotsRunner — the Phase 1a/1b path, retained as a kill-switch
+#     under `CotsOffloadConfig.cpu_runner = "python"`. Eager-only;
+#     `enforce_eager=False` with python runner is rejected at post_init
+#     (Stage 5).
+#
+#   * NativeCotsRunner — the Phase 1c production path under
+#     `cpu_runner = "native"` (default). Wraps the C++ `CotsCpuInfer`
+#     (vllm/_cots_C) and dispatches CPU work through cudaLaunchHostFunc
+#     onto the current CUDA stream, removing the Python `executor.submit`
+#     / `future.result` round-trip and enabling CUDA Graph capture.
+#
+# `CpuTaskRunner` is kept as a module-level alias of `PythonCotsRunner` for
+# any external code that imported the old name.
 #
 # Strict sequential layer execution invariant means at most one task is
-# in flight at any moment, so a single _future field per runner suffices.
+# in flight at any moment.
 # ---------------------------------------------------------------------------
-class CpuTaskRunner:
-    """Generic CPU-side task runner. Phase 1c swap target."""
+class PythonCotsRunner:
+    """Phase 1a/1b-shaped CPU task runner — the kill-switch path under
+    `CotsOffloadConfig.cpu_runner = "python"`. Body identical to the
+    original `CpuTaskRunner`; only the class is renamed for the Phase 1c
+    naming convention.
+
+    Eager-only: `ThreadPoolExecutor.submit` is not graph-capturable, so
+    selecting this runner with `enforce_eager=False` is a hard error
+    (Stage 5 enforces; Stage 2 just plumbs the flag).
+    """
+
+    kind = "python"
 
     def __init__(self, dry_run: bool = False) -> None:
         self._future: Future | None = None
@@ -1140,6 +1166,170 @@ class CpuTaskRunner:
         assert self._future is not None, "submit_with_d2h() not called"
         self._future.result()
         self._future = None
+
+    def close(self) -> None:
+        """Drain any pending task. Idempotent; safe to call from teardown."""
+        if self._future is not None:
+            with contextlib.suppress(Exception):
+                self._future.result()
+            self._future = None
+
+
+# Backwards-compat alias for any external code that imported the old name.
+CpuTaskRunner = PythonCotsRunner
+
+
+class NativeCotsRunner:
+    """Phase 1c production runner. Wraps the C++ `CotsCpuInfer` via the
+    `vllm._cots_C` extension; dispatches CPU work through
+    `cudaLaunchHostFunc` so the forward pass is graph-capturable.
+
+    Stage 2 (this stage) ships the runner class definition and registry
+    plumbing only; the legacy `submit_with_d2h(fn, *args)` API is NOT
+    implemented because operators still call the old PythonCotsRunner
+    shape until Stage 3 flips them to the uniform facade
+    `submit_with_d2h(x, x_pinned, y_pinned, op_descriptor)` +
+    `wait_and_uva(y_pinned, y_gpu, gpu_anchor_a, gpu_anchor_b)`. Until
+    Stage 3 lands, `CotsOffloader.__init__` will reject
+    `cpu_runner="native"` so users see a clean error rather than a
+    confusing failure during the first forward.
+
+    Multi-engine safety: each instance registers itself in the
+    `cots_ops._COTS_RUNNERS` weak registry under a unique runner_id so
+    two offloaders (FastTTS gen + ver) coexist with independent slab
+    pools. `close()` explicitly drains the worker, then unregisters.
+    """
+
+    kind = "native"
+
+    def __init__(self, dry_run: bool = False) -> None:
+        # Lazy imports: cots_ops imports _cots_C which is built only on
+        # CUDA; users on CPU-only / ROCm builds shouldn't hit ImportError
+        # just by importing this module. The registry helpers live in
+        # cots_ops alongside the custom-op registration.
+        try:
+            from vllm import _cots_C  # noqa: F401 — used via attr below
+        except ImportError as e:
+            raise RuntimeError(
+                "NativeCotsRunner requires the `vllm._cots_C` extension, "
+                "which builds only on CUDA targets. Either select "
+                "`cpu_runner='python'` or rebuild vLLM with CUDA support."
+            ) from e
+        from vllm.model_executor.offloader import cots_ops
+
+        self._infer = _cots_C.CotsCpuInfer()
+        self._dry_run = dry_run
+        # Strong reference to the cots_ops module so the registry's weak
+        # entries don't get GC-collected while this runner is alive.
+        self._cots_ops = cots_ops
+        self._runner_id: int = cots_ops._register_runner(self)
+        # Stage 3 will populate this from CotsOffloader._build_slab_table.
+        # Format: {(layer_idx, bucket, op_kind): task_id}.
+        self._task_id_for: dict[tuple[int, int, str], int] = {}
+        self._installed: bool = False
+
+    # Stage 2 placeholder methods that satisfy the operator-side typed
+    # union `PythonCotsRunner | NativeCotsRunner` without falsely
+    # claiming Stage 3 functionality. Operators currently call
+    # `submit_with_d2h(fn, *args)` and `wait()` (Phase 1a/1b legacy
+    # shape); routing them through NativeCotsRunner is a Stage 3 task
+    # that flips the entire surface to the uniform
+    # `submit_with_d2h(x, x_pin, y_pin, op_descriptor)` +
+    # `wait_and_uva(...)` API. The Stage 2 native rejection in
+    # CotsOffloader.__init__ ensures these methods are NEVER reached at
+    # runtime. They exist only so mypy sees a consistent interface
+    # across the runner union.
+    def submit_with_d2h(self, *args: object, **kwargs: object) -> None:
+        raise NotImplementedError(
+            "NativeCotsRunner.submit_with_d2h is reserved for Phase 1c "
+            "Stage 3, which flips operators to the uniform facade. "
+            "Stage 2 rejects cpu_runner='native' at offloader "
+            "construction so this should be unreachable. If you see "
+            "this at runtime, the Stage 2 guard at "
+            "CotsOffloader.__init__ has regressed."
+        )
+
+    def wait(self, *args: object, **kwargs: object) -> None:
+        raise NotImplementedError(
+            "NativeCotsRunner.wait is reserved for Phase 1c Stage 3."
+        )
+
+    def install(
+        self,
+        n_slabs: int,
+        scratch_max_tokens: int,
+        scratch_max_intermediate_per_half: int,
+    ) -> None:
+        """Allocate the C++ slab pool. Called once at offloader install
+        time after the slab count + worst-case scratch sizes are known.
+        Subsequent `populate_slab_*` calls fill in static fields per slab.
+        Idempotent guard: re-install attempts raise.
+        """
+        if self._installed:
+            raise RuntimeError(
+                "NativeCotsRunner.install() called twice on the same instance"
+            )
+        self._infer.install(
+            n_slabs=int(n_slabs),
+            scratch_max_tokens=int(scratch_max_tokens),
+            scratch_max_intermediate_per_half=int(scratch_max_intermediate_per_half),
+        )
+        self._installed = True
+
+    def close(self) -> None:
+        """Drain any in-flight worker task and drop the registry entry.
+        Idempotent; safe to call from teardown."""
+        try:
+            if self._infer is not None:
+                self._infer.sync_blocking()
+        finally:
+            self._cots_ops._unregister_runner(self._runner_id)
+
+    def __del__(self) -> None:
+        # Best-effort registry cleanup if the user forgot to call close().
+        # Note: don't raise from __del__ — the GC log is unhelpful.
+        #
+        # FORWARD RISK (review finding #3, Stage 2 sign-off): this path
+        # only unregisters; it does NOT drain the CUDA stream of any
+        # in-flight `cudaLaunchHostFunc` callbacks scheduled via
+        # `submit_on_stream` / `sync_on_stream`. Once Stage 3 wires
+        # operators end-to-end, an offloader teardown mid-forward could
+        # leave host callbacks pointing at a freed slab. Stage 3 must
+        # either (a) add a BaseOffloader-level shutdown hook that drains
+        # the compute stream and closes the runner before slabs are
+        # freed, OR (b) make this `__del__` best-effort
+        # `torch.cuda.current_stream().synchronize()` first (which is
+        # also dangerous to do from a finalizer if CUDA is already
+        # torn down). Tracked explicitly so it is not forgotten.
+        with contextlib.suppress(Exception):
+            self._cots_ops._unregister_runner(self._runner_id)
+
+
+def _make_runner(config: CotsOffloadConfig) -> PythonCotsRunner | NativeCotsRunner:
+    """Construct the offloader's single runner per `config.cpu_runner`.
+
+    One runner per offloader (not per operator) — see plan §design-decision
+    4 "One offloader-owned runner shared across all operators". This
+    moves the Phase 1a/1b pattern of fresh `CpuTaskRunner()` per op
+    (cots.py:1752 and :1807 in the legacy code) onto a single shared
+    instance, which is the structural prerequisite for the native
+    runner's per-offloader slab pool + runner_id.
+    """
+    # Default fallback "python" matches `CotsOffloadConfig.cpu_runner`
+    # (vllm/config/offload.py) through Stage 4. Stage 5 will flip both
+    # together once graph capture is verified end-to-end. Picking
+    # "native" here would let an old config shim (no `cpu_runner`
+    # field) silently route through the unwired native path during
+    # Stage 2/3/4 and fail at the operator call site.
+    cpu_runner = getattr(config, "cpu_runner", "python")
+    dry_run = bool(getattr(config, "dry_run", False))
+    if cpu_runner == "python":
+        return PythonCotsRunner(dry_run=dry_run)
+    if cpu_runner == "native":
+        return NativeCotsRunner(dry_run=dry_run)
+    raise ValueError(
+        f"Unknown cpu_runner={cpu_runner!r}; expected 'native' or 'python'"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1211,7 +1401,7 @@ class CotsQKVOp:
     def __init__(
         self,
         handle: CotsLinearHandle,
-        runner: CpuTaskRunner,
+        runner: PythonCotsRunner | NativeCotsRunner,
         offloader: CotsOffloader,
         original_quant_method,
     ):
@@ -1323,7 +1513,7 @@ class CotsSwiGLUMLPOp:
         gate_up_handle: CotsLinearHandle,
         down_handle: CotsLinearHandle,
         act_fn: nn.Module,
-        runner: CpuTaskRunner,
+        runner: PythonCotsRunner | NativeCotsRunner,
         offloader: CotsOffloader,
         qualified_name: str,
     ):
@@ -1611,6 +1801,40 @@ class CotsOffloader(BaseOffloader):
         self._prefetch_buffer_pool: CotsPrefetchBufferPool | None = None
         self._streamer: WeightPrefetchStreamer | None = None
 
+        # Phase 1c: one offloader-owned runner shared across all operator
+        # call sites (Stage 2 installer refactor — replaces the Phase
+        # 1a/1b pattern of fresh `CpuTaskRunner()` per op). The factory
+        # selects PythonCotsRunner / NativeCotsRunner from
+        # `config.cpu_runner`. See `_make_runner` and the runner classes
+        # above. Only constructed when COTS is actually offloading
+        # (`f_cpu_store > 0`); the no-offload path leaves it None to
+        # avoid spinning up a worker thread for a no-op session.
+        self._runner: PythonCotsRunner | NativeCotsRunner | None = None
+        if self.f_cpu_store > 0.0:
+            # Stage 2 guard, BEFORE _make_runner so we don't construct
+            # (and register, and spawn a C++ worker for) a NativeCotsRunner
+            # only to throw it away. Constructing first would (a) pollute
+            # the runner registry until GC, and (b) on non-CUDA builds,
+            # raise an `_cots_C` import error that masks the intended
+            # Stage-3 message. The native runner's operator-side wiring
+            # lands in Stage 3 (uniform `submit_with_d2h(x, x_pin, y_pin,
+            # op_descriptor)` + `wait_and_uva` + slab population); until
+            # then, falling through to operator code that calls the
+            # legacy `submit_with_d2h(fn, *args)` shape would just
+            # AttributeError mid-forward. Fail loudly here instead.
+            if getattr(config, "cpu_runner", "python") == "native":
+                raise NotImplementedError(
+                    "cots: cpu_runner='native' is reserved for Phase 1c "
+                    "Stage 3+ where operators flip to the uniform facade. "
+                    "Stage 2 has only stood up the substrate (cots_ops.py, "
+                    "NativeCotsRunner class, runner registry, installer "
+                    "refactor); operator call sites still expect the "
+                    "PythonCotsRunner legacy shape. Set "
+                    "cpu_runner='python' for now, OR wait for Stage 3 to "
+                    "land before switching the default."
+                )
+            self._runner = _make_runner(config)
+
     # ------------------------------------------------------------------
     # Lifecycle: wrap_modules → (weight loading) → post_init.
     # ------------------------------------------------------------------
@@ -1744,12 +1968,20 @@ class CotsOffloader(BaseOffloader):
     # --- Pass 2a: QKV operator install ---
 
     def _install_qkv_ops(self, handles: list[CotsLinearHandle]) -> None:
+        # Phase 1c installer refactor: operators share the offloader's
+        # single runner (constructed once in __init__). Phase 1a/1b
+        # constructed a fresh `CpuTaskRunner` per op; that pattern is
+        # incompatible with Stage 3's per-offloader slab pool +
+        # runner_id design.
+        assert self._runner is not None, (
+            "_install_qkv_ops called with f_cpu_store=0 — runner not constructed"
+        )
         for h in handles:
             if h.kind != "qkv":
                 continue
             h.linear.quant_method = CotsQKVOp(
                 handle=h,
-                runner=CpuTaskRunner(dry_run=self.dry_run),
+                runner=self._runner,
                 offloader=self,
                 original_quant_method=h.linear.quant_method,
             )
@@ -1798,13 +2030,18 @@ class CotsOffloader(BaseOffloader):
                     f"cots: {qualified_name} MLP has skip_bias_add=True; not supported."
                 )
 
+            # Installer refactor: shared offloader runner (see
+            # _install_qkv_ops above for rationale).
+            assert self._runner is not None, (
+                "_install_mlp_ops called with f_cpu_store=0 — runner not constructed"
+            )
             mlp_op = CotsSwiGLUMLPOp(
                 gate_up_layer=gu,
                 down_layer=dp,
                 gate_up_handle=gu_h,
                 down_handle=dp_h,
                 act_fn=af,
-                runner=CpuTaskRunner(dry_run=self.dry_run),
+                runner=self._runner,
                 offloader=self,
                 qualified_name=qualified_name,
             )

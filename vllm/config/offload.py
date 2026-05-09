@@ -127,7 +127,24 @@ class CotsOffloadConfig:
     naive scalar path that is 100x slower."""
 
     cpu_num_threads: int = Field(default=16, ge=1)
-    """PyTorch CPU intra-op thread count. See `phase1a_findings.md §1.13b`."""
+    """PyTorch CPU intra-op thread count. Scalar fallback when
+    `cpu_num_threads_by_bucket` is unset (Phase 1c will add per-bucket
+    policy at Stage 4). See `phase1a_findings.md §1.13b`."""
+
+    cpu_runner: Literal["native", "python"] = "python"
+    """Phase 1c kill-switch. "native" routes CPU work through
+    `cudaLaunchHostFunc` + a C++ `TaskQueue` worker (the production
+    Phase 1c substrate; supports CUDA Graph capture once
+    `enforce_eager=False`). "python" keeps the Phase 1a/1b
+    `ThreadPoolExecutor` substrate for A/B diagnostics — that path is
+    NOT graph-capturable, so `cpu_runner="python"` requires
+    `enforce_eager=True` and will be rejected at engine launch
+    otherwise. The default flips to "native" at Phase 1c Stage 5
+    once graph capture is verified end-to-end; until then it stays
+    "python" so existing Phase 1a/1b workflows are unchanged. Slated
+    for deprecation one quarter post-Phase-1c. See
+    `David/Docs/implementation_roadmap.md` Phase 1c and the approved
+    plan at /root/.claude/plans/pleaes-implement-phase1c-in-quizzical-mist.md."""
 
     dry_run: bool = Field(default=False)
     """Diagnostic: install all wrappers but skip the CPU GEMM in the worker.
