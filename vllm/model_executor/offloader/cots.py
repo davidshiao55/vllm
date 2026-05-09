@@ -1525,6 +1525,28 @@ class NativeCotsRunner:
     `cots_ops._COTS_RUNNERS` weak registry under a unique runner_id so
     two offloaders (FastTTS gen + ver) coexist with independent slab
     pools. `close()` drains the worker then unregisters.
+
+    §1c.21 — TWO ROW COUNTS. After the live-token plumb-through fix,
+    COTS distinguishes between:
+
+      * `slab.num_tokens` — the **graph bucket capacity** (e.g., 256
+        for a captured `BatchExecutionDescriptor` at bucket=256).
+        Frozen at capture time; sizes the captured cudaMemcpyAsync
+        byte count, the slab's pinned x/y buffers, and the worker's
+        upper-bound bound check.
+      * `runtime_num_tokens` — the **live rows to compute**, set OUT
+        OF GRAPH by `gpu_model_runner.execute_model` from
+        `scheduler_output.total_num_scheduled_tokens` BEFORE every
+        forward. Always `runtime_num_tokens <= slab.num_tokens`. The
+        worker's `at::linear` shapes, scratch slicing, and y_pinned
+        write region all key off this.
+
+    For B=1 decode under FULL capture: bucket might be 256 but
+    runtime is 1. The worker computes 1 row of GEMM even though the
+    captured graph fired at the bucket size. Captured D2H copies
+    bucket-sized bytes (PCIe waste tracked under
+    `worker_input_bytes_used` vs `d2h_*_bytes`); §1c.22 follow-up
+    if material.
     """
 
     kind = "native"

@@ -360,6 +360,20 @@ class CotsCpuInfer {
   std::atomic<int64_t> runtime_set_calls_{0};
   std::atomic<int64_t> runtime_last_value_{0};
   std::array<std::atomic<int64_t>, 8> worker_effective_n_hist_{};
+
+  // §1c.22 byte accounting — bucket-sized captured copies vs
+  // live-token worker reads/writes. The captured cudaMemcpyAsync
+  // (input D2H) and Triton UVA (output H2D) walk the full slab
+  // capacity, so their byte counts are tracked under d2h_*_bytes
+  // above. The "used" totals below are summed at worker fire time
+  // using the effective_n the worker actually processed
+  // (effective_n × in_dim × bf16_size for input;
+  // effective_n × cpu_out_dim × bf16_size for output). The diff
+  // (captured - used) is the wasted PCIe / UVA bandwidth at B=1
+  // decode under FULL capture; if material, motivates §1c.22's
+  // dynamic-size copy path.
+  std::atomic<int64_t> worker_input_bytes_used_{0};
+  std::atomic<int64_t> worker_output_bytes_used_{0};
 };
 
 }  // namespace cots

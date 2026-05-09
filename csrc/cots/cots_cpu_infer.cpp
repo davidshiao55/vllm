@@ -485,6 +485,22 @@ void CotsCpuInfer::RunSlabOnWorker(TaskSlab* slab) {
       worker_effective_n_hist_[hist_bin].fetch_add(1,
                                                    std::memory_order_relaxed);
     }
+    // §1c.22 byte accounting: live-token bytes the worker actually
+    // reads (input) and writes (output) per fire. Compared against
+    // d2h_*_bytes (captured input transfer at bucket size) and
+    // the captured Triton UVA grid (output transfer at bucket size,
+    // not counted at this layer) the diff is the PCIe / UVA waste
+    // from over-sized captured copies under FULL graph mode.
+    if (n > 0) {
+      worker_input_bytes_used_.fetch_add(
+          static_cast<int64_t>(n) * static_cast<int64_t>(slab->in_dim) *
+              static_cast<int64_t>(sizeof(at::BFloat16)),
+          std::memory_order_relaxed);
+      worker_output_bytes_used_.fetch_add(
+          static_cast<int64_t>(n) * static_cast<int64_t>(slab->cpu_out_dim) *
+              static_cast<int64_t>(sizeof(at::BFloat16)),
+          std::memory_order_relaxed);
+    }
 
     switch (slab->op_kind) {
       case TaskSlab::kDryrunNoop: {
@@ -606,6 +622,8 @@ std::vector<std::pair<std::string, int64_t>> CotsCpuInfer::get_counters()
     out.emplace_back(std::string("worker_eff_n_") + kBinNames[i],
                      load(worker_effective_n_hist_[i]));
   }
+  out.emplace_back("worker_input_bytes_used", load(worker_input_bytes_used_));
+  out.emplace_back("worker_output_bytes_used", load(worker_output_bytes_used_));
   return out;
 }
 
@@ -627,6 +645,8 @@ void CotsCpuInfer::reset_counters() {
   for (int i = 0; i < 8; ++i) {
     worker_effective_n_hist_[i].store(0, std::memory_order_relaxed);
   }
+  worker_input_bytes_used_.store(0, std::memory_order_relaxed);
+  worker_output_bytes_used_.store(0, std::memory_order_relaxed);
 }
 
 }  // namespace cots
