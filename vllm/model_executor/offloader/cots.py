@@ -2282,7 +2282,17 @@ class CotsOffloader(BaseOffloader):
         # offload — `--cots-f-cpu-store=0` should be a clean control with
         # no side effects on CPU thread behavior. See `phase1a_findings.md
         # §1.14`'s dryrun-vs-none baseline.
-        if self.f_cpu_store > 0.0:
+        #
+        # §1c.21 review fix: gate this to PythonCotsRunner. The native
+        # runner's thread policy lives inside the C++ worker via the
+        # per-slab `n_threads` field (§1c.8) — applying a global
+        # `torch.set_num_threads` for the native path leaks oneDNN /
+        # main-thread settings into Inductor's compiled forward and was
+        # implicated as a possible contributor to the native+capture orch
+        # regression. Python runner still uses the global because its
+        # callbacks run on `at::linear` from `_get_executor()`'s thread
+        # pool, which inherits `set_num_threads` semantics.
+        if self.f_cpu_store > 0.0 and config.cpu_runner == "python":
             torch.set_num_threads(int(config.cpu_num_threads))
 
         # Populated in wrap_modules. _handles is the master list of all
