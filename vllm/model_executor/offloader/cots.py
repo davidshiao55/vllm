@@ -1124,15 +1124,162 @@ class WeightPrefetchStreamer:
 # Strict sequential layer execution invariant means at most one task is
 # in flight at any moment.
 # ---------------------------------------------------------------------------
+# Type of the per-task callback registered by the offloader at install
+# time on PythonCotsRunner. Closes over the per-(layer, bucket, op_kind)
+# weight views so the operator-side call only carries x_pinned/y_pinned
+# views, not weight references — gives both runners the same operator
+# facade (`submit_with_d2h(x, x_pinned, y_pinned, op_descriptor)`).
+PyCotsCallback = Callable[[torch.cuda.Event, torch.Tensor, torch.Tensor], None]
+
+
+class NativeSlabSpec:
+    """Builder record for one C++ TaskSlab. The offloader builds a list
+    of these at `post_init` (one per (layer_idx, bucket, op_kind) with
+    n_cpu_compute > 0); `NativeCotsRunner.install` walks the list and
+    calls the right `populate_slab_*` per record.
+
+    All weight pointers passed to populate_slab_* must be POST-narrow
+    `data_ptr()`s — `at::from_blob` has no storage-offset parameter, so
+    the offset must be baked into the pointer. The strided variant
+    (down-proj column slice) additionally carries `(stride_row,
+    stride_col)` from the source tensor's `.stride()`.
+
+    `dry_run=True` overrides the op_kind to dryrun_noop on every slab so
+    the host-callback round-trip is exercised end-to-end without real
+    CPU GEMM (used by the Stage 2 substrate gate, mirrors
+    PythonCotsRunner's dry_run path).
+    """
+
+    op_descriptor: tuple[int, int, str]
+
+    def __init__(self, op_descriptor: tuple[int, int, str]) -> None:
+        self.op_descriptor = op_descriptor
+
+    def populate(
+        self,
+        infer: object,
+        task_id: int,
+        *,
+        dry_run: bool,
+    ) -> None:
+        raise NotImplementedError
+
+
+class _NativeSlabSpecQkv(NativeSlabSpec):
+    def __init__(
+        self,
+        op_descriptor: tuple[int, int, str],
+        *,
+        n_threads: int,
+        x_pinned_ptr: int,
+        in_dim: int,
+        y_pinned_ptr: int,
+        cpu_out_dim: int,
+        w_cpu_ptr: int,
+        w_cpu_rows: int,
+    ) -> None:
+        super().__init__(op_descriptor)
+        self.n_threads = n_threads
+        self.x_pinned_ptr = x_pinned_ptr
+        self.in_dim = in_dim
+        self.y_pinned_ptr = y_pinned_ptr
+        self.cpu_out_dim = cpu_out_dim
+        self.w_cpu_ptr = w_cpu_ptr
+        self.w_cpu_rows = w_cpu_rows
+
+    def populate(self, infer: object, task_id: int, *, dry_run: bool) -> None:
+        if dry_run:
+            infer.populate_slab_dryrun(task_id=task_id)  # type: ignore[attr-defined]
+            return
+        infer.populate_slab_qkv(  # type: ignore[attr-defined]
+            task_id=task_id,
+            n_threads=self.n_threads,
+            x_pinned_ptr=self.x_pinned_ptr,
+            in_dim=self.in_dim,
+            y_pinned_ptr=self.y_pinned_ptr,
+            cpu_out_dim=self.cpu_out_dim,
+            w_cpu_ptr=self.w_cpu_ptr,
+            w_cpu_rows=self.w_cpu_rows,
+        )
+
+
+class _NativeSlabSpecMlp(NativeSlabSpec):
+    def __init__(
+        self,
+        op_descriptor: tuple[int, int, str],
+        *,
+        n_threads: int,
+        x_pinned_ptr: int,
+        in_dim: int,
+        y_pinned_ptr: int,
+        cpu_out_dim: int,
+        w_gate_ptr: int,
+        w_gate_rows: int,
+        w_up_ptr: int,
+        w_up_rows: int,
+        w_down_ptr: int,
+        w_down_rows: int,
+        w_down_cols: int,
+        w_down_stride_row: int,
+        w_down_stride_col: int,
+        intermediate_per_half: int,
+    ) -> None:
+        super().__init__(op_descriptor)
+        self.n_threads = n_threads
+        self.x_pinned_ptr = x_pinned_ptr
+        self.in_dim = in_dim
+        self.y_pinned_ptr = y_pinned_ptr
+        self.cpu_out_dim = cpu_out_dim
+        self.w_gate_ptr = w_gate_ptr
+        self.w_gate_rows = w_gate_rows
+        self.w_up_ptr = w_up_ptr
+        self.w_up_rows = w_up_rows
+        self.w_down_ptr = w_down_ptr
+        self.w_down_rows = w_down_rows
+        self.w_down_cols = w_down_cols
+        self.w_down_stride_row = w_down_stride_row
+        self.w_down_stride_col = w_down_stride_col
+        self.intermediate_per_half = intermediate_per_half
+
+    def populate(self, infer: object, task_id: int, *, dry_run: bool) -> None:
+        if dry_run:
+            infer.populate_slab_dryrun(task_id=task_id)  # type: ignore[attr-defined]
+            return
+        infer.populate_slab_mlp(  # type: ignore[attr-defined]
+            task_id=task_id,
+            n_threads=self.n_threads,
+            x_pinned_ptr=self.x_pinned_ptr,
+            in_dim=self.in_dim,
+            y_pinned_ptr=self.y_pinned_ptr,
+            cpu_out_dim=self.cpu_out_dim,
+            w_gate_ptr=self.w_gate_ptr,
+            w_gate_rows=self.w_gate_rows,
+            w_up_ptr=self.w_up_ptr,
+            w_up_rows=self.w_up_rows,
+            w_down_ptr=self.w_down_ptr,
+            w_down_rows=self.w_down_rows,
+            w_down_cols=self.w_down_cols,
+            w_down_stride_row=self.w_down_stride_row,
+            w_down_stride_col=self.w_down_stride_col,
+            intermediate_per_half=self.intermediate_per_half,
+        )
+
+
 class PythonCotsRunner:
     """Phase 1a/1b-shaped CPU task runner — the kill-switch path under
-    `CotsOffloadConfig.cpu_runner = "python"`. Body identical to the
-    original `CpuTaskRunner`; only the class is renamed for the Phase 1c
-    naming convention.
+    `CotsOffloadConfig.cpu_runner = "python"`. Same execution semantics
+    as the original `CpuTaskRunner` (single-worker `ThreadPoolExecutor`
+    + `future.result()`), but the operator-facing API is now the Phase
+    1c uniform facade so operators can use `submit_with_d2h(x, x_pinned,
+    y_pinned, op_descriptor)` without branching on runner type.
+
+    The per-(layer, bucket, op_kind) weight views are bound at install
+    time into closures stored in `_callbacks`; the operator just hands
+    over an op_descriptor and the runner looks up the right closure.
 
     Eager-only: `ThreadPoolExecutor.submit` is not graph-capturable, so
     selecting this runner with `enforce_eager=False` is a hard error
-    (Stage 5 enforces; Stage 2 just plumbs the flag).
+    (Stage 5 enforces).
     """
 
     kind = "python"
@@ -1140,32 +1287,91 @@ class PythonCotsRunner:
     def __init__(self, dry_run: bool = False) -> None:
         self._future: Future | None = None
         self._dry_run = dry_run
+        self._callbacks: dict[tuple[int, int, str], PyCotsCallback] = {}
+        self._bucket_for_fallback: Callable[[int], int] | None = None
+        self._installed = False
+
+    def install(
+        self,
+        callbacks: dict[tuple[int, int, str], PyCotsCallback],
+        bucket_for_fallback: Callable[[int], int] | None = None,
+    ) -> None:
+        """Register the per-(layer, bucket, op_kind) work closures.
+
+        The offloader builds these at `post_init` from the dispatch table
+        + handle weight views; one closure per slab-equivalent. Under
+        `dry_run=True` the offloader installs noop closures (only the
+        D2H event sync runs, no real CPU GEMM) — the runner's
+        submit/wait shape is identical either way so timing-sensitive
+        diagnostics can A/B by toggling `dry_run`.
+        """
+        if self._installed:
+            raise RuntimeError(
+                "PythonCotsRunner.install() called twice on the same instance"
+            )
+        self._callbacks = dict(callbacks)
+        self._bucket_for_fallback = bucket_for_fallback
+        self._installed = True
 
     def submit_with_d2h(
         self,
         x_gpu: torch.Tensor,
-        x_pinned_view: torch.Tensor,
-        fn: Callable,
-        *args,
+        x_pinned: torch.Tensor,
+        y_pinned: torch.Tensor,
+        op_descriptor: tuple[int, int | None, str],
     ) -> None:
-        """Async D2H of `x_gpu` → `x_pinned_view`, record event, submit
-        `fn(event, x_pinned_view, *args)` to the worker.
-
-        The worker function MUST call `event.synchronize()` before reading
-        `x_pinned_view` (otherwise the GEMM races the H2D copy).
+        """Phase 1c uniform facade. D2H copies `x_gpu` into `x_pinned`,
+        records an event ordering the H2D, and submits the work closure
+        that fills `y_pinned`. Both runners share this signature so
+        operators don't branch on runner type.
         """
-        x_pinned_view.copy_(x_gpu, non_blocking=True)
+        # Lazy bucket-fallback (plan §design-decision 11): if the
+        # operator hasn't seen `prepare_before_forward` set the active
+        # bucket yet (e.g., a code path that bypassed the pre-hook), we
+        # rebuild the descriptor from `_bucket_for(num_tokens)` here so
+        # the slab/closure lookup never sees `bucket=None`. Bind a
+        # fresh-typed local so mypy can narrow `int | None` -> `int`
+        # for the dict lookup.
+        layer_idx, raw_bucket, op_kind = op_descriptor
+        if raw_bucket is None:
+            assert self._bucket_for_fallback is not None, (
+                "PythonCotsRunner: op_descriptor bucket is None and "
+                "bucket_for_fallback was not registered at install"
+            )
+            raw_bucket = self._bucket_for_fallback(int(x_gpu.shape[0]))
+        resolved: tuple[int, int, str] = (layer_idx, raw_bucket, op_kind)
+        x_pinned.copy_(x_gpu, non_blocking=True)
         event = torch.cuda.Event()
         event.record()
         if self._dry_run:
-            fn = _cpu_dryrun_noop
-        self._future = _get_executor().submit(fn, event, x_pinned_view, *args)
+            cb: PyCotsCallback = _cpu_dryrun_noop
+        else:
+            cb = self._callbacks[resolved]
+        self._future = _get_executor().submit(cb, event, x_pinned, y_pinned)
 
-    def wait(self) -> None:
-        """Block until the submitted task completes; re-raises worker errors."""
+    def wait_and_uva(
+        self,
+        y_pinned: torch.Tensor,
+        y_gpu: torch.Tensor,
+        gpu_anchor_a: torch.Tensor,
+        gpu_anchor_b: torch.Tensor,
+    ) -> None:
+        """Drain the worker and copy the pinned result into the GPU
+        buffer via the SM-issued UVA kernel. `gpu_anchor_a` and
+        `gpu_anchor_b` are accepted for API symmetry with NativeCotsRunner
+        — they're the barrier-installing anchors that pin the
+        `cots_sync_then_uva` custom op AFTER each independent GPU GEMM
+        under graph capture. Under PythonCotsRunner we're eager-only
+        (no graph capture), so the anchors are unused; but accepting
+        them lets operators call both runners with one signature.
+        """
+        del gpu_anchor_a, gpu_anchor_b
         assert self._future is not None, "submit_with_d2h() not called"
-        self._future.result()
-        self._future = None
+        try:
+            self._future.result()  # re-raises worker exceptions
+        finally:
+            self._future = None
+        uva_copy_into_gpu(y_pinned, y_gpu)
 
     def close(self) -> None:
         """Drain any pending task. Idempotent; safe to call from teardown."""
@@ -1184,20 +1390,18 @@ class NativeCotsRunner:
     `vllm._cots_C` extension; dispatches CPU work through
     `cudaLaunchHostFunc` so the forward pass is graph-capturable.
 
-    Stage 2 (this stage) ships the runner class definition and registry
-    plumbing only; the legacy `submit_with_d2h(fn, *args)` API is NOT
-    implemented because operators still call the old PythonCotsRunner
-    shape until Stage 3 flips them to the uniform facade
-    `submit_with_d2h(x, x_pinned, y_pinned, op_descriptor)` +
-    `wait_and_uva(y_pinned, y_gpu, gpu_anchor_a, gpu_anchor_b)`. Until
-    Stage 3 lands, `CotsOffloader.__init__` will reject
-    `cpu_runner="native"` so users see a clean error rather than a
-    confusing failure during the first forward.
+    Operator-facing API mirrors PythonCotsRunner: `submit_with_d2h(x,
+    x_pinned, y_pinned, op_descriptor)` + `wait_and_uva(y_pinned, y_gpu,
+    gpu_anchor_a, gpu_anchor_b)`. The runner translates op_descriptors
+    to slab task_ids and routes the host callback through the
+    `vllm.cots_submit_gemm` / `vllm.cots_sync_then_uva` custom ops so
+    torch.compile and CUDA Graph capture honor the barrier-installing
+    `mutates_args` declarations on `x_gpu` and `gpu_anchor_a/_b`.
 
     Multi-engine safety: each instance registers itself in the
     `cots_ops._COTS_RUNNERS` weak registry under a unique runner_id so
     two offloaders (FastTTS gen + ver) coexist with independent slab
-    pools. `close()` explicitly drains the worker, then unregisters.
+    pools. `close()` drains the worker then unregisters.
     """
 
     kind = "native"
@@ -1228,53 +1432,97 @@ class NativeCotsRunner:
         self._task_id_for: dict[tuple[int, int, str], int] = {}
         self._installed: bool = False
 
-    # Stage 2 placeholder methods that satisfy the operator-side typed
-    # union `PythonCotsRunner | NativeCotsRunner` without falsely
-    # claiming Stage 3 functionality. Operators currently call
-    # `submit_with_d2h(fn, *args)` and `wait()` (Phase 1a/1b legacy
-    # shape); routing them through NativeCotsRunner is a Stage 3 task
-    # that flips the entire surface to the uniform
-    # `submit_with_d2h(x, x_pin, y_pin, op_descriptor)` +
-    # `wait_and_uva(...)` API. The Stage 2 native rejection in
-    # CotsOffloader.__init__ ensures these methods are NEVER reached at
-    # runtime. They exist only so mypy sees a consistent interface
-    # across the runner union.
-    def submit_with_d2h(self, *args: object, **kwargs: object) -> None:
-        raise NotImplementedError(
-            "NativeCotsRunner.submit_with_d2h is reserved for Phase 1c "
-            "Stage 3, which flips operators to the uniform facade. "
-            "Stage 2 rejects cpu_runner='native' at offloader "
-            "construction so this should be unreachable. If you see "
-            "this at runtime, the Stage 2 guard at "
-            "CotsOffloader.__init__ has regressed."
-        )
-
-    def wait(self, *args: object, **kwargs: object) -> None:
-        raise NotImplementedError(
-            "NativeCotsRunner.wait is reserved for Phase 1c Stage 3."
-        )
-
     def install(
         self,
-        n_slabs: int,
+        slab_specs: list[NativeSlabSpec],
         scratch_max_tokens: int,
         scratch_max_intermediate_per_half: int,
+        bucket_for_fallback: Callable[[int], int] | None = None,
     ) -> None:
-        """Allocate the C++ slab pool. Called once at offloader install
-        time after the slab count + worst-case scratch sizes are known.
-        Subsequent `populate_slab_*` calls fill in static fields per slab.
-        Idempotent guard: re-install attempts raise.
+        """Allocate the C++ slab pool, populate slabs, and build the
+        op_descriptor -> task_id map. Called once at offloader
+        `post_init` after the dispatch table + handle weight views are
+        known.
+
+        `slab_specs` is a list (ordering = task_id) of NativeSlabSpec
+        records — one per (layer_idx, bucket, op_kind) where there is
+        actual CPU work (n_cpu_compute > 0). Under `dry_run=True` the
+        offloader passes specs with op_kind='dryrun_noop' so the
+        runtime path exercises the full host-callback round-trip but
+        skips real GEMM (mirrors Phase 1a/1b's PythonCotsRunner dry_run
+        diagnostic, see phase1a_findings.md §1.14).
         """
         if self._installed:
             raise RuntimeError(
                 "NativeCotsRunner.install() called twice on the same instance"
             )
+        n_slabs = len(slab_specs)
         self._infer.install(
             n_slabs=int(n_slabs),
             scratch_max_tokens=int(scratch_max_tokens),
             scratch_max_intermediate_per_half=int(scratch_max_intermediate_per_half),
         )
+        for tid, spec in enumerate(slab_specs):
+            self._task_id_for[spec.op_descriptor] = tid
+            spec.populate(self._infer, tid, dry_run=self._dry_run)
+        self._bucket_for_fallback = bucket_for_fallback
         self._installed = True
+
+    def submit_with_d2h(
+        self,
+        x_gpu: torch.Tensor,
+        x_pinned: torch.Tensor,
+        y_pinned: torch.Tensor,
+        op_descriptor: tuple[int, int | None, str],
+    ) -> None:
+        """Phase 1c uniform facade. Issues a non-blocking D2H of x_gpu
+        into x_pinned on the current CUDA stream, then routes through
+        `torch.ops.vllm.cots_submit_gemm` so torch.compile/CUDA graph
+        capture sees the barrier-installing `mutates_args=["x_gpu",
+        "y_pinned"]` and pins this op BEFORE every GPU GEMM that reads
+        x_gpu (preserves the overlap window). The custom op's impl
+        looks up the per-runner pybind handle by runner_id and invokes
+        `submit_on_stream(task_id, num_tokens, stream)` on it.
+        """
+        # Lazy bucket-fallback (plan §design-decision 11): same shape
+        # as PythonCotsRunner. Bind a fresh-typed local so mypy
+        # narrows `int | None` -> `int` for the dict lookup.
+        layer_idx, raw_bucket, op_kind = op_descriptor
+        if raw_bucket is None:
+            assert self._bucket_for_fallback is not None, (
+                "NativeCotsRunner: op_descriptor bucket is None and "
+                "bucket_for_fallback was not registered at install"
+            )
+            raw_bucket = self._bucket_for_fallback(int(x_gpu.shape[0]))
+        resolved: tuple[int, int, str] = (layer_idx, raw_bucket, op_kind)
+        task_id = self._task_id_for[resolved]
+        num_tokens = int(x_gpu.shape[0])
+        # D2H first; the cots_submit_gemm op's `mutates_args=["x_gpu",
+        # "y_pinned"]` keeps the cudaLaunchHostFunc enqueue ordered
+        # AFTER the copy_, before the GPU GEMMs that read x_gpu.
+        x_pinned.copy_(x_gpu, non_blocking=True)
+        torch.ops.vllm.cots_submit_gemm(
+            x_gpu, x_pinned, y_pinned, self._runner_id, task_id, num_tokens
+        )
+
+    def wait_and_uva(
+        self,
+        y_pinned: torch.Tensor,
+        y_gpu: torch.Tensor,
+        gpu_anchor_a: torch.Tensor,
+        gpu_anchor_b: torch.Tensor,
+    ) -> None:
+        """Routes through `torch.ops.vllm.cots_sync_then_uva` so the
+        cudaLaunchHostFunc-based stream sync + the Triton UVA copy
+        bundle into one graph-recorded entry. The two-anchor schema
+        keeps sync ordered AFTER each independent GPU GEMM
+        (`gpu_anchor_a` = out_perm or dummy_a, `gpu_anchor_b` = out_pref
+        or dummy_b — operators pass two distinct CUDA tensors, never
+        aliased).
+        """
+        torch.ops.vllm.cots_sync_then_uva(
+            y_pinned, y_gpu, gpu_anchor_a, gpu_anchor_b, self._runner_id
+        )
 
     def close(self) -> None:
         """Drain any in-flight worker task and drop the registry entry.
@@ -1292,17 +1540,21 @@ class NativeCotsRunner:
         # FORWARD RISK (review finding #3, Stage 2 sign-off): this path
         # only unregisters; it does NOT drain the CUDA stream of any
         # in-flight `cudaLaunchHostFunc` callbacks scheduled via
-        # `submit_on_stream` / `sync_on_stream`. Once Stage 3 wires
-        # operators end-to-end, an offloader teardown mid-forward could
-        # leave host callbacks pointing at a freed slab. Stage 3 must
-        # either (a) add a BaseOffloader-level shutdown hook that drains
-        # the compute stream and closes the runner before slabs are
-        # freed, OR (b) make this `__del__` best-effort
-        # `torch.cuda.current_stream().synchronize()` first (which is
-        # also dangerous to do from a finalizer if CUDA is already
-        # torn down). Tracked explicitly so it is not forgotten.
-        with contextlib.suppress(Exception):
+        # `submit_on_stream` / `sync_on_stream`. Stage 3 wires operators
+        # end-to-end, so an offloader teardown mid-forward could leave
+        # host callbacks pointing at a freed slab. Stage 4 or 5 should
+        # add either a BaseOffloader-level shutdown hook that drains the
+        # compute stream and closes the runner before slabs are freed,
+        # OR a best-effort `torch.cuda.current_stream().synchronize()`
+        # here (also dangerous from a finalizer if CUDA is torn down).
+        #
+        # `try/except: pass` rather than `contextlib.suppress` because at
+        # interpreter shutdown `contextlib` itself can be None;
+        # try/except is the only finalizer-safe form.
+        try:  # noqa: SIM105
             self._cots_ops._unregister_runner(self._runner_id)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _make_runner(config: CotsOffloadConfig) -> PythonCotsRunner | NativeCotsRunner:
@@ -1428,19 +1680,27 @@ class CotsQKVOp:
         h = self._handle
         assert h.w_cpu is not None
         num_tokens = x.shape[0]
-        # Active-bucket dispatch: compute shape is decided by the bucket
-        # of the CURRENT forward (capture-time constant under Phase 1c
-        # graph capture), not by whatever was last filled into the slot.
-        # Slot state (owner + available_rows) is asserted as a runtime
-        # invariant, not used as a runtime lookup.
-        streamer = offloader._streamer
-        b = streamer.current_bucket if streamer is not None else None
-        if b is None or h.max_n_prefetch == 0:
+        # Phase 1c Stage 3: bucket lives on the offloader (set
+        # unconditionally by `prepare_before_forward`), NOT on the
+        # streamer. The operator must resolve `b` BEFORE reading
+        # per-bucket dicts so that y_pinned's shape (sized to
+        # `n_cpu_compute_by_bucket[b]`) agrees with the runner's install
+        # closure / slab (also keyed on `b`). If prefetch is inactive
+        # (`max_n_prefetch == 0`) every bucket has n_pref=0 and
+        # n_cpu_compute=h.n_cpu, so we can use h.n_cpu directly. If
+        # prefetch IS active but the pre-hook hasn't set _current_bucket
+        # yet (e.g., test that bypasses the hook), fall back to
+        # `_bucket_for(num_tokens)` here. The runner's lazy descriptor
+        # rebuild is still a defense-in-depth backup.
+        b = offloader._current_bucket
+        if h.max_n_prefetch == 0:
             n_pref = 0
             n_cpu = h.n_cpu
             cpu_idx = h.cpu_indices_cuda
             pref_idx = cpu_idx  # unused when n_pref == 0
         else:
+            if b is None:
+                b = offloader._bucket_for(num_tokens)
             n_pref = h.n_prefetch_by_bucket[b]
             n_cpu = h.n_cpu_compute_by_bucket[b]
             pref_idx = h.prefetch_indices_cuda_by_bucket[b]
@@ -1456,6 +1716,7 @@ class CotsQKVOp:
                 )
 
         # CPU compute path skipped when n_cpu_compute == 0 (pure-prefetch).
+        y_out: torch.Tensor | None = None
         y_dst: torch.Tensor | None = None
         if n_cpu > 0:
             x_in = offloader._x_pinned[: num_tokens * h.in_dim].view(
@@ -1463,10 +1724,13 @@ class CotsQKVOp:
             )
             y_out = offloader._y_pinned[: num_tokens * n_cpu].view(num_tokens, n_cpu)
             y_dst = offloader._y_gpu[: num_tokens * n_cpu].view(num_tokens, n_cpu)
-            w_cpu_compute = h.w_cpu.narrow(0, n_pref, n_cpu)
-            self._runner.submit_with_d2h(
-                x, x_in, _cpu_gemm_into_after_event, w_cpu_compute, y_out
-            )
+            # Phase 1c Stage 3 uniform facade: no callback / weight
+            # passed inline — the runner has those captured at install
+            # time per (layer_idx, bucket, op_kind). `b` may be None
+            # here (no streamer + pre-hook hasn't fired yet); the
+            # runner's lazy fallback resolves it before the slab/closure
+            # lookup.
+            self._runner.submit_with_d2h(x, x_in, y_out, (h.layer_idx, b, "qkv"))
 
         # GPU permanent slice. Skipped at f_cpu_store=1.0: F.linear on
         # weight (0, in_dim) returns (B, 0) which crashes downstream
@@ -1484,9 +1748,18 @@ class CotsQKVOp:
             out_pref = F.linear(x, slot_view, None)
 
         if n_cpu > 0:
-            self._runner.wait()
-            assert y_dst is not None
-            uva_copy_into_gpu(y_out, y_dst)
+            assert y_out is not None and y_dst is not None
+            assert offloader._dummy_gpu_anchor_a is not None
+            assert offloader._dummy_gpu_anchor_b is not None
+            # Two-anchor schema (plan §design-decision 6): pin sync_then_uva
+            # AFTER each independent GPU GEMM. out_perm and out_pref come
+            # from independent F.linear calls; mutating only one would let
+            # torch.compile reorder the other across sync. Distinct dummy
+            # CUDA anchors fill in when a GPU GEMM didn't run for this slab
+            # — never aliased.
+            gpu_a = out_perm if out_perm is not None else offloader._dummy_gpu_anchor_a
+            gpu_b = out_pref if out_pref is not None else offloader._dummy_gpu_anchor_b
+            self._runner.wait_and_uva(y_out, y_dst, gpu_a, gpu_b)
 
         out = _scatter_col_outputs_three_way(
             out_perm, out_pref, y_dst, pref_idx, cpu_idx, h, num_tokens
@@ -1550,12 +1823,12 @@ class CotsSwiGLUMLPOp:
         assert gu_h.w_cpu is not None
         assert dn_h.w_cpu is not None
         num_tokens = x.shape[0]
-        # Active-bucket dispatch (see CotsQKVOp.apply for rationale).
-        # Compute shape from the active bucket; slot state is asserted
-        # as a runtime invariant. gu and dn share the active bucket by
-        # construction, so no inter-handle bucket-equality check needed.
-        streamer = offloader._streamer
-        b = streamer.current_bucket if streamer is not None else None
+        # Phase 1c Stage 3: bucket from offloader, not streamer (see
+        # CotsQKVOp.apply for the resolution rationale). gu and dn
+        # share the active bucket by construction.
+        b = offloader._current_bucket
+        if gu_h.max_n_prefetch > 0 and b is None:
+            b = offloader._bucket_for(num_tokens)
         if b is None or gu_h.max_n_prefetch == 0:
             gu_n_pref = 0
             dn_n_pref = 0
@@ -1588,12 +1861,12 @@ class CotsSwiGLUMLPOp:
                     f"need {dn_n_pref}"
                 )
 
-        n_pref_per_half = gu_n_pref // 2
-        n_cpu_per_half_total = self._n_cpu_per_half  # original count per half
-
         # CPU compute path — skipped entirely when n_cpu_compute == 0
         # (pure-prefetch case). Without this fast-path the runner / D2H /
-        # UVA overhead leaks into the prefetch-only regime.
+        # UVA overhead leaks into the prefetch-only regime. Phase 1c
+        # Stage 3: weight slicing (n_pref_per_half / n_cpu_per_half_total)
+        # is now done at install time inside the runner; the operator
+        # only sees the descriptor (gu_h.layer_idx, b, "mlp_block").
         y2_pinned: torch.Tensor | None = None
         y2_gpu: torch.Tensor | None = None
         if dn_n_cpu > 0:
@@ -1606,22 +1879,11 @@ class CotsSwiGLUMLPOp:
             y2_gpu = offloader._y_gpu[: num_tokens * self._out_dim].view(
                 num_tokens, self._out_dim
             )
-            # CPU compute slices: gate / up exclude the first `n_pref_per_half`
-            # rows of each half (those are prefetched). MLP2's input cols
-            # exclude the first `dn_n_pref` cols.
-            w_gate_compute = gu_h.w_cpu[n_pref_per_half:n_cpu_per_half_total, :]
-            w_up_compute = gu_h.w_cpu[
-                n_cpu_per_half_total + n_pref_per_half : 2 * n_cpu_per_half_total, :
-            ]
-            w_dn_compute = dn_h.w_cpu.narrow(1, dn_n_pref, dn_n_cpu)
+            # Phase 1c Stage 3: weight slices captured at install-time
+            # in the runner's closure / slab. Operator just hands over
+            # the descriptor + x/y views.
             self._runner.submit_with_d2h(
-                x,
-                x_pinned,
-                _cpu_mlp_block_work,
-                w_gate_compute,
-                w_up_compute,
-                w_dn_compute,
-                y2_pinned,
+                x, x_pinned, y2_pinned, (gu_h.layer_idx, b, "mlp_block")
             )
 
         # GPU permanent MLP block. Skipped at f_cpu_store=1.0: gate_up's
@@ -1660,9 +1922,20 @@ class CotsSwiGLUMLPOp:
             out_gpu = pref_out if out_gpu is None else out_gpu.add_(pref_out)
 
         if dn_n_cpu > 0:
-            self._runner.wait()
             assert y2_pinned is not None and y2_gpu is not None
-            uva_copy_into_gpu(y2_pinned, y2_gpu)
+            assert offloader._dummy_gpu_anchor_a is not None
+            assert offloader._dummy_gpu_anchor_b is not None
+            # MLP block: out_gpu carries a combined dep on both perm and
+            # pref GEMMs (via `out_gpu.add_(pref_out)` above), so
+            # gpu_anchor_a alone covers the GPU work; gpu_anchor_b is
+            # always the dummy. In the degenerate f_cpu_store=1.0 case
+            # (no GPU work at all), anchor_a falls back to the dummy too
+            # — there's nothing to order after sync except the
+            # downstream consumer of the returned tensor, which the
+            # `y_gpu` mutate already covers.
+            gpu_a = out_gpu if out_gpu is not None else offloader._dummy_gpu_anchor_a
+            gpu_b = offloader._dummy_gpu_anchor_b
+            self._runner.wait_and_uva(y2_pinned, y2_gpu, gpu_a, gpu_b)
             # When CPU is the sole contributor, clone — y2_gpu is a shared
             # activation buffer and would be clobbered by the next layer.
             out_gpu = y2_gpu.clone() if out_gpu is None else out_gpu.add_(y2_gpu)
@@ -1809,31 +2082,30 @@ class CotsOffloader(BaseOffloader):
         # above. Only constructed when COTS is actually offloading
         # (`f_cpu_store > 0`); the no-offload path leaves it None to
         # avoid spinning up a worker thread for a no-op session.
+        # Stage 3 dropped the Stage-2 native rejection — operators now
+        # flip to the uniform facade and either runner runs end-to-end.
         self._runner: PythonCotsRunner | NativeCotsRunner | None = None
         if self.f_cpu_store > 0.0:
-            # Stage 2 guard, BEFORE _make_runner so we don't construct
-            # (and register, and spawn a C++ worker for) a NativeCotsRunner
-            # only to throw it away. Constructing first would (a) pollute
-            # the runner registry until GC, and (b) on non-CUDA builds,
-            # raise an `_cots_C` import error that masks the intended
-            # Stage-3 message. The native runner's operator-side wiring
-            # lands in Stage 3 (uniform `submit_with_d2h(x, x_pin, y_pin,
-            # op_descriptor)` + `wait_and_uva` + slab population); until
-            # then, falling through to operator code that calls the
-            # legacy `submit_with_d2h(fn, *args)` shape would just
-            # AttributeError mid-forward. Fail loudly here instead.
-            if getattr(config, "cpu_runner", "python") == "native":
-                raise NotImplementedError(
-                    "cots: cpu_runner='native' is reserved for Phase 1c "
-                    "Stage 3+ where operators flip to the uniform facade. "
-                    "Stage 2 has only stood up the substrate (cots_ops.py, "
-                    "NativeCotsRunner class, runner registry, installer "
-                    "refactor); operator call sites still expect the "
-                    "PythonCotsRunner legacy shape. Set "
-                    "cpu_runner='python' for now, OR wait for Stage 3 to "
-                    "land before switching the default."
-                )
             self._runner = _make_runner(config)
+
+        # Phase 1c: active-bucket lives on the offloader, not the
+        # streamer (plan §design-decision 11). `prepare_before_forward`
+        # always sets `_current_bucket` regardless of streamer presence
+        # so the operator slab/closure lookup never sees `bucket=None`
+        # at `f_prefetch=0`. The first-decoder pre-hook is installed
+        # unconditionally when COTS is active (see
+        # `_install_bucket_prehook`), independent of prefetch.
+        self._current_bucket: int | None = None
+        # Two distinct dummy CUDA anchors for the cots_sync_then_uva
+        # custom op's mutates_args=["y_gpu", "gpu_anchor_a",
+        # "gpu_anchor_b"]. Operators pass these when out_perm/out_pref
+        # are absent so the two anchor slots never alias (aliasing
+        # confuses torch.compile / functionalization). Allocated in
+        # `_allocate_activation_buffers` because that runs inside
+        # vLLM's DeviceMemoryProfiler accounting window
+        # (phase1a_findings.md §1.5).
+        self._dummy_gpu_anchor_a: torch.Tensor | None = None
+        self._dummy_gpu_anchor_b: torch.Tensor | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle: wrap_modules → (weight loading) → post_init.
@@ -1898,6 +2170,10 @@ class CotsOffloader(BaseOffloader):
         # f_prefetch == 0.
         if any(h.max_n_prefetch > 0 for h in self._handles):
             self._install_prefetch_machinery()
+        # Phase 1c: bucket pre-hook is independent of prefetch. Always
+        # install whenever COTS has handles so the operator slab/closure
+        # lookup has a valid `_current_bucket` even at f_prefetch=0.
+        self._install_bucket_prehook()
 
         logger.info_once(
             "CotsOffloader: wrapped %d linear modules and %d fused MLP blocks "
@@ -2158,10 +2434,210 @@ class CotsOffloader(BaseOffloader):
         for i, layer in enumerate(self._layer_modules):
             self._hook_layer_forward(i, layer)
 
-        if self._layer_modules:
-            self._layer_modules[0].register_forward_pre_hook(
-                self._first_decoder_pre_hook, with_kwargs=True
+    # --- Phase 1c Stage 3: runner install (closures / slab specs) -----
+
+    @staticmethod
+    def _make_qkv_python_callback(w_cpu: torch.Tensor) -> PyCotsCallback:
+        """Build a closure that captures the per-(layer, bucket) QKV
+        weight slice. Module-level helper so closures don't accidentally
+        capture `self` (would leak the offloader through the registry)."""
+
+        def cb(
+            event: torch.cuda.Event,
+            x_pinned: torch.Tensor,
+            y_pinned: torch.Tensor,
+        ) -> None:
+            event.synchronize()
+            y_pinned.copy_(F.linear(x_pinned, w_cpu))
+
+        return cb
+
+    @staticmethod
+    def _make_mlp_python_callback(
+        w_gate: torch.Tensor, w_up: torch.Tensor, w_down: torch.Tensor
+    ) -> PyCotsCallback:
+        """Closure for the fused MLP block (gate + up + silu*up + down).
+        Mirrors `_cpu_mlp_block_work` but with weights captured at
+        install time so the operator-side call only carries
+        x_pinned/y_pinned views."""
+
+        def cb(
+            event: torch.cuda.Event,
+            x_pinned: torch.Tensor,
+            y_pinned: torch.Tensor,
+        ) -> None:
+            event.synchronize()
+            gate_out = F.linear(x_pinned, w_gate)
+            up_out = F.linear(x_pinned, w_up)
+            z = F.silu(gate_out) * up_out
+            y_pinned.copy_(F.linear(z, w_down))
+
+        return cb
+
+    def _build_python_callbacks(
+        self,
+    ) -> dict[tuple[int, int, str], PyCotsCallback]:
+        """Build the (layer_idx, bucket, op_kind) -> closure table that
+        PythonCotsRunner consults at submit time. Skip slabs where there
+        is no CPU work (n_cpu_compute == 0).
+        """
+        callbacks: dict[tuple[int, int, str], PyCotsCallback] = {}
+        for h in self._handles:
+            if h.kind != "qkv":
+                continue
+            assert h.w_cpu is not None
+            for bucket in self._capture_buckets:
+                n_pref = h.n_prefetch_by_bucket.get(bucket, 0)
+                n_cpu = h.n_cpu_compute_by_bucket.get(bucket, h.n_cpu)
+                if n_cpu == 0:
+                    continue
+                w_view = h.w_cpu.narrow(0, n_pref, n_cpu)
+                callbacks[(h.layer_idx, bucket, "qkv")] = (
+                    self._make_qkv_python_callback(w_view)
+                )
+        for fop in self._fused_ops:
+            gu_h = fop._gate_up
+            dn_h = fop._down
+            assert gu_h.w_cpu is not None
+            assert dn_h.w_cpu is not None
+            n_cpu_per_half_total = gu_h.n_cpu // 2
+            for bucket in self._capture_buckets:
+                gu_n_pref = gu_h.n_prefetch_by_bucket.get(bucket, 0)
+                dn_n_pref = dn_h.n_prefetch_by_bucket.get(bucket, 0)
+                dn_n_cpu = dn_h.n_cpu_compute_by_bucket.get(bucket, dn_h.n_cpu)
+                if dn_n_cpu == 0:
+                    continue
+                n_pref_per_half = gu_n_pref // 2
+                w_gate_view = gu_h.w_cpu[n_pref_per_half:n_cpu_per_half_total, :]
+                w_up_view = gu_h.w_cpu[
+                    n_cpu_per_half_total + n_pref_per_half : 2 * n_cpu_per_half_total,
+                    :,
+                ]
+                w_down_view = dn_h.w_cpu.narrow(1, dn_n_pref, dn_n_cpu)
+                callbacks[(gu_h.layer_idx, bucket, "mlp_block")] = (
+                    self._make_mlp_python_callback(w_gate_view, w_up_view, w_down_view)
+                )
+        return callbacks
+
+    def _build_native_slab_specs(self) -> list[NativeSlabSpec]:
+        """Build the per-(layer, bucket, op_kind) slab specs that
+        NativeCotsRunner.install populates into the C++ slab pool. All
+        weight pointers are POST-narrow `data_ptr()`s; the down-proj
+        slabs additionally carry strides reflecting the source tensor.
+        """
+        assert self._x_pinned is not None
+        assert self._y_pinned is not None
+        n_threads = int(self.config.cpu_num_threads)
+        x_pinned_ptr = int(self._x_pinned.data_ptr())
+        y_pinned_ptr = int(self._y_pinned.data_ptr())
+        specs: list[NativeSlabSpec] = []
+        for h in self._handles:
+            if h.kind != "qkv":
+                continue
+            assert h.w_cpu is not None
+            for bucket in self._capture_buckets:
+                n_pref = h.n_prefetch_by_bucket.get(bucket, 0)
+                n_cpu = h.n_cpu_compute_by_bucket.get(bucket, h.n_cpu)
+                if n_cpu == 0:
+                    continue
+                w_view = h.w_cpu.narrow(0, n_pref, n_cpu)
+                specs.append(
+                    _NativeSlabSpecQkv(
+                        op_descriptor=(h.layer_idx, bucket, "qkv"),
+                        n_threads=n_threads,
+                        x_pinned_ptr=x_pinned_ptr,
+                        in_dim=int(h.in_dim),
+                        y_pinned_ptr=y_pinned_ptr,
+                        cpu_out_dim=int(n_cpu),
+                        w_cpu_ptr=int(w_view.data_ptr()),
+                        w_cpu_rows=int(w_view.shape[0]),
+                    )
+                )
+        for fop in self._fused_ops:
+            gu_h = fop._gate_up
+            dn_h = fop._down
+            assert gu_h.w_cpu is not None
+            assert dn_h.w_cpu is not None
+            n_cpu_per_half_total = gu_h.n_cpu // 2
+            for bucket in self._capture_buckets:
+                gu_n_pref = gu_h.n_prefetch_by_bucket.get(bucket, 0)
+                dn_n_pref = dn_h.n_prefetch_by_bucket.get(bucket, 0)
+                dn_n_cpu = dn_h.n_cpu_compute_by_bucket.get(bucket, dn_h.n_cpu)
+                if dn_n_cpu == 0:
+                    continue
+                n_pref_per_half = gu_n_pref // 2
+                inter_per_half = n_cpu_per_half_total - n_pref_per_half
+                w_gate_view = gu_h.w_cpu[n_pref_per_half:n_cpu_per_half_total, :]
+                w_up_view = gu_h.w_cpu[
+                    n_cpu_per_half_total + n_pref_per_half : 2 * n_cpu_per_half_total,
+                    :,
+                ]
+                w_down_view = dn_h.w_cpu.narrow(1, dn_n_pref, dn_n_cpu)
+                specs.append(
+                    _NativeSlabSpecMlp(
+                        op_descriptor=(gu_h.layer_idx, bucket, "mlp_block"),
+                        n_threads=n_threads,
+                        x_pinned_ptr=x_pinned_ptr,
+                        in_dim=int(fop._in_dim),
+                        y_pinned_ptr=y_pinned_ptr,
+                        cpu_out_dim=int(fop._out_dim),
+                        w_gate_ptr=int(w_gate_view.data_ptr()),
+                        w_gate_rows=int(w_gate_view.shape[0]),
+                        w_up_ptr=int(w_up_view.data_ptr()),
+                        w_up_rows=int(w_up_view.shape[0]),
+                        w_down_ptr=int(w_down_view.data_ptr()),
+                        w_down_rows=int(w_down_view.shape[0]),
+                        w_down_cols=int(w_down_view.shape[1]),
+                        w_down_stride_row=int(w_down_view.stride(0)),
+                        w_down_stride_col=int(w_down_view.stride(1)),
+                        intermediate_per_half=int(inter_per_half),
+                    )
+                )
+        return specs
+
+    def _install_runner(self) -> None:
+        """Hand the per-bucket work table to the runner. Called from
+        `post_init` after weights have loaded (closures / slab pointers
+        are stable post-install regardless of when they were taken,
+        but post_init is the natural ordering point)."""
+        if self._runner is None or not self._handles:
+            return
+        if isinstance(self._runner, PythonCotsRunner):
+            callbacks = self._build_python_callbacks()
+            self._runner.install(callbacks, bucket_for_fallback=self._bucket_for)
+        elif isinstance(self._runner, NativeCotsRunner):
+            slab_specs = self._build_native_slab_specs()
+            # Worst-case scratch: max(n_cpu_per_half) over all fused MLP
+            # blocks. The C++ worker uses one shared `scratch_silu_up_`
+            # tensor sized to (max_num_batched_tokens × max_inter_per_half)
+            # for the silu(gate)*up intermediate.
+            max_inter_per_half = 0
+            for fop in self._fused_ops:
+                n_cpu_per_half = fop._gate_up.n_cpu // 2
+                max_inter_per_half = max(max_inter_per_half, n_cpu_per_half)
+            self._runner.install(
+                slab_specs=slab_specs,
+                scratch_max_tokens=int(self._max_num_tokens),
+                scratch_max_intermediate_per_half=int(max_inter_per_half),
+                bucket_for_fallback=self._bucket_for,
             )
+
+    def _install_bucket_prehook(self) -> None:
+        """Phase 1c (Stage 3): install the first-decoder pre-hook
+        UNCONDITIONALLY whenever COTS has handles, not gated on
+        prefetch. The pre-hook calls `prepare_before_forward` which now
+        always sets `_current_bucket` (plan §design-decision 11). Under
+        `f_prefetch=0` (no streamer) this is the only path that sets
+        `_current_bucket` under eager mode — without it, the operator's
+        slab lookup would see `bucket=None`. Under graph capture
+        `cudagraph_utils.py:267` calls `prepare_before_forward` outside
+        the captured graph independently.
+        """
+        if not self._layer_modules:
+            return
+        self._layer_modules[0].register_forward_pre_hook(
+            self._first_decoder_pre_hook, with_kwargs=True
+        )
 
     def _hook_layer_forward(self, index: int, layer: nn.Module) -> None:
         """Wrap the decoder layer's `forward` with pre-compute scheduling.
@@ -2227,11 +2703,16 @@ class CotsOffloader(BaseOffloader):
     def prepare_before_forward(self, num_tokens: int) -> None:
         """Repair active-bucket state before a forward starts.
 
-        This is deliberately limited to layer 0. Steady-state next-layer
-        prefetches are emitted inside each layer wrapper so FULL CUDA graph
-        capture records them as graph nodes rather than relying on replay-time
+        Always sets `_current_bucket` (plan §design-decision 11) so the
+        operator slab/closure lookup has a valid bucket regardless of
+        whether prefetch is active. Layer-0 slot repair and streamer
+        bucket mirroring run only when the streamer exists
+        (`f_prefetch > 0`). Steady-state next-layer prefetches are
+        emitted inside each layer wrapper so FULL CUDA graph capture
+        records them as graph nodes rather than relying on replay-time
         Python state.
         """
+        self._current_bucket = self._bucket_for(num_tokens)
         if self._streamer is None:
             return
         self._streamer.set_current_bucket(num_tokens, self._bucket_for)
@@ -2296,6 +2777,17 @@ class CotsOffloader(BaseOffloader):
         )
         self._y_gpu = torch.empty(y_capacity, dtype=dtype, device=device)
 
+        # Phase 1c: two distinct dummy CUDA tensors for the
+        # cots_sync_then_uva op's gpu_anchor_a / gpu_anchor_b mutates_args.
+        # Operators pass these when the corresponding GPU GEMM (out_perm
+        # / out_pref / out_gpu) didn't run for this slab — never aliased,
+        # so torch.compile / functionalization sees two distinct
+        # mutation slots. Allocated here (inside the
+        # DeviceMemoryProfiler accounting window per phase1a §1.5),
+        # NOT in __init__ which can predate CUDA device setup.
+        self._dummy_gpu_anchor_a = torch.empty(1, dtype=dtype, device=device)
+        self._dummy_gpu_anchor_b = torch.empty(1, dtype=dtype, device=device)
+
     # --- post_init: bookkeeping only ---
 
     def post_init(self) -> None:
@@ -2315,6 +2807,14 @@ class CotsOffloader(BaseOffloader):
             )
 
         self._eager_fallback_entry = self._dispatch_table[self._capture_buckets[-1]]
+
+        # Phase 1c Stage 3: install the runner's per-(layer, bucket,
+        # op_kind) work table. Python runner gets a closures dict
+        # capturing weight views; native runner populates the C++ slab
+        # pool. Both can be done at post_init: the underlying
+        # `w_cpu`/`_x_pinned`/`_y_pinned` storages are stable
+        # post-allocation regardless of when their views are taken.
+        self._install_runner()
 
         # Post-init max-fill for layer 0. It is consumed before the current
         # forward can issue any pre-compute prefetch; every later layer is
