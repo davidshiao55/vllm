@@ -34,7 +34,7 @@ for the design rationale and empirical numbers.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
@@ -2018,7 +2018,9 @@ class CotsOffloader(BaseOffloader):
     def __init__(
         self,
         config: CotsOffloadConfig,
-        dispatch_table_factory: Callable[[list[int]], dict[int, tuple[float, float]]]
+        dispatch_table_factory: Callable[
+            [Sequence[int]], dict[int, tuple[float, float]]
+        ]
         | None = None,
     ):
         self.config = config
@@ -2066,7 +2068,7 @@ class CotsOffloader(BaseOffloader):
         # Dispatch table populated in wrap_modules (Phase 1b: needed before
         # the prefetch buffer pool is sized).
         self._dispatch_table: dict[int, tuple[float, float]] = {}
-        self._capture_buckets: list[int] = []
+        self._capture_buckets: tuple[int, ...] = ()
         self._max_num_tokens: int = 0
         self._eager_fallback_entry: tuple[float, float] = (0.0, 0.0)
 
@@ -2774,15 +2776,25 @@ class CotsOffloader(BaseOffloader):
         self.prepare_before_forward(anchor.shape[0])
 
     def _bucket_for(self, num_tokens: int) -> int:
-        """Bisect-up lookup on `_capture_buckets`. Returns the bucket key
+        """Round-up lookup on `_capture_buckets`. Returns the bucket key
         (matches `lookup_dispatch`'s rounding semantics, `planner_design.md
-        §4.5`). Out-of-range returns the largest captured bucket."""
-        from bisect import bisect_left
+        §4.5`). Out-of-range returns the largest captured bucket.
 
-        i = bisect_left(self._capture_buckets, num_tokens)
-        if i >= len(self._capture_buckets):
-            return self._capture_buckets[-1]
-        return self._capture_buckets[i]
+        Implementation note: this used to call `bisect.bisect_left`, but
+        `_bisect.bisect_left` is a C builtin Dynamo can't trace. Under
+        `torch.compile(fullgraph=True)` the model's forward pre-hooks
+        (which include this offloader's first-decoder pre-hook) are
+        traced into the captured graph, so this lookup must be
+        Dynamo-friendly. A linear scan over the bucket tuple is treated
+        as a constant by Dynamo and unrolled at trace time. N is the
+        number of capture buckets (typically O(10)), and this runs once
+        per forward boundary — not per-GEMM — so the O(N) vs O(log N)
+        difference is unobservable. See `phase1c_findings.md §1c.18`.
+        """
+        for bucket in self._capture_buckets:
+            if num_tokens <= bucket:
+                return bucket
+        return self._capture_buckets[-1]
 
     # --- BaseOffloader lifecycle delegation ---
 
@@ -2833,7 +2845,10 @@ class CotsOffloader(BaseOffloader):
         )
         if not capture_sizes:
             capture_sizes = [self._max_num_tokens]
-        self._capture_buckets = sorted(set(capture_sizes))
+        # Tuple (not list) so Dynamo treats `_capture_buckets` as a
+        # constant container during graph capture; the linear scan in
+        # `_bucket_for` then unrolls cleanly. See §1c.18.
+        self._capture_buckets = tuple(sorted(set(capture_sizes)))
 
     # --- Activation buffer allocation ---
 
@@ -3045,10 +3060,10 @@ class CotsOffloader(BaseOffloader):
     def lookup_dispatch(self, num_tokens: int) -> tuple[float, float]:
         """Per `planner_design.md §4.5`: round `num_tokens` UP to the nearest
         capture bucket; out-of-range falls back to the largest bucket's entry.
+        Shares `_bucket_for`'s rounding semantics so dispatch and bucket
+        state always agree (and so neither path uses `bisect_left` —
+        see §1c.18).
         """
-        from bisect import bisect_left
-
-        i = bisect_left(self._capture_buckets, num_tokens)
-        if i >= len(self._capture_buckets):
+        if num_tokens > self._capture_buckets[-1]:
             return self._eager_fallback_entry
-        return self._dispatch_table[self._capture_buckets[i]]
+        return self._dispatch_table[self._bucket_for(num_tokens)]
