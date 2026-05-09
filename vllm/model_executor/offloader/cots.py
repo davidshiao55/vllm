@@ -1433,6 +1433,16 @@ class NativeCotsRunner:
         # Format: {(layer_idx, bucket, op_kind): task_id}.
         self._task_id_for: dict[tuple[int, int, str], int] = {}
         self._installed: bool = False
+        # §1c.19 ownership flag. Multiple `NativeCotsRunner` instances
+        # can share the same `_runner_id` after a pickle round-trip
+        # (PyTorch's AOT guard cache pickles + unpickles the runner as
+        # part of guard serialization). Only the ORIGINAL constructor
+        # owns the registry entry — the unpickled copy is non-owning.
+        # `close()` and `__del__` no-op for non-owners so GC of a
+        # guard-cache copy can't unregister the live runner's infer.
+        # See `__getstate__` / `__setstate__` below for the pickle
+        # path that flips this to False.
+        self._owns_infer_registry_entry: bool = True
 
     def install(
         self,
@@ -1537,33 +1547,63 @@ class NativeCotsRunner:
             y_pinned, y_gpu, gpu_anchor_a, gpu_anchor_b, self._runner_id
         )
 
+    def __getstate__(self) -> dict:
+        """Pickle hook — used by PyTorch's AOT compile guard cache when
+        it serializes the captured forward's closure values
+        (§1c.19/§1c.19.1). The unpickled facade points at the SAME
+        `_runner_id` as the original; if it ran the same `__del__` /
+        `close()` path, GC of a guard-cache copy could yank the live
+        registry entry while the original is still serving requests.
+        Mark the pickled state non-owning so the unpickled copy's
+        `close()` and `__del__` no-op."""
+        state = self.__dict__.copy()
+        state["_owns_infer_registry_entry"] = False
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        # Defensive: in case a state dict from a future pickle didn't
+        # carry the flag, default to non-owning.
+        self.__dict__.setdefault("_owns_infer_registry_entry", False)
+
     def close(self) -> None:
         """Drain any in-flight worker task and drop the registry entry.
         Idempotent; safe to call from teardown. Both the drain and the
         unregister go through cots_ops helpers so this runner facade
         never has to dereference the pybind handle directly (see
-        §1c.19)."""
+        §1c.19).
+
+        No-ops for non-owning copies (`_owns_infer_registry_entry` is
+        False after `__setstate__`). The original constructor is the
+        sole owner; only IT may drain or unregister.
+        """
+        if not getattr(self, "_owns_infer_registry_entry", False):
+            return
         from vllm.model_executor.offloader import cots_ops
 
         try:
             cots_ops.sync_blocking(self._runner_id)
         finally:
             cots_ops._unregister_infer(self._runner_id)
+            self._owns_infer_registry_entry = False
 
     def __del__(self) -> None:
         # Best-effort registry cleanup if the user forgot to call close().
         # Note: don't raise from __del__ — the GC log is unhelpful.
         #
-        # FORWARD RISK (review finding #3, Stage 2 sign-off): this path
-        # only unregisters; it does NOT drain the CUDA stream of any
-        # in-flight `cudaLaunchHostFunc` callbacks scheduled via
-        # `submit_on_stream` / `sync_on_stream`. Stage 3 wires operators
-        # end-to-end, so an offloader teardown mid-forward could leave
-        # host callbacks pointing at a freed slab. Stage 4 or 5 should
-        # add either a BaseOffloader-level shutdown hook that drains the
-        # compute stream and closes the runner before slabs are freed,
-        # OR a best-effort `torch.cuda.current_stream().synchronize()`
-        # here (also dangerous from a finalizer if CUDA is torn down).
+        # No-op for non-owning copies (e.g., AOT guard-cache unpickled
+        # facades) — they share `_runner_id` with the original but must
+        # NOT unregister it on GC. The original's `__del__` / `close()`
+        # is the sole path that may drop the entry.
+        #
+        # FORWARD RISK (review finding #3, Stage 2 sign-off): the
+        # owning path here only unregisters; it does NOT drain the CUDA
+        # stream of any in-flight `cudaLaunchHostFunc` callbacks. Stage
+        # 4 / 5 follow-up should add a BaseOffloader-level shutdown
+        # hook that drains the compute stream and closes the runner
+        # before slabs are freed, OR a best-effort
+        # `torch.cuda.current_stream().synchronize()` here (also
+        # dangerous from a finalizer if CUDA is torn down).
         #
         # `try/except: pass` rather than `contextlib.suppress` because at
         # interpreter shutdown `contextlib` itself can be None;
@@ -1571,9 +1611,11 @@ class NativeCotsRunner:
         # registry module too — interpreter shutdown can already have
         # cleared it.
         try:  # noqa: SIM105
-            from vllm.model_executor.offloader import cots_ops
+            if getattr(self, "_owns_infer_registry_entry", False):
+                from vllm.model_executor.offloader import cots_ops
 
-            cots_ops._unregister_infer(self._runner_id)
+                cots_ops._unregister_infer(self._runner_id)
+                self._owns_infer_registry_entry = False
         except Exception:  # noqa: BLE001
             pass
 
