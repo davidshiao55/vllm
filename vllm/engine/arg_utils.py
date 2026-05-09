@@ -472,6 +472,11 @@ class EngineArgs:
     cots_f_prefetch: float = CotsOffloadConfig.f_prefetch
     cots_kv_biased: bool = CotsOffloadConfig.kv_biased
     cots_cpu_num_threads: int = CotsOffloadConfig.cpu_num_threads
+    cots_cpu_num_threads_by_bucket: dict[int, int] | None = (
+        CotsOffloadConfig.cpu_num_threads_by_bucket
+    )
+    cots_cpu_runner: Literal["native", "python"] = CotsOffloadConfig.cpu_runner
+    cots_cpu_worker_affinity: list[int] | None = CotsOffloadConfig.cpu_worker_affinity
     cots_dry_run: bool = CotsOffloadConfig.dry_run
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
@@ -1076,6 +1081,15 @@ class EngineArgs:
         offload_group.add_argument("--cots-kv-biased", **cots_kwargs["kv_biased"])
         offload_group.add_argument(
             "--cots-cpu-num-threads", **cots_kwargs["cpu_num_threads"]
+        )
+        offload_group.add_argument(
+            "--cots-cpu-num-threads-by-bucket",
+            **cots_kwargs["cpu_num_threads_by_bucket"],
+        )
+        offload_group.add_argument("--cots-cpu-runner", **cots_kwargs["cpu_runner"])
+        offload_group.add_argument(
+            "--cots-cpu-worker-affinity",
+            **cots_kwargs["cpu_worker_affinity"],
         )
         offload_group.add_argument("--cots-dry-run", **cots_kwargs["dry_run"])
 
@@ -1983,6 +1997,9 @@ class EngineArgs:
             f_prefetch=self.cots_f_prefetch,
             kv_biased=self.cots_kv_biased,
             cpu_num_threads=self.cots_cpu_num_threads,
+            cpu_num_threads_by_bucket=self.cots_cpu_num_threads_by_bucket,
+            cpu_runner=self.cots_cpu_runner,
+            cpu_worker_affinity=self.cots_cpu_worker_affinity,
             dry_run=self.cots_dry_run,
         )
         offload_config = config_replace(
