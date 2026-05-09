@@ -72,6 +72,17 @@ class BaseOffloader(ABC):
         """
         pass
 
+    def set_runtime_num_tokens(self, actual_num_tokens: int) -> None:  # noqa: B027
+        """Push the live (unpadded) token count to the offloader.
+
+        Called OUT OF GRAPH by `cudagraph_utils.py` before each
+        captured replay so offloaders can reconcile graph-bucket-sized
+        capture with live decode token counts. Default is no-op;
+        offloaders that need this (e.g., COTS native runner — see
+        `phase1c_findings.md §1c.21`) override.
+        """
+        pass
+
     def sync_prev_onload(self) -> None:  # noqa: B027
         """Sync previous onload operations. Override in subclasses."""
         pass

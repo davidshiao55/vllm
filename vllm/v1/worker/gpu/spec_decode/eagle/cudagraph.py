@@ -85,7 +85,11 @@ class EagleCudaGraphManager(CudaGraphManager):
 
         super().capture(create_forward_fn, progress_bar_desc)
 
-    def run_fullgraph(self, desc: BatchExecutionDescriptor) -> torch.Tensor:
+    def run_fullgraph(
+        self,
+        desc: BatchExecutionDescriptor,
+        actual_num_tokens: int | None = None,
+    ) -> torch.Tensor:
         """Replay a captured FULL cudagraph and return draft tokens."""
-        super().run_fullgraph(desc)
+        super().run_fullgraph(desc, actual_num_tokens=actual_num_tokens)
         return self.draft_tokens

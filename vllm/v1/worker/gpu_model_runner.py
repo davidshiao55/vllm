@@ -4009,6 +4009,17 @@ class GPUModelRunner(
         )
 
         # Run the model.
+        # §1c.21: push the live unpadded token count to the offloader
+        # BEFORE the FULL/PIECEWISE/eager dispatch so the COTS native
+        # worker uses live row counts for CPU GEMM work, not the
+        # captured graph-bucket size at `batch_desc.num_tokens`. The
+        # captured graph shape stays at the bucket; only the worker's
+        # row-count arithmetic shrinks. No-op for offloaders that
+        # don't override `set_runtime_num_tokens`.
+        from vllm.model_executor.offloader.base import get_offloader
+
+        get_offloader().set_runtime_num_tokens(num_tokens_unpadded)
+
         # Use persistent buffers for CUDA graphs.
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.

@@ -247,8 +247,21 @@ class CudaGraphManager:
             cg_mode=CUDAGraphMode.NONE, num_tokens=num_tokens, num_reqs=num_reqs
         )
 
-    def run_fullgraph(self, desc: BatchExecutionDescriptor):
-        """Replay a captured FULL cudagraph."""
+    def run_fullgraph(
+        self,
+        desc: BatchExecutionDescriptor,
+        actual_num_tokens: int | None = None,
+    ):
+        """Replay a captured FULL cudagraph.
+
+        §1c.21: `actual_num_tokens` is the live unpadded token count
+        (from `scheduler_output.total_num_scheduled_tokens`). vLLM
+        captures the graph at `desc.num_tokens` (a padded bucket size)
+        and replays it for any live count up to that bucket. The
+        native COTS runner uses `actual_num_tokens` to size CPU GEMM
+        work; without it the worker would do bucket-sized GEMMs at
+        every replay.
+        """
         assert desc.cg_mode == CUDAGraphMode.FULL, (
             f"Expected FULL mode, got {desc.cg_mode}"
         )
@@ -260,6 +273,12 @@ class CudaGraphManager:
         # cannot see. Without this, replay could overwrite static buffers
         # while those copies are still in flight.
         offloader = get_offloader()
+        # §1c.21: push the live unpadded token count to the offloader's
+        # C++ worker BEFORE prepare_before_forward (which stays
+        # Dynamo-clean for the captured pre-hook path). No-op for
+        # offloaders that don't override the default.
+        if actual_num_tokens is not None:
+            offloader.set_runtime_num_tokens(actual_num_tokens)
         # FULL graph replay bypasses Python model hooks, so repair any
         # active-bucket state that normally lives in forward pre-hooks.
         # A single sync after repair drains both prior copy-stream work
@@ -389,10 +408,12 @@ class ModelCudaGraphManager(CudaGraphManager):
         super().capture(create_forward_fn, progress_bar_desc)
 
     def run_fullgraph(
-        self, desc: BatchExecutionDescriptor
+        self,
+        desc: BatchExecutionDescriptor,
+        actual_num_tokens: int | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | IntermediateTensors:
         """Replay a captured FULL cudagraph and return hidden states."""
-        super().run_fullgraph(desc)
+        super().run_fullgraph(desc, actual_num_tokens=actual_num_tokens)
         if not self.is_last_pp_rank:
             assert self.intermediate_tensors is not None
             return self.intermediate_tensors[: desc.num_tokens]

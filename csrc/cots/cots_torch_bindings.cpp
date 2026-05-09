@@ -55,6 +55,8 @@ PYBIND11_MODULE(_cots_C, m) {
            py::arg("x"), py::arg("w"), py::arg("y_out"))
       .def("y_pinned_view", &CotsCpuInfer::y_pinned_view, py::arg("task_id"),
            py::arg("num_tokens"))
+      .def("set_runtime_num_tokens", &CotsCpuInfer::set_runtime_num_tokens,
+           py::arg("n"))
       .def("get_counters",
            [](const CotsCpuInfer& self) {
              // §1c.21: return as a Python dict for ergonomic

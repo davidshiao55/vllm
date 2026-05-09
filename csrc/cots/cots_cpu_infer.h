@@ -233,6 +233,36 @@ class CotsCpuInfer {
   // CotsCpuInfer instance).
   at::Tensor y_pinned_view(int64_t task_id, int32_t num_tokens) const;
 
+  // §1c.21 fix — live unpadded token count plumbed through OUT OF
+  // GRAPH. Under vLLM full CUDA graph capture, `slab->num_tokens` is
+  // frozen at the captured bucket size (e.g., 256). Replays at B=1
+  // decode would otherwise run CPU GEMMs for the bucket size, costing
+  // ~17 ms/GEMM × 7000 calls = ~120 s/generate wasted (see
+  // phase1c_findings.md §1c.21 counter-driven diagnosis).
+  //
+  // Caller (CotsOffloader.prepare_before_forward, called by
+  // cudagraph_utils.py before each captured replay) sets this to the
+  // live unpadded token count from
+  // `scheduler_output.total_num_scheduled_tokens`. The worker reads it via the
+  // loaded value and uses `effective_n` for all row-count arithmetic —
+  // at::from_blob shapes, GEMM input rows, scratch slicing — instead of
+  // `slab->num_tokens`. Always bounded by `effective_n <= slab->num_tokens`
+  // (the slab capacity) so no buffer overrun is possible.
+  //
+  // Sentinel 0 = unset → fall back to slab->num_tokens. Any positive
+  // value overrides. Validated `n >= 0` at the entry point.
+  //
+  // The captured cudaMemcpyAsync byte count and the captured Triton
+  // UVA grid are still sized to the bucket — those nodes are baked
+  // into the graph at capture time. Only the worker's CPU-side
+  // arithmetic shrinks to the live count. Rows beyond `effective_n`
+  // in y_pinned hold stale data; vLLM's full-graph contract only
+  // consumes the first `effective_n` rows of any output anyway.
+  // Wasted PCIe / Triton bandwidth is a §1c.22 follow-up; the
+  // dominant cost the counter data showed was CPU GEMM work, which
+  // this fix collapses.
+  void set_runtime_num_tokens(int32_t n);
+
   // §1c.21 perf-investigation counters (focused). Tracks submit_count
   // and a num_tokens histogram by op kind, plus D2H 1D/2D split.
   // Reset via `reset_counters()` at the start of a measurement window;
@@ -289,6 +319,13 @@ class CotsCpuInfer {
 
   std::atomic<int32_t> last_observed_num_threads_{0};
 
+  // §1c.21 live-token override. Sentinel 0 = unset; positive values
+  // override slab->num_tokens for row-count arithmetic in the
+  // worker. Updated OUT OF GRAPH by set_runtime_num_tokens() before
+  // each captured replay; read on the worker thread via acquire
+  // load. See header comment on set_runtime_num_tokens.
+  std::atomic<int32_t> runtime_num_tokens_{0};
+
   // Worker exception surfacing (see has_error / take_error above).
   std::atomic<bool> has_error_{false};
   std::mutex error_mtx_;
@@ -309,6 +346,20 @@ class CotsCpuInfer {
   std::atomic<int64_t> d2h_2d_count_{0};
   std::atomic<int64_t> d2h_1d_bytes_{0};
   std::atomic<int64_t> d2h_2d_bytes_{0};
+
+  // §1c.21 fix-validation counters: distinct from the submit-time
+  // num_tokens histogram. `runtime_set_calls_` counts how often
+  // `set_runtime_num_tokens` was called (proves the plumb-through
+  // is reaching C++); `runtime_last_value_` is the most recent
+  // value (proves what's being pushed); `worker_effective_n_hist_`
+  // bins what the worker actually used after the
+  // `effective_n = override > 0 ? override : slab.num_tokens`
+  // resolution. If submit-time histogram is dominated by `nt_gt_64`
+  // but `worker_effective_n_hist` shows mostly `nt_le_1`, the
+  // worker is correctly using the override.
+  std::atomic<int64_t> runtime_set_calls_{0};
+  std::atomic<int64_t> runtime_last_value_{0};
+  std::array<std::atomic<int64_t>, 8> worker_effective_n_hist_{};
 };
 
 }  // namespace cots

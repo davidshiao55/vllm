@@ -3063,6 +3063,13 @@ class CotsOffloader(BaseOffloader):
         emitted inside each layer wrapper so FULL CUDA graph capture
         records them as graph nodes rather than relying on replay-time
         Python state.
+
+        Kept Dynamo-clean (no pybind calls) because vLLM's
+        `_first_decoder_pre_hook` is registered on the model and gets
+        traced into the captured graph. The C++-side runtime token
+        override (§1c.21) is pushed via the separate
+        `set_runtime_num_tokens` method, called OUT OF GRAPH by
+        cudagraph_utils.py before each replay.
         """
         self._current_bucket = self._bucket_for(num_tokens)
         if self._streamer is None:
@@ -3070,6 +3077,26 @@ class CotsOffloader(BaseOffloader):
         self._streamer.set_current_bucket(num_tokens, self._bucket_for)
         if self._layer_handles:
             self._streamer.prepare_for_forward_bucket(0, self._layer_handles[0])
+
+    def set_runtime_num_tokens(self, actual_num_tokens: int) -> None:
+        """§1c.21 fix: push the live unpadded token count to the C++
+        worker so it sizes CPU GEMM work correctly even when vLLM
+        replays a captured graph for a larger bucket. Called OUT OF
+        GRAPH by `cudagraph_utils.py` (capture and replay sites)
+        BEFORE `prepare_before_forward`.
+
+        No-op when not using the native runner (PythonCotsRunner is
+        eager-only and reads the live count directly off
+        `slab.num_tokens.store` at submit time). Also no-op for
+        `actual_num_tokens <= 0` (sentinel).
+        """
+        if not isinstance(self._runner, NativeCotsRunner):
+            return
+        if int(actual_num_tokens) <= 0:
+            return
+        from vllm.model_executor.offloader import cots_ops
+
+        cots_ops.set_runtime_num_tokens(self._runner._runner_id, int(actual_num_tokens))
 
     def _start_prefetch(self, layer_idx: int) -> None:
         if self._streamer is not None:

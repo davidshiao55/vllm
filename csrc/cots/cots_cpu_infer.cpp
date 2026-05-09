@@ -445,7 +445,46 @@ void CotsCpuInfer::RunSlabOnWorker(TaskSlab* slab) {
     last_observed_num_threads_.store(at::get_num_threads(),
                                      std::memory_order_release);
 
-    const int32_t n = slab->num_tokens.load(std::memory_order_acquire);
+    // §1c.21: prefer runtime_num_tokens_ (live unpadded count, set
+    // OUT OF GRAPH by `set_runtime_num_tokens` before each captured
+    // replay) over `slab->num_tokens` (captured bucket capacity).
+    // Sentinel 0 → fall back to slab capacity; bounded by
+    // effective_n <= slab->num_tokens so the worker never reads past
+    // the slab's pinned buffer.
+    const int32_t slab_cap = slab->num_tokens.load(std::memory_order_acquire);
+    const int32_t override_n =
+        runtime_num_tokens_.load(std::memory_order_acquire);
+    const int32_t n = (override_n > 0) ? override_n : slab_cap;
+    TORCH_CHECK(n <= slab_cap, "RunSlabOnWorker: runtime_num_tokens=", n,
+                " exceeds slab capacity (slab.num_tokens=", slab_cap,
+                ") at task_id=", static_cast<int64_t>(slab - slabs_.get()),
+                " — would read past the pinned buffer's tail");
+
+    // §1c.21 fix-validation: bin the effective_n the worker
+    // actually used. If submit-time num_tokens histogram is mostly
+    // `nt_gt_64` but this is mostly `nt_le_1`, the override is
+    // working as intended.
+    {
+      int hist_bin;
+      if (n <= 1)
+        hist_bin = 0;
+      else if (n <= 2)
+        hist_bin = 1;
+      else if (n <= 4)
+        hist_bin = 2;
+      else if (n <= 8)
+        hist_bin = 3;
+      else if (n <= 16)
+        hist_bin = 4;
+      else if (n <= 32)
+        hist_bin = 5;
+      else if (n <= 64)
+        hist_bin = 6;
+      else
+        hist_bin = 7;
+      worker_effective_n_hist_[hist_bin].fetch_add(1,
+                                                   std::memory_order_relaxed);
+    }
 
     switch (slab->op_kind) {
       case TaskSlab::kDryrunNoop: {
@@ -515,6 +554,21 @@ void CotsCpuInfer::RunSlabOnWorker(TaskSlab* slab) {
   }
 }
 
+// --- §1c.21 live-token override ---------------------------------------
+
+void CotsCpuInfer::set_runtime_num_tokens(int32_t n) {
+  TORCH_CHECK(n >= 0, "set_runtime_num_tokens: n=", n,
+              " < 0; pass 0 to clear the override.");
+  // Release store: the worker's acquire load in RunSlabOnWorker pairs
+  // with this. The caller's responsibility is to set this BEFORE the
+  // captured graph replay begins (i.e., from
+  // CotsOffloader.prepare_before_forward, called by
+  // cudagraph_utils.py:267 outside the captured region).
+  runtime_num_tokens_.store(n, std::memory_order_release);
+  runtime_set_calls_.fetch_add(1, std::memory_order_relaxed);
+  runtime_last_value_.store(n, std::memory_order_relaxed);
+}
+
 // --- §1c.21 perf-investigation counters --------------------------------
 
 std::vector<std::pair<std::string, int64_t>> CotsCpuInfer::get_counters()
@@ -546,6 +600,12 @@ std::vector<std::pair<std::string, int64_t>> CotsCpuInfer::get_counters()
   out.emplace_back("d2h_2d_count", load(d2h_2d_count_));
   out.emplace_back("d2h_1d_bytes", load(d2h_1d_bytes_));
   out.emplace_back("d2h_2d_bytes", load(d2h_2d_bytes_));
+  out.emplace_back("runtime_set_calls", load(runtime_set_calls_));
+  out.emplace_back("runtime_last_value", load(runtime_last_value_));
+  for (int i = 0; i < 8; ++i) {
+    out.emplace_back(std::string("worker_eff_n_") + kBinNames[i],
+                     load(worker_effective_n_hist_[i]));
+  }
   return out;
 }
 
@@ -562,6 +622,11 @@ void CotsCpuInfer::reset_counters() {
   d2h_2d_count_.store(0, std::memory_order_relaxed);
   d2h_1d_bytes_.store(0, std::memory_order_relaxed);
   d2h_2d_bytes_.store(0, std::memory_order_relaxed);
+  runtime_set_calls_.store(0, std::memory_order_relaxed);
+  runtime_last_value_.store(0, std::memory_order_relaxed);
+  for (int i = 0; i < 8; ++i) {
+    worker_effective_n_hist_[i].store(0, std::memory_order_relaxed);
+  }
 }
 
 }  // namespace cots

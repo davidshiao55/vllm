@@ -138,6 +138,22 @@ def set_worker_affinity(runner_id: int, mask: int) -> None:
     infer.set_worker_affinity(int(mask))
 
 
+def set_runtime_num_tokens(runner_id: int, n: int) -> None:
+    """§1c.21 live-token plumb-through. Called by
+    `CotsOffloader.prepare_before_forward` BEFORE each captured graph
+    replay with the live unpadded token count from
+    `scheduler_output.total_num_scheduled_tokens`. The worker reads
+    the value on the next host-callback fire and uses it for
+    row-count arithmetic instead of the captured bucket size."""
+    infer = _COTS_INFER.get(runner_id)
+    if infer is None:
+        # Best-effort: a stale runner_id call here shouldn't crash —
+        # just skip. The next custom-op call will surface the missing
+        # registry entry with a clearer error.
+        return
+    infer.set_runtime_num_tokens(int(n))
+
+
 def sync_blocking(runner_id: int) -> None:
     """Drain any in-flight worker task synchronously. Called from
     `NativeCotsRunner.close()`."""
