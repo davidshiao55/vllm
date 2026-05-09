@@ -197,7 +197,7 @@ void CotsCpuInfer::sync_blocking() {
   check_error();
 }
 
-void CotsCpuInfer::set_worker_affinity(int64_t cpu_set) {
+void CotsCpuInfer::set_worker_affinity(uint64_t cpu_set) {
   if (cpu_set == 0) {
     return;  // No-op; leave kernel default. (Stage 4 fills this out.)
   }
@@ -205,8 +205,10 @@ void CotsCpuInfer::set_worker_affinity(int64_t cpu_set) {
   // a restrictive cgroup mask. (Phase 1c plan §risk-3 / Stage 4.)
   cpu_set_t requested;
   CPU_ZERO(&requested);
-  for (int i = 0; i < kMaxCpus; ++i) {
-    if (cpu_set & (int64_t{1} << i)) CPU_SET(i, &requested);
+  // Iterate up to min(kMaxCpus, 64) — uint64 mask has 64 bits, no more.
+  // uint64_t shift up to bit 63 is well-defined (unlike signed int64).
+  for (int i = 0; i < kMaxCpus && i < 64; ++i) {
+    if (cpu_set & (uint64_t{1} << i)) CPU_SET(i, &requested);
   }
   cpu_set_t process_mask;
   CPU_ZERO(&process_mask);

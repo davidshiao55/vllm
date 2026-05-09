@@ -2519,15 +2519,58 @@ class CotsOffloader(BaseOffloader):
                 )
         return callbacks
 
+    def _n_threads_for(self, bucket: int) -> int:
+        """Resolve the CPU GEMM thread count for a given bucket.
+
+        Phase 1c Stage 4: when `config.cpu_num_threads_by_bucket` is
+        set, look up the bucket; missing keys fall back to the scalar
+        `cpu_num_threads` (the Planner is allowed to specify only the
+        buckets it has profile data for; uncovered buckets get the
+        scalar default rather than failing). When the dict is None
+        (default), every bucket uses the scalar `cpu_num_threads` —
+        Phase 1a/1b behavior, no per-bucket variation.
+
+        Validation lives in `_validate_thread_policy` because
+        `_capture_buckets` is not known until `_resolve_capture_buckets`
+        runs in `wrap_modules`.
+        """
+        per_bucket = getattr(self.config, "cpu_num_threads_by_bucket", None)
+        if per_bucket is None:
+            return int(self.config.cpu_num_threads)
+        return int(per_bucket.get(bucket, self.config.cpu_num_threads))
+
+    def _validate_thread_policy(self) -> None:
+        """Reject `cpu_num_threads_by_bucket` keys that aren't captured
+        buckets — would silently fall back to scalar and the Planner's
+        intent would be lost."""
+        per_bucket = getattr(self.config, "cpu_num_threads_by_bucket", None)
+        if per_bucket is None:
+            return
+        unknown = set(per_bucket.keys()) - set(self._capture_buckets)
+        if unknown:
+            raise ValueError(
+                f"cots: cpu_num_threads_by_bucket has keys "
+                f"{sorted(unknown)} that are not in cudagraph_capture_sizes "
+                f"({self._capture_buckets}). Per-bucket thread policy must "
+                f"only reference captured buckets."
+            )
+        for b, n in per_bucket.items():
+            if n < 1:
+                raise ValueError(
+                    f"cots: cpu_num_threads_by_bucket[{b}] = {n}, must be >= 1"
+                )
+
     def _build_native_slab_specs(self) -> list[NativeSlabSpec]:
         """Build the per-(layer, bucket, op_kind) slab specs that
         NativeCotsRunner.install populates into the C++ slab pool. All
         weight pointers are POST-narrow `data_ptr()`s; the down-proj
         slabs additionally carry strides reflecting the source tensor.
+        Each slab's `n_threads` is per-bucket via `_n_threads_for` so
+        the C++ worker dispatcher's cache-guarded `at::set_num_threads`
+        picks up Stage 4's per-`BatchDescriptor` policy.
         """
         assert self._x_pinned is not None
         assert self._y_pinned is not None
-        n_threads = int(self.config.cpu_num_threads)
         x_pinned_ptr = int(self._x_pinned.data_ptr())
         y_pinned_ptr = int(self._y_pinned.data_ptr())
         specs: list[NativeSlabSpec] = []
@@ -2544,7 +2587,7 @@ class CotsOffloader(BaseOffloader):
                 specs.append(
                     _NativeSlabSpecQkv(
                         op_descriptor=(h.layer_idx, bucket, "qkv"),
-                        n_threads=n_threads,
+                        n_threads=self._n_threads_for(bucket),
                         x_pinned_ptr=x_pinned_ptr,
                         in_dim=int(h.in_dim),
                         y_pinned_ptr=y_pinned_ptr,
@@ -2576,7 +2619,7 @@ class CotsOffloader(BaseOffloader):
                 specs.append(
                     _NativeSlabSpecMlp(
                         op_descriptor=(gu_h.layer_idx, bucket, "mlp_block"),
-                        n_threads=n_threads,
+                        n_threads=self._n_threads_for(bucket),
                         x_pinned_ptr=x_pinned_ptr,
                         in_dim=int(fop._in_dim),
                         y_pinned_ptr=y_pinned_ptr,
@@ -2602,6 +2645,10 @@ class CotsOffloader(BaseOffloader):
         but post_init is the natural ordering point)."""
         if self._runner is None or not self._handles:
             return
+        # Stage 4: validate per-bucket thread policy keys before
+        # building specs so a Planner-mistyped bucket fails loudly at
+        # install instead of silently falling back to scalar.
+        self._validate_thread_policy()
         if isinstance(self._runner, PythonCotsRunner):
             callbacks = self._build_python_callbacks()
             self._runner.install(callbacks, bucket_for_fallback=self._bucket_for)
@@ -2621,6 +2668,22 @@ class CotsOffloader(BaseOffloader):
                 scratch_max_intermediate_per_half=int(max_inter_per_half),
                 bucket_for_fallback=self._bucket_for,
             )
+            # Stage 4: optional worker-thread CPU affinity. The C++
+            # `set_worker_affinity` packs cpu IDs into a uint64 bitmask,
+            # intersects with the process's `sched_getaffinity` mask,
+            # and warns-and-skips on empty intersection. None / empty
+            # list means "no opinion" — leave the kernel default.
+            cpu_affinity = getattr(self.config, "cpu_worker_affinity", None)
+            if cpu_affinity:
+                mask = 0
+                for cpu_id in cpu_affinity:
+                    if not (0 <= int(cpu_id) < 64):
+                        raise ValueError(
+                            f"cots: cpu_worker_affinity contains cpu_id "
+                            f"{cpu_id}; must be in [0, 64)"
+                        )
+                    mask |= 1 << int(cpu_id)
+                self._runner._infer.set_worker_affinity(mask)
 
     def _install_bucket_prehook(self) -> None:
         """Phase 1c (Stage 3): install the first-decoder pre-hook

@@ -128,8 +128,34 @@ class CotsOffloadConfig:
 
     cpu_num_threads: int = Field(default=16, ge=1)
     """PyTorch CPU intra-op thread count. Scalar fallback when
-    `cpu_num_threads_by_bucket` is unset (Phase 1c will add per-bucket
-    policy at Stage 4). See `phase1a_findings.md §1.13b`."""
+    `cpu_num_threads_by_bucket` is unset. See `phase1a_findings.md §1.13b`."""
+
+    cpu_num_threads_by_bucket: dict[int, int] | None = Field(default=None)
+    """Phase 1c Stage 4: per-`BatchDescriptor` thread count for the CPU
+    GEMM worker. Keys are `num_tokens` bucket values (must be a subset
+    of `cudagraph_capture_sizes`); values are >= 1. When unset, every
+    bucket uses the scalar `cpu_num_threads`. The Planner produces
+    this mapping by sweeping per-bucket optimal thread counts (see
+    `bench_thread_policy_sweep.py`).
+
+    Only consulted by `cpu_runner='native'`; the Python runner uses the
+    process-wide `torch.set_num_threads(cpu_num_threads)` set once at
+    offloader init. Per-bucket policy on the Python path would race
+    other threads in the process holding torch ops."""
+
+    cpu_worker_affinity: list[int] | None = Field(default=None)
+    """Phase 1c Stage 4: optional CPU affinity mask for the native
+    runner's TaskQueue worker thread. List of CPU IDs to pin the
+    worker to, or None (default) for no opinion. The C++ implementation
+    intersects this with the process's existing `sched_getaffinity` mask
+    and warns-and-skips on empty intersection.
+
+    Recommended on i9-14900KF: P-cores 1..7 (i.e., `[1, 2, 3, 4, 5, 6,
+    7]`) — keeps the worker off P-core 0 where the main thread / CUDA
+    dispatch / kernel tend to land. Hardware-specific; left as None by
+    default so we don't bake i9-14900KF assumptions into the config.
+
+    Only consulted by `cpu_runner='native'`."""
 
     cpu_runner: Literal["native", "python"] = "python"
     """Phase 1c kill-switch. "native" routes CPU work through

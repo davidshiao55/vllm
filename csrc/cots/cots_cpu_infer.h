@@ -161,10 +161,12 @@ class CotsCpuInfer {
   void sync_blocking();
 
   // Bucket-aware thread policy hook. Sets the worker thread's CPU affinity
-  // to `cpu_set` (a bitmask packed into int64). cpu_set == 0 means clear
-  // affinity. Intersect with sched_getaffinity at call time to avoid
-  // EINVAL when running under a restrictive cgroup.
-  void set_worker_affinity(int64_t cpu_set);
+  // to `cpu_set` (a bitmask of CPU IDs packed into uint64; bit i set =>
+  // CPU i is allowed). cpu_set == 0 means clear affinity. Intersect with
+  // sched_getaffinity at call time to avoid EINVAL when running under a
+  // restrictive cgroup. uint64 (not int64) so cpu_id 63 is representable
+  // — `int64_t{1} << 63` is signed-shift UB.
+  void set_worker_affinity(uint64_t cpu_set);
 
   // Test helper: read whether the worker has set num_threads to the value
   // the slab requested, after a sync. Used by test_bucket_thread_policy.
