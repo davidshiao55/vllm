@@ -130,12 +130,24 @@ def sync_blocking(runner_id: int) -> None:
 
 
 # --- vllm.cots_submit_gemm -------------------------------------------------
+#
+# §1c.20 schema: y_pinned is INTENTIONALLY not in this op's argument
+# list, and consequently not in `mutates_args`. The previous schema
+# (`mutates_args=["x_gpu", "y_pinned"]`) caused Inductor's
+# functionalization to allocate a fresh pageable CPU buffer
+# (`empty_strided_cpu`) and clone the pinned slice into it after this
+# op's mutation, then pass the clone to `cots_sync_then_uva` — which
+# broke `uva_copy_into_gpu`'s page-locked-storage requirement. The
+# worker writes to the pinned output via the slab-side pointer
+# populated at install time (`cots_ops.populate_slab_via_spec`), so
+# the compiler does not need to see the pinned buffer to enforce
+# correctness; the (submit → sync) data dependency rides on `x_gpu`
+# instead. See `phase1c_findings.md §1c.20`.
 
 
 def _cots_submit_gemm_impl(
     x_gpu: torch.Tensor,
     x_pinned: torch.Tensor,
-    y_pinned: torch.Tensor,
     runner_id: int,
     task_id: int,
     num_tokens: int,
@@ -146,6 +158,8 @@ def _cots_submit_gemm_impl(
     BEFORE this op is invoked (in NativeCotsRunner.submit_with_d2h);
     torch.compile sees x_pinned as use-after-mutate and keeps that
     ordering. We just enqueue the GEMM task on the current CUDA stream.
+    The worker writes to the pinned output via the slab pointer, NOT
+    through any tensor argument here (§1c.20).
     """
     infer = _lookup_infer(runner_id, "cots_submit_gemm")
     stream = torch.cuda.current_stream().cuda_stream
@@ -155,7 +169,6 @@ def _cots_submit_gemm_impl(
 def _cots_submit_gemm_fake(
     x_gpu: torch.Tensor,
     x_pinned: torch.Tensor,
-    y_pinned: torch.Tensor,
     runner_id: int,
     task_id: int,
     num_tokens: int,
@@ -172,6 +185,7 @@ def _cots_sync_then_uva_impl(
     y_gpu: torch.Tensor,
     gpu_anchor_a: torch.Tensor,
     gpu_anchor_b: torch.Tensor,
+    submit_anchor: torch.Tensor,
     runner_id: int,
 ) -> None:
     """Real impl: schedule the sync host callback then run the UVA copy.
@@ -182,6 +196,13 @@ def _cots_sync_then_uva_impl(
     sync. `gpu_anchor_a` / `gpu_anchor_b` are CUDA tensors that the
     GPU GEMMs produced; mutating them pins this op AFTER both
     independent GEMMs (out_perm, out_pref).
+
+    §1c.20: `submit_anchor` is `x_gpu` from the matching
+    `cots_submit_gemm`. Reading it pins this op AFTER submit without
+    requiring `y_pinned` to be in submit's `mutates_args` (which would
+    trigger Inductor's functionalization clone). `y_pinned` here is
+    read-only from the compiler's view; the runtime data was written by
+    the worker via the slab pointer.
     """
     infer = _lookup_infer(runner_id, "cots_sync_then_uva")
     stream = torch.cuda.current_stream().cuda_stream
@@ -198,6 +219,7 @@ def _cots_sync_then_uva_fake(
     y_gpu: torch.Tensor,
     gpu_anchor_a: torch.Tensor,
     gpu_anchor_b: torch.Tensor,
+    submit_anchor: torch.Tensor,
     runner_id: int,
 ) -> None:
     return
@@ -211,12 +233,16 @@ def register_cots_offloader_ops() -> None:
     direct_register_custom_op(
         op_name="cots_submit_gemm",
         op_func=_cots_submit_gemm_impl,
-        # x_gpu is the CUDA dispatch anchor AND the ordering pin (see
-        # plan §design-decision 6). Mutating it forces every subsequent
-        # GPU GEMM that reads x_gpu (F.linear permanent / prefetched) to
-        # be ordered after submit. y_pinned is the buffer the worker
-        # fills.
-        mutates_args=["x_gpu", "y_pinned"],
+        # §1c.20: `mutates_args=["x_gpu"]` only. x_gpu is the CUDA
+        # dispatch anchor AND the ordering pin — mutating it forces
+        # every subsequent GPU GEMM that reads x_gpu (F.linear
+        # permanent / prefetched) to be ordered after submit, AND
+        # `cots_sync_then_uva` reads x_gpu as `submit_anchor` to
+        # stay ordered after submit. y_pinned is intentionally NOT
+        # an arg here; the worker writes to the pinned output via
+        # the slab pointer, not through any tensor visible to the
+        # compiler.
+        mutates_args=["x_gpu"],
         fake_impl=_cots_submit_gemm_fake,
     )
     direct_register_custom_op(

@@ -113,16 +113,57 @@ if HAS_TRITON:
         tl.store(dst_ptr + offsets, x, mask=mask)
 
 
+def _has_pinned_host_storage(t: torch.Tensor) -> bool:
+    """Storage-level page-locked check (§1c.20 safety belt).
+
+    `Tensor.is_pinned()` reports the metadata bit on a tensor view,
+    which can be lost across reinterpret/view operations even when
+    the underlying storage IS page-locked. The Triton UVA kernel
+    needs the storage to be page-locked, so we drop down to
+    `untyped_storage().is_pinned()` if the metadata fast path says
+    False. A pageable CPU tensor still returns False; non-CPU
+    tensors are rejected immediately.
+
+    NB: in the captured forward, Inductor's functionalization
+    allocates a FRESH pageable CPU buffer rather than just dropping
+    the metadata bit, so this helper alone does not unblock the
+    captured path — that fix is the schema change (§1c.20: drop
+    `y_pinned` from `cots_submit_gemm.mutates_args`, anchor
+    `cots_sync_then_uva` on `x_gpu` instead). This helper is the
+    safety belt for direct callers (`PythonCotsRunner.wait_and_uva`)
+    that still legitimately pass pinned tensors and views thereof.
+    """
+    if t.device.type != "cpu":
+        return False
+    if t.is_pinned():
+        return True
+    try:
+        return bool(t.untyped_storage().is_pinned())
+    except Exception:  # noqa: BLE001 — defensive: any failure → reject
+        return False
+
+
 def uva_copy_into_gpu(
     src_pinned: torch.Tensor,
     dst_gpu: torch.Tensor,
 ) -> None:
     """SM-issued copy from pinned-host (UVA) into a GPU buffer.
 
-    Bypasses CE0; runs on the compute SMs, sharing PCIe link bandwidth with
-    any concurrent CE0 DMA without queueing behind it.
+    Bypasses CE0; runs on the compute SMs, sharing PCIe link
+    bandwidth with any concurrent CE0 DMA without queueing behind
+    it. **Loss of CE0-bypass is unacceptable** (Phase 1b's measured
+    1.85× PCIe BW recovery on row-prefetch depends on it), so the
+    captured-forward path also routes through this helper via the
+    `cots_sync_then_uva` custom op — but the §1c.20 schema fix
+    ensures the input arrives as a real pinned-storage view, not an
+    Inductor-cloned pageable buffer.
     """
-    assert src_pinned.is_pinned(), "src must be pinned host memory"
+    assert _has_pinned_host_storage(src_pinned), (
+        "src must be pinned host memory (storage-level check; see "
+        "phase1c_findings.md §1c.20). A pageable CPU tensor passed "
+        "to the UVA kernel reads garbage from device-mapped host "
+        "memory."
+    )
     assert dst_gpu.is_cuda, "dst must be on CUDA"
     assert src_pinned.shape == dst_gpu.shape, (
         f"shape mismatch: src={tuple(src_pinned.shape)}, dst={tuple(dst_gpu.shape)}"
@@ -1353,17 +1394,19 @@ class PythonCotsRunner:
         y_gpu: torch.Tensor,
         gpu_anchor_a: torch.Tensor,
         gpu_anchor_b: torch.Tensor,
+        submit_anchor: torch.Tensor,
     ) -> None:
         """Drain the worker and copy the pinned result into the GPU
-        buffer via the SM-issued UVA kernel. `gpu_anchor_a` and
-        `gpu_anchor_b` are accepted for API symmetry with NativeCotsRunner
+        buffer via the SM-issued UVA kernel. `gpu_anchor_a` /
+        `gpu_anchor_b` / `submit_anchor` are accepted for API
+        symmetry with NativeCotsRunner
         — they're the barrier-installing anchors that pin the
         `cots_sync_then_uva` custom op AFTER each independent GPU GEMM
         under graph capture. Under PythonCotsRunner we're eager-only
         (no graph capture), so the anchors are unused; but accepting
         them lets operators call both runners with one signature.
         """
-        del gpu_anchor_a, gpu_anchor_b
+        del gpu_anchor_a, gpu_anchor_b, submit_anchor
         assert self._future is not None, "submit_with_d2h() not called"
         try:
             self._future.result()  # re-raises worker exceptions
@@ -1499,17 +1542,29 @@ class NativeCotsRunner:
         """Phase 1c uniform facade. Issues a non-blocking D2H of x_gpu
         into x_pinned on the current CUDA stream, then routes through
         `torch.ops.vllm.cots_submit_gemm` so torch.compile/CUDA graph
-        capture sees the barrier-installing `mutates_args=["x_gpu",
-        "y_pinned"]` and pins this op BEFORE every GPU GEMM that reads
-        x_gpu (preserves the overlap window). The custom op's impl
-        looks up the per-runner pybind handle by runner_id and invokes
+        capture sees the barrier-installing `mutates_args=["x_gpu"]`
+        and pins this op BEFORE every GPU GEMM that reads x_gpu
+        (preserves the overlap window). The custom op's impl looks up
+        the per-runner pybind handle by runner_id and invokes
         `submit_on_stream(task_id, num_tokens, stream)` on it.
+
+        §1c.20: `y_pinned` is accepted in the facade signature for API
+        symmetry with PythonCotsRunner, but is INTENTIONALLY NOT
+        passed to the custom op. The previous schema had y_pinned in
+        `mutates_args` and Inductor's functionalization cloned it into
+        a fresh pageable CPU buffer post-mutation, breaking the UVA
+        kernel's page-locked-storage requirement. The worker writes
+        to the pinned output via the slab-side pointer populated at
+        install time; the (submit → sync) data dependency rides on
+        x_gpu, which `cots_sync_then_uva` reads as its
+        `submit_anchor`.
 
         §1c.19: `op_descriptor[1]` MUST be a resolved int. Operators
         call `offloader._bucket_for(num_tokens)` themselves before
         invoking the runner, so the runner facade contains no
         offloader-bound references and stays Dynamo-pickleable.
         """
+        del y_pinned  # §1c.20: not passed to the custom op
         layer_idx, bucket, op_kind = op_descriptor
         # Defensive — operator callers always resolve. Cheap to validate.
         assert isinstance(bucket, int), (
@@ -1520,12 +1575,13 @@ class NativeCotsRunner:
         )
         task_id = self._task_id_for[(layer_idx, bucket, op_kind)]
         num_tokens = int(x_gpu.shape[0])
-        # D2H first; the cots_submit_gemm op's `mutates_args=["x_gpu",
-        # "y_pinned"]` keeps the cudaLaunchHostFunc enqueue ordered
-        # AFTER the copy_, before the GPU GEMMs that read x_gpu.
+        # D2H first; the cots_submit_gemm op's `mutates_args=["x_gpu"]`
+        # keeps the cudaLaunchHostFunc enqueue ordered AFTER the copy_
+        # (use-after-mutate of x_pinned in the trace), before the GPU
+        # GEMMs that read x_gpu.
         x_pinned.copy_(x_gpu, non_blocking=True)
         torch.ops.vllm.cots_submit_gemm(
-            x_gpu, x_pinned, y_pinned, self._runner_id, task_id, num_tokens
+            x_gpu, x_pinned, self._runner_id, task_id, num_tokens
         )
 
     def wait_and_uva(
@@ -1534,17 +1590,29 @@ class NativeCotsRunner:
         y_gpu: torch.Tensor,
         gpu_anchor_a: torch.Tensor,
         gpu_anchor_b: torch.Tensor,
+        submit_anchor: torch.Tensor,
     ) -> None:
         """Routes through `torch.ops.vllm.cots_sync_then_uva` so the
         cudaLaunchHostFunc-based stream sync + the Triton UVA copy
-        bundle into one graph-recorded entry. The two-anchor schema
-        keeps sync ordered AFTER each independent GPU GEMM
-        (`gpu_anchor_a` = out_perm or dummy_a, `gpu_anchor_b` = out_pref
-        or dummy_b — operators pass two distinct CUDA tensors, never
-        aliased).
+        bundle into one graph-recorded entry.
+
+        Three barrier roles:
+        - `gpu_anchor_a` / `gpu_anchor_b` are mutated, pinning sync
+          AFTER each independent GPU GEMM (`out_perm`, `out_pref`).
+          Operators pass two distinct CUDA tensors, never aliased.
+        - `submit_anchor` (§1c.20) is read-only — the same `x_gpu`
+          that `cots_submit_gemm` mutated. Reading x_gpu here pins
+          sync AFTER submit without requiring y_pinned in submit's
+          mutates_args (which would trigger Inductor's
+          functionalization clone of the pinned slice).
         """
         torch.ops.vllm.cots_sync_then_uva(
-            y_pinned, y_gpu, gpu_anchor_a, gpu_anchor_b, self._runner_id
+            y_pinned,
+            y_gpu,
+            gpu_anchor_a,
+            gpu_anchor_b,
+            submit_anchor,
+            self._runner_id,
         )
 
     def __getstate__(self) -> dict:
@@ -1827,7 +1895,12 @@ class CotsQKVOp:
             # — never aliased.
             gpu_a = out_perm if out_perm is not None else offloader._dummy_gpu_anchor_a
             gpu_b = out_pref if out_pref is not None else offloader._dummy_gpu_anchor_b
-            self._runner.wait_and_uva(y_out, y_dst, gpu_a, gpu_b)
+            # §1c.20: pass `x` as `submit_anchor` — the same x_gpu that
+            # `cots_submit_gemm` mutated. Reading it pins sync after
+            # submit without requiring y_pinned in submit's
+            # mutates_args (which would trigger Inductor's
+            # functionalization clone of the pinned slice).
+            self._runner.wait_and_uva(y_out, y_dst, gpu_a, gpu_b, x)
 
         out = _scatter_col_outputs_three_way(
             out_perm, out_pref, y_dst, pref_idx, cpu_idx, h, num_tokens
@@ -2005,7 +2078,9 @@ class CotsSwiGLUMLPOp:
             # `y_gpu` mutate already covers.
             gpu_a = out_gpu if out_gpu is not None else offloader._dummy_gpu_anchor_a
             gpu_b = offloader._dummy_gpu_anchor_b
-            self._runner.wait_and_uva(y2_pinned, y2_gpu, gpu_a, gpu_b)
+            # §1c.20: pass `x` as `submit_anchor` so sync stays after
+            # submit without y_pinned in submit's mutates_args.
+            self._runner.wait_and_uva(y2_pinned, y2_gpu, gpu_a, gpu_b, x)
             # When CPU is the sole contributor, clone — y2_gpu is a shared
             # activation buffer and would be clobbered by the next layer.
             out_gpu = y2_gpu.clone() if out_gpu is None else out_gpu.add_(y2_gpu)
