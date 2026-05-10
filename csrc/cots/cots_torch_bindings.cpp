@@ -56,6 +56,19 @@ PYBIND11_MODULE(_cots_C, m) {
       .def("set_ablations", &CotsCpuInfer::set_ablations, py::arg("ablate_d2h"),
            py::arg("ablate_hostfn"), py::arg("ablate_submit_hostfn") = false,
            py::arg("ablate_sync_hostfn") = false)
+      // §1c.29 M3 — install + wait launcher + test helpers.
+      .def("install_m3_for_task", &CotsCpuInfer::install_m3_for_task,
+           py::arg("task_id"))
+      .def("m3_wait_on_stream", &CotsCpuInfer::m3_wait_on_stream,
+           py::arg("task_id"), py::arg("cuda_stream"))
+      .def("m3_get_req_slot", &CotsCpuInfer::m3_get_req_slot,
+           py::arg("task_id"))
+      .def("m3_get_done_slot", &CotsCpuInfer::m3_get_done_slot,
+           py::arg("task_id"))
+      .def("m3_set_req_slot", &CotsCpuInfer::m3_set_req_slot,
+           py::arg("task_id"), py::arg("value"))
+      .def("m3_set_done_slot", &CotsCpuInfer::m3_set_done_slot,
+           py::arg("task_id"), py::arg("value"))
       .def("last_observed_num_threads",
            &CotsCpuInfer::last_observed_num_threads)
       .def("has_error", &CotsCpuInfer::has_error)

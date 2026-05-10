@@ -1023,14 +1023,30 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   set(VLLM_COTS_EXT_SRC
     "csrc/cots/task_queue.cpp"
     "csrc/cots/cots_cpu_infer.cpp"
-    "csrc/cots/cots_torch_bindings.cpp")
+    "csrc/cots/cots_torch_bindings.cpp"
+    # §1c.29 M3 wait kernel — compiled as CUDA so nvcc handles
+    # the __global__ kernel and PTX inline asm. The other
+    # sources stay C++ host code; nvcc compiles them
+    # transparently when LANGUAGE=CUDA.
+    "csrc/cots/cots_m3_wait_kernel.cu")
+
+  # §1c.29: per-source gencode flags for the M3 .cu file. The
+  # PTX `nanosleep` instruction requires sm_70+; without the
+  # gencode flags nvcc defaults to sm_50 (cmake's default) and
+  # fails. Mirrors the pattern used by other CUDA targets in
+  # this CMakeLists (e.g., set_gencode_flags_for_srcs is the
+  # repo-blessed way to apply CUDA_ARCHS per-source).
+  set_gencode_flags_for_srcs(
+    SRCS "csrc/cots/cots_m3_wait_kernel.cu"
+    CUDA_ARCHS "${CUDA_ARCHS}")
 
   message(STATUS "Enabling cots_C extension.")
   define_extension_target(
     _cots_C
     DESTINATION vllm
-    LANGUAGE CXX
+    LANGUAGE ${VLLM_GPU_LANG}
     SOURCES ${VLLM_COTS_EXT_SRC}
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
     LIBRARIES CUDA::cudart
     WITH_SOABI)
 

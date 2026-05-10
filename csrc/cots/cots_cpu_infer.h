@@ -70,6 +70,24 @@ struct alignas(64) TaskSlab {
   // mode never writes this).
   std::atomic<int64_t> enqueue_time_ns{0};
 
+  // §1c.29 M3 (sync host_fn replacement). One req/done slot pair
+  // per slab, allocated lazily by `install_m3_for_task` only when
+  // the M3 feature flag is on. host_*_ptr is the CPU-visible
+  // address (worker reads/writes); dev_*_ptr is the GPU-visible
+  // address (m3_wait_kernel reads via host-mapped pinned).
+  // `next_seq` is incremented per dispatch_cb fire from the
+  // driver thread; `uint32_t` is documented as "wraps at 2^32"
+  // — at 56 ops × billions of replays this is a non-issue for
+  // any realistic workload, but a future robust version could
+  // promote to uint64_t. m3_installed is set by
+  // install_m3_for_task and gates the dispatch/wait paths.
+  void* host_req_slot{nullptr};
+  void* dev_req_slot{nullptr};
+  void* host_done_slot{nullptr};
+  void* dev_done_slot{nullptr};
+  std::atomic<uint32_t> next_seq{0};
+  std::atomic<bool> m3_installed{false};
+
   // §1c.22 review-fix: immutable bucket capacity, populated once at
   // install time from the (layer, bucket, op_kind) descriptor and
   // never written again. Replay-time byte accounting MUST read this
@@ -226,6 +244,32 @@ class CotsCpuInfer {
   int32_t last_observed_num_threads() const {
     return last_observed_num_threads_.load(std::memory_order_acquire);
   }
+
+  // §1c.29 M3 — install per-slab host-mapped pinned req/done
+  // slots. Idempotent; calling twice for the same task_id raises.
+  // Hard-fails on cudaHostAlloc(cudaHostAllocMapped) or
+  // cudaHostGetDevicePointer error (per §1c.29 safety gate (c)/(d)
+  // — silent fallback under graph capture would put different
+  // slabs on different mechanisms, refuse to install). After
+  // success, `slab.m3_installed = true`.
+  void install_m3_for_task(int64_t task_id);
+
+  // Launch the captured-graph wait kernel for `task_id` on
+  // `cuda_stream`. Selects production vs diag kernel based on
+  // VLLM_COTS_DIAG. Hard-fails if M3 was not installed for this
+  // task. Used inside the captured `cots_sync_then_uva` op when
+  // the M3 feature flag is on (commit 2 wires it; commit 1
+  // exposes the launcher for direct testing).
+  void m3_wait_on_stream(int64_t task_id, uintptr_t cuda_stream);
+
+  // §1c.29 test helpers. Direct slot access from CPU — used by
+  // the unit smoke (test_m3_wait_kernel_smoke.py) to drive the
+  // wait kernel in isolation. NOT used on the captured-graph
+  // hot path.
+  uint32_t m3_get_req_slot(int64_t task_id) const;
+  uint32_t m3_get_done_slot(int64_t task_id) const;
+  void m3_set_req_slot(int64_t task_id, uint32_t value);
+  void m3_set_done_slot(int64_t task_id, uint32_t value);
 
   // §1c.26 / §1c.27 diagnostic ablation flags. Probe-only —
   // meaningful ONLY under `dry_run=True` AND `VLLM_COTS_DIAG=1`.
@@ -509,6 +553,27 @@ class CotsCpuInfer {
   std::atomic<bool> ablate_hostfn_{false};
   std::atomic<bool> ablate_submit_hostfn_{false};
   std::atomic<bool> ablate_sync_hostfn_{false};
+
+  // §1c.29 M3 diag counters. Allocated once at first
+  // install_m3_for_task call (lazily — most instances don't
+  // use M3) as host-mapped pinned int64_t cells so the GPU
+  // m3_wait_kernel_diag can atomicAdd directly. host_ptr is
+  // CPU-readable for get_counters/reset_counters; dev_ptr is
+  // GPU-visible for the kernel. Counters meaning:
+  //   immediate_resume: wait fires that found done >= req on
+  //     the first read (GPU window covered CPU work).
+  //   lagging_wait: wait fires that had to spin at all.
+  //   spin_iters_total: sum of spin iterations across all
+  //     lagging waits.
+  // Together they tell us how often the prototype's wait
+  // actually serializes vs returns immediately — the §1c.29
+  // canary for keeping SM occupancy small.
+  int64_t* m3_immediate_resume_host_{nullptr};
+  int64_t* m3_immediate_resume_dev_{nullptr};
+  int64_t* m3_lagging_wait_host_{nullptr};
+  int64_t* m3_lagging_wait_dev_{nullptr};
+  int64_t* m3_spin_iters_host_{nullptr};
+  int64_t* m3_spin_iters_dev_{nullptr};
 };
 
 }  // namespace cots

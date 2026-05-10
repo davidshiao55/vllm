@@ -93,6 +93,40 @@ CotsCpuInfer::~CotsCpuInfer() {
   if (task_queue_) {
     task_queue_->sync(0);
   }
+  // §1c.29 M3: free per-slab host-mapped pinned slots. These are
+  // allocated lazily via cudaHostAlloc(cudaHostAllocMapped) by
+  // install_m3_for_task; teardown must release them or the host
+  // pinned region leaks. Walk the slabs_ array (sized at install
+  // time) and free any with m3_installed=true.
+  if (slabs_) {
+    for (int64_t i = 0; i < slab_count_; ++i) {
+      TaskSlab& s = slabs_[i];
+      if (s.m3_installed.load(std::memory_order_acquire)) {
+        if (s.host_req_slot != nullptr) {
+          cudaFreeHost(s.host_req_slot);
+          s.host_req_slot = nullptr;
+        }
+        if (s.host_done_slot != nullptr) {
+          cudaFreeHost(s.host_done_slot);
+          s.host_done_slot = nullptr;
+        }
+        s.m3_installed.store(false, std::memory_order_release);
+      }
+    }
+  }
+  // Free M3 diag counter cells if allocated.
+  if (m3_immediate_resume_host_ != nullptr) {
+    cudaFreeHost(m3_immediate_resume_host_);
+    m3_immediate_resume_host_ = nullptr;
+  }
+  if (m3_lagging_wait_host_ != nullptr) {
+    cudaFreeHost(m3_lagging_wait_host_);
+    m3_lagging_wait_host_ = nullptr;
+  }
+  if (m3_spin_iters_host_ != nullptr) {
+    cudaFreeHost(m3_spin_iters_host_);
+    m3_spin_iters_host_ = nullptr;
+  }
 }
 
 void CotsCpuInfer::install(int64_t n_slabs, int64_t scratch_max_tokens,
@@ -839,6 +873,17 @@ std::vector<std::pair<std::string, int64_t>> CotsCpuInfer::get_counters()
   out.emplace_back("worker_busy_total_ns", load(worker_busy_total_ns_));
   out.emplace_back("worker_queue_wait_total_ns",
                    load(worker_queue_wait_total_ns_));
+  // §1c.29 M3 diag counters. Populated only when
+  // `VLLM_COTS_DIAG=1` AND a captured graph that fires
+  // `m3_wait_kernel_diag` runs (production-default path skips
+  // these). Stored as host-mapped pinned int64_t cells so the
+  // GPU can atomicAdd; the host pointer is read here.
+  out.emplace_back("m3_immediate_resume_count",
+                   m3_immediate_resume_host_ ? *m3_immediate_resume_host_ : 0);
+  out.emplace_back("m3_lagging_wait_count",
+                   m3_lagging_wait_host_ ? *m3_lagging_wait_host_ : 0);
+  out.emplace_back("m3_wait_spin_iters_total",
+                   m3_spin_iters_host_ ? *m3_spin_iters_host_ : 0);
   return out;
 }
 
@@ -873,6 +918,173 @@ void CotsCpuInfer::reset_counters() {
   worker_run_count_.store(0, std::memory_order_relaxed);
   worker_busy_total_ns_.store(0, std::memory_order_relaxed);
   worker_queue_wait_total_ns_.store(0, std::memory_order_relaxed);
+  // §1c.29 M3 diag counters. Lazy-allocated; only zero them
+  // if they exist (i.e., M3 was installed at least once).
+  if (m3_immediate_resume_host_) *m3_immediate_resume_host_ = 0;
+  if (m3_lagging_wait_host_) *m3_lagging_wait_host_ = 0;
+  if (m3_spin_iters_host_) *m3_spin_iters_host_ = 0;
+}
+
+// §1c.29 M3 — install per-slab host-mapped pinned slots.
+// Forward declarations of the launchers in cots_m3_wait_kernel.cu
+// so we can call them from this C++ TU without a header pulling
+// in CUDA-specific symbols.
+extern "C" void launch_m3_wait_kernel_production(uint32_t*, uint32_t*,
+                                                 cudaStream_t);
+extern "C" void launch_m3_wait_kernel_diag(uint32_t*, uint32_t*, int64_t*,
+                                           int64_t*, int64_t*, cudaStream_t);
+
+// §1c.29 helper: lazily allocate the diag counter cells the
+// first time install_m3_for_task is called. Host-mapped pinned
+// int64_t each so the GPU kernel can atomicAdd directly. Reads
+// in get_counters/reset_counters use the host pointer.
+static void ensure_m3_diag_cell(int64_t** host_ptr, int64_t** dev_ptr,
+                                const char* name) {
+  if (*host_ptr != nullptr) return;
+  void* hp = nullptr;
+  cudaError_t e = cudaHostAlloc(&hp, sizeof(int64_t), cudaHostAllocMapped);
+  TORCH_CHECK(e == cudaSuccess, "install_m3_for_task: cudaHostAlloc(", name,
+              ") failed: ", cudaGetErrorString(e));
+  *static_cast<int64_t*>(hp) = 0;
+  void* dp = nullptr;
+  cudaError_t e2 = cudaHostGetDevicePointer(&dp, hp, 0);
+  if (e2 != cudaSuccess) {
+    cudaFreeHost(hp);
+    TORCH_CHECK(false, "install_m3_for_task: cudaHostGetDevicePointer(", name,
+                ") failed: ", cudaGetErrorString(e2));
+  }
+  *host_ptr = static_cast<int64_t*>(hp);
+  *dev_ptr = static_cast<int64_t*>(dp);
+}
+
+void CotsCpuInfer::install_m3_for_task(int64_t task_id) {
+  check_error();
+  TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
+              "install_m3_for_task: task_id ", task_id, " out of range");
+  TaskSlab& s = slabs_[task_id];
+  TORCH_CHECK(!s.m3_installed.load(std::memory_order_acquire),
+              "install_m3_for_task: M3 already installed for task_id=", task_id,
+              " (idempotency violation)");
+  // Lazy-alloc the per-runner diag counter cells on first use.
+  ensure_m3_diag_cell(&m3_immediate_resume_host_, &m3_immediate_resume_dev_,
+                      "m3_immediate_resume");
+  ensure_m3_diag_cell(&m3_lagging_wait_host_, &m3_lagging_wait_dev_,
+                      "m3_lagging_wait");
+  ensure_m3_diag_cell(&m3_spin_iters_host_, &m3_spin_iters_dev_,
+                      "m3_spin_iters");
+  // Allocate one uint32_t per slot, host-mapped pinned. We keep
+  // host_*_ptr (CPU-visible) and dev_*_ptr (GPU-visible — same
+  // memory, different virtual address) on the slab. Hard-fails
+  // on any allocation/mapping error per §1c.29 safety gate
+  // (c)/(d) — silent fallback under graph capture would put
+  // different slabs on different mechanisms.
+  void* host_req = nullptr;
+  void* host_done = nullptr;
+  cudaError_t e1 =
+      cudaHostAlloc(&host_req, sizeof(uint32_t), cudaHostAllocMapped);
+  TORCH_CHECK(e1 == cudaSuccess,
+              "install_m3_for_task: cudaHostAlloc(req_slot) failed: ",
+              cudaGetErrorString(e1));
+  cudaError_t e2 =
+      cudaHostAlloc(&host_done, sizeof(uint32_t), cudaHostAllocMapped);
+  if (e2 != cudaSuccess) {
+    cudaFreeHost(host_req);  // partial-failure cleanup
+    TORCH_CHECK(false, "install_m3_for_task: cudaHostAlloc(done_slot) failed: ",
+                cudaGetErrorString(e2));
+  }
+  *static_cast<uint32_t*>(host_req) = 0;
+  *static_cast<uint32_t*>(host_done) = 0;
+  void* dev_req = nullptr;
+  void* dev_done = nullptr;
+  cudaError_t e3 = cudaHostGetDevicePointer(&dev_req, host_req, 0);
+  cudaError_t e4 = cudaHostGetDevicePointer(&dev_done, host_done, 0);
+  if (e3 != cudaSuccess || e4 != cudaSuccess) {
+    cudaFreeHost(host_req);
+    cudaFreeHost(host_done);
+    TORCH_CHECK(false, "install_m3_for_task: cudaHostGetDevicePointer failed: ",
+                cudaGetErrorString(e3 != cudaSuccess ? e3 : e4));
+  }
+  s.host_req_slot = host_req;
+  s.dev_req_slot = dev_req;
+  s.host_done_slot = host_done;
+  s.dev_done_slot = dev_done;
+  s.next_seq.store(0, std::memory_order_relaxed);
+  s.m3_installed.store(true, std::memory_order_release);
+}
+
+void CotsCpuInfer::m3_wait_on_stream(int64_t task_id, uintptr_t cuda_stream) {
+  check_error();
+  TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
+              "m3_wait_on_stream: task_id ", task_id, " out of range");
+  TaskSlab& s = slabs_[task_id];
+  TORCH_CHECK(s.m3_installed.load(std::memory_order_acquire),
+              "m3_wait_on_stream: M3 not installed for task_id=", task_id,
+              "; call install_m3_for_task first");
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  if (nvtx_internal::diag_enabled()) {
+    // Diag counter cells are lazy-allocated by install_m3_for_task,
+    // so they must exist by now (we already passed the m3_installed
+    // gate above).
+    TORCH_CHECK(m3_immediate_resume_dev_ != nullptr &&
+                    m3_lagging_wait_dev_ != nullptr &&
+                    m3_spin_iters_dev_ != nullptr,
+                "m3_wait_on_stream: diag mode active but diag counter "
+                "cells not allocated (logic bug — install_m3_for_task "
+                "should have allocated them)");
+    launch_m3_wait_kernel_diag(static_cast<uint32_t*>(s.dev_req_slot),
+                               static_cast<uint32_t*>(s.dev_done_slot),
+                               m3_spin_iters_dev_, m3_immediate_resume_dev_,
+                               m3_lagging_wait_dev_, stream);
+  } else {
+    launch_m3_wait_kernel_production(static_cast<uint32_t*>(s.dev_req_slot),
+                                     static_cast<uint32_t*>(s.dev_done_slot),
+                                     stream);
+  }
+}
+
+uint32_t CotsCpuInfer::m3_get_req_slot(int64_t task_id) const {
+  TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
+              "m3_get_req_slot: task_id out of range");
+  const TaskSlab& s = slabs_[task_id];
+  TORCH_CHECK(s.m3_installed.load(std::memory_order_acquire),
+              "m3_get_req_slot: M3 not installed for task_id=", task_id);
+  return *static_cast<volatile uint32_t*>(s.host_req_slot);
+}
+
+uint32_t CotsCpuInfer::m3_get_done_slot(int64_t task_id) const {
+  TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
+              "m3_get_done_slot: task_id out of range");
+  const TaskSlab& s = slabs_[task_id];
+  TORCH_CHECK(s.m3_installed.load(std::memory_order_acquire),
+              "m3_get_done_slot: M3 not installed for task_id=", task_id);
+  return *static_cast<volatile uint32_t*>(s.host_done_slot);
+}
+
+void CotsCpuInfer::m3_set_req_slot(int64_t task_id, uint32_t value) {
+  TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
+              "m3_set_req_slot: task_id out of range");
+  TaskSlab& s = slabs_[task_id];
+  TORCH_CHECK(s.m3_installed.load(std::memory_order_acquire),
+              "m3_set_req_slot: M3 not installed for task_id=", task_id);
+  std::atomic_thread_fence(std::memory_order_release);
+  *static_cast<volatile uint32_t*>(s.host_req_slot) = value;
+  std::atomic_thread_fence(std::memory_order_release);
+}
+
+void CotsCpuInfer::m3_set_done_slot(int64_t task_id, uint32_t value) {
+  TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
+              "m3_set_done_slot: task_id out of range");
+  TaskSlab& s = slabs_[task_id];
+  TORCH_CHECK(s.m3_installed.load(std::memory_order_acquire),
+              "m3_set_done_slot: M3 not installed for task_id=", task_id);
+  // Worker-side publish ordering (§1c.29 reminder): in production
+  // the worker writes y_pinned, releases via fence, THEN writes
+  // done_slot=seq. The test helper omits y_pinned (no real CPU
+  // GEMM in the smoke), but keeps the release fence for
+  // consistency.
+  std::atomic_thread_fence(std::memory_order_release);
+  *static_cast<volatile uint32_t*>(s.host_done_slot) = value;
+  std::atomic_thread_fence(std::memory_order_release);
 }
 
 }  // namespace cots
