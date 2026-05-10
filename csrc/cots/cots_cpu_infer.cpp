@@ -965,13 +965,24 @@ void CotsCpuInfer::install_m3_for_task(int64_t task_id) {
   TORCH_CHECK(!s.m3_installed.load(std::memory_order_acquire),
               "install_m3_for_task: M3 already installed for task_id=", task_id,
               " (idempotency violation)");
-  // Lazy-alloc the per-runner diag counter cells on first use.
-  ensure_m3_diag_cell(&m3_immediate_resume_host_, &m3_immediate_resume_dev_,
-                      "m3_immediate_resume");
-  ensure_m3_diag_cell(&m3_lagging_wait_host_, &m3_lagging_wait_dev_,
-                      "m3_lagging_wait");
-  ensure_m3_diag_cell(&m3_spin_iters_host_, &m3_spin_iters_dev_,
-                      "m3_spin_iters");
+  // Lazy-alloc the per-runner diag counter cells, but ONLY when
+  // VLLM_COTS_DIAG=1 — production M3 should not pay the pinned-
+  // allocation surface for cells the diag kernel will never read.
+  // Per reviewer (§1c.29 commit 1 fix): diag-only allocation
+  // surface keeps the production failure space minimal.
+  // m3_wait_on_stream re-checks diag_enabled() at each launch and
+  // selects the diag kernel only if both the env is set AND the
+  // cells are allocated; in production these cells stay nullptr
+  // and the production launcher (which doesn't take counter ptrs)
+  // is used instead.
+  if (nvtx_internal::diag_enabled()) {
+    ensure_m3_diag_cell(&m3_immediate_resume_host_, &m3_immediate_resume_dev_,
+                        "m3_immediate_resume");
+    ensure_m3_diag_cell(&m3_lagging_wait_host_, &m3_lagging_wait_dev_,
+                        "m3_lagging_wait");
+    ensure_m3_diag_cell(&m3_spin_iters_host_, &m3_spin_iters_dev_,
+                        "m3_spin_iters");
+  }
   // Allocate one uint32_t per slot, host-mapped pinned. We keep
   // host_*_ptr (CPU-visible) and dev_*_ptr (GPU-visible — same
   // memory, different virtual address) on the slab. Hard-fails
