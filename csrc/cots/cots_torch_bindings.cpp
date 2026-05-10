@@ -57,6 +57,9 @@ PYBIND11_MODULE(_cots_C, m) {
            py::arg("task_id"), py::arg("cuda_stream"))
       .def("m3_installed_for_task", &CotsCpuInfer::m3_installed_for_task,
            py::arg("task_id"))
+      // §1c.33 per-task fire counter — returns
+      // List[int] indexed by task_id (size = slab_count_).
+      .def("get_task_fire_counts", &CotsCpuInfer::get_task_fire_counts)
       .def("submit_dryrun_burst", &CotsCpuInfer::submit_dryrun_burst,
            py::arg("n"))
       .def("sync_blocking", &CotsCpuInfer::sync_blocking)

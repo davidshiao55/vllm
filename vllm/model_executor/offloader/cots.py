@@ -1652,6 +1652,10 @@ class NativeCotsRunner:
                 self._runner_id, spec, tid, dry_run=self._dry_run
             )
         self._installed = True
+        # §1c.33 diagnostic: hand the task_id map to cots_ops so the
+        # atexit per-task fire-count dump can cross-reference each
+        # task_id with its (layer_idx, bucket, op_kind) descriptor.
+        cots_ops._register_task_id_for(self._runner_id, self._task_id_for)
         # Cache n_slabs so install_m3 (separate post-install call,
         # gated on the feature flag) doesn't have to re-walk
         # task_id_for. Set last so any populate-time error leaves

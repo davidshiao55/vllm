@@ -85,6 +85,13 @@ if TYPE_CHECKING:
 # `__del__` / `close()` is the only thing that removes entries; if a
 # runner is GC'd without close() the __del__ unregisters there.
 _COTS_INFER: dict[int, Any] = {}
+# §1c.33: parallel registry for the per-runner
+# `(layer_idx, bucket, op_kind) -> task_id` map. Populated by
+# NativeCotsRunner.install via `_register_task_id_for`. Read by
+# the §1c.33 atexit dump so per-task fire counts can be
+# cross-referenced with their COTS-op descriptors without the
+# runner needing to live in EngineCore as a strong reference.
+_COTS_TASK_ID_FOR: dict[int, dict[tuple[int, int, str], int]] = {}
 _NEXT_RUNNER_ID = itertools.count(1)
 
 
@@ -100,6 +107,17 @@ def _register_infer(infer: Any) -> int:
 def _unregister_infer(runner_id: int) -> None:
     """Drop the registry entry for a runner. Idempotent."""
     _COTS_INFER.pop(runner_id, None)
+    _COTS_TASK_ID_FOR.pop(runner_id, None)
+
+
+def _register_task_id_for(
+    runner_id: int,
+    task_id_for: dict[tuple[int, int, str], int],
+) -> None:
+    """§1c.33: store the runner's task_id map so the atexit dump
+    can cross-reference per-task fire counts with their
+    (layer_idx, bucket, op_kind) descriptors."""
+    _COTS_TASK_ID_FOR[runner_id] = dict(task_id_for)
 
 
 def _lookup_infer(runner_id: int, op_name: str) -> Any:
@@ -173,6 +191,48 @@ def set_worker_affinity(runner_id: int, mask: int) -> None:
     call from `CotsOffloader.post_init` after install."""
     infer = _lookup_infer(runner_id, "set_worker_affinity")
     infer.set_worker_affinity(int(mask))
+
+
+def dump_task_resolved_fire_counts(
+    runner_id: int,
+    task_id_for: dict[tuple[int, int, str], int],
+) -> list[dict]:
+    """§1c.33: per-task fire counts cross-referenced with the
+    runner's `(layer_idx, bucket, op_kind) -> task_id` map.
+
+    Returns one record per (layer_idx, bucket, op_kind) in
+    sorted order. Each record:
+      {
+        "task_id": int,
+        "layer_idx": int,
+        "bucket": int,
+        "op_kind": str,
+        "fire_count": int,
+      }
+
+    Caller is responsible for resetting counters via
+    `infer.reset_counters()` to define the measurement window.
+    The fire-count counter is single relaxed atomic so per-fire
+    cost is ~1 ns; safe to leave always-on.
+    """
+    infer = _lookup_infer(runner_id, "dump_task_resolved_fire_counts")
+    raw = list(infer.get_task_fire_counts())  # type: ignore[attr-defined]
+    inverse: dict[int, tuple[int, int, str]] = {
+        tid: desc for desc, tid in task_id_for.items()
+    }
+    records = []
+    for tid in range(len(raw)):
+        layer, bucket, op_kind = inverse.get(tid, (-1, -1, "unknown"))
+        records.append(
+            {
+                "task_id": tid,
+                "layer_idx": layer,
+                "bucket": bucket,
+                "op_kind": op_kind,
+                "fire_count": int(raw[tid]),
+            }
+        )
+    return records
 
 
 def reset_all_counters() -> None:
@@ -474,3 +534,72 @@ def _dump_counters_at_exit() -> None:
 
 
 atexit.register(_dump_counters_at_exit)
+
+
+def _dump_task_fire_counts_at_exit() -> None:
+    """§1c.33: dump per-task fire counts, cross-referenced with
+    each (layer_idx, bucket, op_kind) descriptor, at process exit.
+    Gated by `VLLM_COTS_DUMP_TASK_FIRES=1`. Optionally write to
+    a file via `VLLM_COTS_DUMP_TASK_FIRES_FILE=/path/to.json`;
+    otherwise dump to stderr alongside the standard counters.
+
+    The file output is the auditable artifact for the §1c.32
+    op-count investigation: 35% more captured COTS ops/forward
+    than eager (76.7 vs 56.4), source unknown. Per-task fires
+    let us see which (layer, bucket, op_kind) tuples produce
+    the extras.
+    """
+    if os.environ.get("VLLM_COTS_DUMP_TASK_FIRES", "0") != "1":
+        return
+    if not _COTS_INFER:
+        return
+    file_path = os.environ.get("VLLM_COTS_DUMP_TASK_FIRES_FILE", "").strip()
+    out_records: dict[str, list[dict]] = {}
+    for rid in list(_COTS_INFER.keys()):
+        task_id_for = _COTS_TASK_ID_FOR.get(rid)
+        if task_id_for is None:
+            # Runner registered an infer but never reached install;
+            # nothing to attribute.
+            continue
+        try:
+            out_records[f"runner_{rid}"] = dump_task_resolved_fire_counts(
+                rid, task_id_for
+            )
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(
+                f"[cots §1c.33] runner_id={rid}: "
+                f"dump_task_resolved_fire_counts failed: {e}\n"
+            )
+            continue
+    if not out_records:
+        return
+    if file_path:
+        try:
+            import json as _json
+
+            with open(file_path, "w") as fh:
+                _json.dump(out_records, fh, indent=2, default=str)
+            sys.stderr.write(f"[cots §1c.33] per-task fire counts → {file_path}\n")
+        except OSError as e:
+            sys.stderr.write(
+                f"[cots §1c.33] write to {file_path} failed: {e}; "
+                f"falling back to stderr\n"
+            )
+            file_path = ""
+    if not file_path:
+        sys.stderr.write("\n[cots §1c.33 per-task fire counts]\n")
+        for runner_key, records in out_records.items():
+            sys.stderr.write(f"  {runner_key}:\n")
+            for rec in records:
+                if rec["fire_count"] == 0:
+                    continue
+                sys.stderr.write(
+                    f"    task_id={rec['task_id']:>3}  "
+                    f"layer={rec['layer_idx']:>2}  "
+                    f"bucket={rec['bucket']:>4}  "
+                    f"op_kind={rec['op_kind']:<11}  "
+                    f"fires={rec['fire_count']}\n"
+                )
+
+
+atexit.register(_dump_task_fire_counts_at_exit)

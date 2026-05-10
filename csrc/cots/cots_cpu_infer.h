@@ -88,6 +88,18 @@ struct alignas(64) TaskSlab {
   std::atomic<uint32_t> next_seq{0};
   std::atomic<bool> m3_installed{false};
 
+  // §1c.33: per-task fire counter. Incremented once per
+  // DispatchCallback invocation (the captured graph's host_fn
+  // fire OR the eager-mode equivalent). Read out via
+  // `CotsCpuInfer::get_task_fire_counts()` so the Python side
+  // can cross-reference each task_id with its
+  // (layer_idx, bucket, op_kind) descriptor and identify which
+  // tuples produce the captured-vs-eager op-count delta seen in
+  // §1c.32. Diagnostic only — production-default reads/writes
+  // are a single relaxed atomic add, on the order of 1 ns per
+  // dispatch_cb fire.
+  std::atomic<int64_t> fire_count{0};
+
   // §1c.22 review-fix: immutable bucket capacity, populated once at
   // install time from the (layer, bucket, op_kind) descriptor and
   // never written again. Replay-time byte accounting MUST read this
@@ -286,6 +298,17 @@ class CotsCpuInfer {
   // for `task_id`. Used by safety-gate tests to assert the
   // post_init wiring matches the config flag.
   bool m3_installed_for_task(int64_t task_id) const;
+
+  // §1c.33 diagnostic: per-task fire counts. Returns a vector of
+  // `slab.fire_count` values indexed by task_id (size = slab_count_).
+  // The Python side cross-references each index with the runner's
+  // `_task_id_for: dict[(layer_idx, bucket, op_kind), int]` to
+  // attribute fires to specific (layer, bucket, op_kind) tuples
+  // — used to identify which slabs produce the captured-vs-eager
+  // op-count delta documented in §1c.32. Read at any time;
+  // typically zeroed via `reset_counters()` between warmup and
+  // the measured window.
+  std::vector<int64_t> get_task_fire_counts() const;
 
   uint32_t m3_get_req_slot(int64_t task_id) const;
   uint32_t m3_get_done_slot(int64_t task_id) const;

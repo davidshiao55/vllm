@@ -460,6 +460,19 @@ bool CotsCpuInfer::m3_installed_for_task(int64_t task_id) const {
   return slabs_[task_id].m3_installed.load(std::memory_order_acquire);
 }
 
+std::vector<int64_t> CotsCpuInfer::get_task_fire_counts() const {
+  // §1c.33 diagnostic: dump per-slab fire counts in task_id order.
+  // The caller (cots_ops.py) cross-references the index with the
+  // runner's task_id_for map to attribute fires to specific
+  // (layer_idx, bucket, op_kind) tuples.
+  std::vector<int64_t> out;
+  out.reserve(static_cast<size_t>(slab_count_));
+  for (int64_t i = 0; i < slab_count_; ++i) {
+    out.push_back(slabs_[i].fire_count.load(std::memory_order_relaxed));
+  }
+  return out;
+}
+
 void CotsCpuInfer::submit_dryrun_burst(int64_t n) {
   check_error();
   for (int64_t i = 0; i < n; ++i) {
@@ -598,6 +611,11 @@ void CotsCpuInfer::DispatchCallback(void* user_data) {
     slab->enqueue_time_ns.store(now_ns(), std::memory_order_release);
     self->dispatch_cb_count_.fetch_add(1, std::memory_order_relaxed);
   }
+  // §1c.33 per-task fire counter. Always-on (single relaxed
+  // atomic add, ~1 ns); read out via get_task_fire_counts() to
+  // attribute the §1c.32 op-count delta to specific
+  // (layer, bucket, op_kind) tuples.
+  slab->fire_count.fetch_add(1, std::memory_order_relaxed);
   // §1c.29 commit 2 — M3 sequence publish. When M3 is installed
   // for this slab, increment the slab-local seq, capture it into
   // the worker lambda, ENQUEUE the lambda FIRST, THEN publish
@@ -1024,6 +1042,12 @@ void CotsCpuInfer::reset_counters() {
   worker_busy_total_ns_.store(0, std::memory_order_relaxed);
   worker_queue_wait_total_ns_.store(0, std::memory_order_relaxed);
   worker_clamp_override_count_.store(0, std::memory_order_relaxed);
+  // §1c.33 per-task fire counters.
+  if (slabs_) {
+    for (int64_t i = 0; i < slab_count_; ++i) {
+      slabs_[i].fire_count.store(0, std::memory_order_relaxed);
+    }
+  }
   // §1c.29 M3 diag counters. Lazy-allocated; only zero them
   // if they exist (i.e., M3 was installed at least once).
   if (m3_immediate_resume_host_) *m3_immediate_resume_host_ = 0;
