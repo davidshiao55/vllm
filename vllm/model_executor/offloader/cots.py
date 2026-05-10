@@ -1652,6 +1652,32 @@ class NativeCotsRunner:
                 self._runner_id, spec, tid, dry_run=self._dry_run
             )
         self._installed = True
+        # Cache n_slabs so install_m3 (separate post-install call,
+        # gated on the feature flag) doesn't have to re-walk
+        # task_id_for. Set last so any populate-time error leaves
+        # the cache empty.
+        self._n_slabs: int = n_slabs
+
+    def install_m3(self) -> None:
+        """§1c.29 commit 2: install host-mapped pinned req/done
+        slots for every slab in the pool. Must be called AFTER
+        `install()` and only when the offloader's feature flag
+        `cots_m3_wait_kernel=True`.
+
+        After this returns, every slab's `m3_installed=True`, the
+        captured `dispatch_cb` writes `req_slot=seq` per dispatch,
+        the worker writes `done_slot=seq` (in a finally-style
+        block) per dispatch, and `cots_sync_then_uva` routes
+        through the wait kernel via `sync_or_wait_on_stream`.
+        """
+        from vllm.model_executor.offloader import cots_ops
+
+        if not self._installed:
+            raise RuntimeError(
+                "NativeCotsRunner.install_m3() called before install(); "
+                "M3 needs the slab pool to exist first"
+            )
+        cots_ops.install_m3_for_all_tasks(self._runner_id, self._n_slabs)
 
     def submit_with_d2h(
         self,
@@ -3404,6 +3430,59 @@ class CotsOffloader(BaseOffloader):
                 "phase1c_findings.md §1c.23."
             )
 
+        # §1c.29 commit 2 — M3 wait-kernel safety gates. Hard-fail at
+        # post_init when the feature flag is set but a precondition is
+        # missing. We check BEFORE _install_runner so misconfigurations
+        # surface before any C++ slab allocation. The legacy
+        # cudaLaunchHostFunc(sync_cb) path stays the production default
+        # (cots_m3_wait_kernel=False) and is unchanged by these gates.
+        m3_enabled = bool(getattr(self.config, "cots_m3_wait_kernel", False))
+        if m3_enabled:
+            # Gate 1: native runner only. Python runner has no slabs /
+            # no host-mapped done_slot / no worker thread to publish.
+            if cpu_runner != "native":
+                raise RuntimeError(
+                    "CotsOffloader: cots_m3_wait_kernel=True requires "
+                    f"cpu_runner='native' (got {cpu_runner!r}). The Python "
+                    "runner has no host-mapped done_slot mechanism; the M3 "
+                    "wait kernel is meaningful only on the native substrate. "
+                    "Set cots_m3_wait_kernel=False or switch to "
+                    "cpu_runner='native'."
+                )
+            # Gate 2: graph-capture mode required. Eager mode launches
+            # and syncs each iteration, so the wait kernel adds
+            # round-trip cost without removing any captured sync_cb
+            # node — net negative.
+            if vllm_config.model_config.enforce_eager:
+                raise RuntimeError(
+                    "CotsOffloader: cots_m3_wait_kernel=True requires "
+                    "enforce_eager=False (graph-capture mode). The wait "
+                    "kernel replaces the captured sync_cb host_fn node; "
+                    "under enforce_eager=True there is no captured node to "
+                    "replace. Set cots_m3_wait_kernel=False or "
+                    "enforce_eager=False."
+                )
+            # Gate 3: CUDA available (defensive — native runner already
+            # requires CUDA, but a clearer error here pinpoints M3 as
+            # the configuration that needs the GPU).
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "CotsOffloader: cots_m3_wait_kernel=True requires "
+                    "CUDA to be available; the wait kernel runs on the "
+                    "GPU."
+                )
+            # Gate 4: _cots_C extension built (defensive — already
+            # required by NativeCotsRunner, but with the wait kernel
+            # we want a tight blame line if the build was partial).
+            try:
+                from vllm import _cots_C  # noqa: F401
+            except ImportError as e:
+                raise RuntimeError(
+                    "CotsOffloader: cots_m3_wait_kernel=True requires "
+                    "the `vllm._cots_C` extension. Rebuild vLLM with CUDA "
+                    f"support (./rebuild_vllm.sh). Underlying ImportError: {e}"
+                ) from e
+
         self._eager_fallback_entry = self._dispatch_table[self._capture_buckets[-1]]
 
         # Phase 1c Stage 3: install the runner's per-(layer, bucket,
@@ -3413,6 +3492,16 @@ class CotsOffloader(BaseOffloader):
         # `w_cpu`/`_x_pinned`/`_y_pinned` storages are stable
         # post-allocation regardless of when their views are taken.
         self._install_runner()
+
+        # §1c.29 commit 2 — install M3 host-mapped pinned slots once
+        # the slab pool exists. install_m3 walks every slab in the
+        # pool and allocates the req/done slot pair (and the diag
+        # counter cells lazily, only when VLLM_COTS_DIAG=1 — see
+        # commit 1 review-fix). After this returns, the captured
+        # graph's sync_cb host_fn nodes are replaced with wait kernel
+        # launches at every cots_sync_then_uva call site.
+        if m3_enabled and isinstance(self._runner, NativeCotsRunner):
+            self._runner.install_m3()
 
         # §1c.26 / §1c.27 ablation install. Probe-only: read five env
         # vars (VLLM_COTS_ABLATE_HOSTFN / SUBMIT_HOSTFN / SYNC_HOSTFN /

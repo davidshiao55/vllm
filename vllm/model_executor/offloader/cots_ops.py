@@ -151,6 +151,23 @@ def populate_slab_via_spec(
     spec.populate(infer, task_id, dry_run=dry_run)
 
 
+def install_m3_for_all_tasks(runner_id: int, n_slabs: int) -> None:
+    """§1c.29 commit 2: install M3 (host-mapped pinned req/done
+    slots, lazy diag-counter alloc when VLLM_COTS_DIAG=1) for
+    every slab in the pool. Called from `CotsOffloader.post_init`
+    only when `cots_m3_wait_kernel=True`.
+
+    Idempotent only at the offloader level — calling
+    `install_m3_for_task` twice for the same task_id raises
+    (idempotency violation; see §1c.29 design). The offloader
+    holds a single `_m3_installed` flag to make sure this helper
+    runs once per offloader.
+    """
+    infer = _lookup_infer(runner_id, "install_m3_for_all_tasks")
+    for tid in range(int(n_slabs)):
+        infer.install_m3_for_task(int(tid))
+
+
 def set_worker_affinity(runner_id: int, mask: int) -> None:
     """Pin the worker thread to a CPU set (uint64 bitmask). One-shot
     call from `CotsOffloader.post_init` after install."""
@@ -344,7 +361,16 @@ def _cots_sync_then_uva_impl(
     if _COTS_DIAG_ENABLED:
         torch.cuda.nvtx.range_push("cots:py_sync_then_uva")
     try:
-        infer.sync_on_stream(stream)
+        # §1c.29 commit 2: unified entry. C++ side branches per-slab
+        # on `slab.m3_installed` — when M3 was installed at offloader
+        # post_init under `cots_m3_wait_kernel=True`, the captured
+        # node is the wait kernel reading the worker-published
+        # `done_slot=seq`. Otherwise the captured node stays the
+        # legacy SyncCallback host_fn that blocks the driver thread
+        # on TaskQueue::sync(0). Python ALWAYS calls this entry —
+        # the A/B is controlled exclusively by whether the
+        # offloader installed M3 for this task at startup.
+        infer.sync_or_wait_on_stream(task_id, stream)
         # Build the CPU view over the slab pointer locally — never escapes
         # back to Python in a way Inductor would see.
         y_pinned = infer.y_pinned_view(task_id, num_tokens)

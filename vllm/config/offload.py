@@ -179,6 +179,32 @@ class CotsOffloadConfig:
     diagnostic — useful for verifying Phase 1c collapsed the orchestration
     column and for catching future regressions in the COTS host path."""
 
+    cots_m3_wait_kernel: bool = Field(default=False)
+    """Phase 1c §1c.29 M3 prototype: replace the captured
+    `cudaLaunchHostFunc(sync_cb)` node with a custom GPU wait kernel
+    that spins on a host-mapped pinned `done_slot` written by the
+    CPU worker. Submit-side host_fn (dispatch_cb) is unchanged so
+    CPU GEMM still starts overlapping immediately when the GPU
+    reaches the submit node. The split host_fn ablation (§1c.27)
+    showed the captured `sync_cb` host_fn alone costs ~273 ms cgl /
+    ~126 ms wall per generate at output_len=128, B=1, t=16, f=0.05
+    — that's the upper bound this flag tries to recover.
+
+    Hard-fail safety gates (commit 2 in `CotsOffloader.post_init`):
+    * Requires `cpu_runner='native'` — the Python runner cannot
+      participate (it has no slabs / no worker thread / no
+      host-mapped `done_slot`).
+    * Requires `enforce_eager=False` — the wait kernel is
+      meaningful only when the captured graph replays the wait
+      node; eager mode would launch+sync each iteration.
+    * Requires CUDA available + `_cots_C` extension built (defensive
+      checks; both are normal preconditions for `cpu_runner='native'`).
+
+    Defaults to False; the existing `cudaLaunchHostFunc(sync_cb)`
+    path stays in the codebase as the production default and as
+    the fall-back if M3 is found inadequate. See
+    `David/Docs/phase1c_findings.md` §1c.29."""
+
 
 @config
 class OffloadConfig:

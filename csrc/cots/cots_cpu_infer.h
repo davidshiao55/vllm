@@ -223,6 +223,19 @@ class CotsCpuInfer {
   // thread on `task_queue_->sync(0)`.
   void sync_on_stream(uintptr_t cuda_stream);
 
+  // §1c.29 commit 2 — unified sync/wait dispatch. Per-slab choice
+  // based on `slab.m3_installed`: when M3 is installed for this
+  // task (offloader called `install_m3_for_task` in post_init under
+  // `cots_m3_wait_kernel=True`), the captured graph node is the
+  // M3 wait kernel reading the worker-published `done_slot=seq`.
+  // Otherwise the captured node is the legacy
+  // `cudaLaunchHostFunc(SyncCallback)` blocking the driver thread
+  // on `TaskQueue::sync(0)`. The Python side
+  // (`cots_sync_then_uva`) ALWAYS calls this entry; the A/B is
+  // controlled exclusively by whether the offloader installed M3
+  // for this task at startup.
+  void sync_or_wait_on_stream(int64_t task_id, uintptr_t cuda_stream);
+
   // Test-only / Python-side helpers (not in the captured-graph hot path).
   // Submit N dryrun_noop tasks directly via TaskQueue::enqueue (no CUDA
   // stream / host callback involved). Used by test_taskqueue_stress.
@@ -266,6 +279,11 @@ class CotsCpuInfer {
   // the unit smoke (test_m3_wait_kernel_smoke.py) to drive the
   // wait kernel in isolation. NOT used on the captured-graph
   // hot path.
+  // Test helper: query whether `install_m3_for_task` was called
+  // for `task_id`. Used by safety-gate tests to assert the
+  // post_init wiring matches the config flag.
+  bool m3_installed_for_task(int64_t task_id) const;
+
   uint32_t m3_get_req_slot(int64_t task_id) const;
   uint32_t m3_get_done_slot(int64_t task_id) const;
   void m3_set_req_slot(int64_t task_id, uint32_t value);
@@ -403,8 +421,15 @@ class CotsCpuInfer {
   static void DispatchCallback(void* user_data);
   static void SyncCallback(void* user_data);
 
-  // Worker-thread task body; runs whatever op_kind says.
-  void RunSlabOnWorker(TaskSlab* slab);
+  // Worker-thread task body; runs whatever op_kind says. The `seq`
+  // parameter (0 == no M3, > 0 == M3 enabled for this dispatch)
+  // controls whether the worker publishes `done_slot = seq` after
+  // the task completes — see §1c.29 commit 2. The publish is in a
+  // finally-style block so a worker exception still releases the
+  // captured wait kernel (otherwise `m3_wait_kernel` would spin
+  // forever on `done < req` and the GPU stream would deadlock,
+  // hiding the error from Python).
+  void RunSlabOnWorker(TaskSlab* slab, uint32_t seq);
 
   std::unique_ptr<TaskQueue> task_queue_;
 

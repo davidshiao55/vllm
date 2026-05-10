@@ -48,6 +48,15 @@ PYBIND11_MODULE(_cots_C, m) {
            py::arg("cuda_stream"))
       .def("sync_on_stream", &CotsCpuInfer::sync_on_stream,
            py::arg("cuda_stream"))
+      // §1c.29 commit 2 — unified entry. Always called by
+      // `cots_sync_then_uva`'s impl; per-slab branch into
+      // sync_on_stream or m3_wait_on_stream lives in C++ so the
+      // Python side does not need to know which mechanism each
+      // task uses.
+      .def("sync_or_wait_on_stream", &CotsCpuInfer::sync_or_wait_on_stream,
+           py::arg("task_id"), py::arg("cuda_stream"))
+      .def("m3_installed_for_task", &CotsCpuInfer::m3_installed_for_task,
+           py::arg("task_id"))
       .def("submit_dryrun_burst", &CotsCpuInfer::submit_dryrun_burst,
            py::arg("n"))
       .def("sync_blocking", &CotsCpuInfer::sync_blocking)
