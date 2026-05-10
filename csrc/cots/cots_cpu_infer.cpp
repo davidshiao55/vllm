@@ -1051,6 +1051,14 @@ void CotsCpuInfer::m3_wait_on_stream(int64_t task_id, uintptr_t cuda_stream) {
                                      static_cast<uint32_t*>(s.dev_done_slot),
                                      stream);
   }
+  // §1c.29 commit 1 review-fix-2: surface launch errors here, not
+  // at the next stream sync. cudaGetLastError catches sync errors
+  // (invalid kernel config, bad stream, etc.); async kernel-runtime
+  // errors will still surface at the next sync, but this gives a
+  // tight blame-line for any launch-config bug in commit 2.
+  cudaError_t le = cudaGetLastError();
+  TORCH_CHECK(le == cudaSuccess, "m3_wait_on_stream: kernel launch failed: ",
+              cudaGetErrorString(le));
 }
 
 uint32_t CotsCpuInfer::m3_get_req_slot(int64_t task_id) const {
