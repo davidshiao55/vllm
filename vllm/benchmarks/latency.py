@@ -9,6 +9,7 @@ import time
 from typing import Any
 
 import numpy as np
+import torch
 from tqdm import tqdm
 
 from vllm.benchmarks.lib.utils import convert_to_pytorch_benchmark_format, write_to_json
@@ -120,6 +121,34 @@ def main(args: argparse.Namespace):
                 ),
             )
 
+    # §1c.24: env-gated NVTX marker around each non-profile run. Each
+    # call to `run_to_completion(do_profile=False)` (warmup AND
+    # measured iters) gets its own marker pair; nsys post-processing
+    # filters by selecting the LAST marker instance per arm (the
+    # measured iter, since vLLM appends in time order). Best-effort
+    # counter reset before each marker so the atexit dump
+    # approximates the measured iter when num_iters_warmup >= 1
+    # (the reset wipes warmup activity); the dump still bundles
+    # whatever ran post-final-reset, so for clean per-iter accounting
+    # use --num-iters 1.
+    _diag_enabled = os.environ.get("VLLM_COTS_DIAG", "0") == "1"
+
+    def _diag_pre():
+        if not _diag_enabled:
+            return
+        try:
+            from vllm.model_executor.offloader import cots_ops as _cots_ops
+
+            _cots_ops.reset_all_counters()
+        except Exception:
+            pass
+        torch.cuda.nvtx.range_push("cots:bench_iter")
+
+    def _diag_post():
+        if not _diag_enabled:
+            return
+        torch.cuda.nvtx.range_pop()
+
     def run_to_completion(do_profile: bool = False):
         if do_profile:
             llm.start_profile()
@@ -127,7 +156,14 @@ def main(args: argparse.Namespace):
             llm.stop_profile()
         else:
             start_time = time.perf_counter()
-            llm_generate()
+            _diag_pre()
+            try:
+                llm_generate()
+            finally:
+                # Always pop the NVTX marker, even if llm_generate()
+                # raised — leaving the NVTX stack unbalanced poisons
+                # later events on this thread.
+                _diag_post()
             end_time = time.perf_counter()
             latency = end_time - start_time
             return latency

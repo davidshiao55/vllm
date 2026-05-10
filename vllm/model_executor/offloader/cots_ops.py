@@ -55,6 +55,12 @@ import torch
 
 from vllm.utils.torch_utils import direct_register_custom_op
 
+# §1c.24: env-gated diagnostic flag. When 0 (default), the NVTX
+# range_push/pop pairs in the custom-op impls are skipped — they
+# cost ~hundreds of ns each across the 7k+ hot-path calls per
+# generate.
+_COTS_DIAG_ENABLED = os.environ.get("VLLM_COTS_DIAG", "0") == "1"
+
 if TYPE_CHECKING:
     # Type-only import; avoids forcing _cots_C at module load on
     # non-CUDA builds.
@@ -253,18 +259,28 @@ def _cots_submit_gemm_impl(
     )
     infer = _lookup_infer(runner_id, "cots_submit_gemm")
     stream = torch.cuda.current_stream().cuda_stream
-    # Pass shape/stride so the C++ D2H can dispatch the right
-    # cudaMemcpy* variant — see CotsCpuInfer::submit_on_stream for
-    # the 1D-vs-2D branch.
-    infer.submit_on_stream(
-        task_id,
-        num_tokens,
-        x_gpu.data_ptr(),
-        x_gpu.shape[1],
-        x_gpu.stride(0),
-        x_gpu.stride(1),
-        stream,
-    )
+    # §1c.24: NVTX scope so the nsys timeline can attribute the
+    # Python-side dispatch boundary separately from the C++ submit
+    # body's d2h_record / launch_dispatch_cb sub-ranges. Env-gated
+    # (VLLM_COTS_DIAG=1) — diagnostic only, off by default.
+    if _COTS_DIAG_ENABLED:
+        torch.cuda.nvtx.range_push("cots:py_submit_gemm")
+    try:
+        # Pass shape/stride so the C++ D2H can dispatch the right
+        # cudaMemcpy* variant — see CotsCpuInfer::submit_on_stream for
+        # the 1D-vs-2D branch.
+        infer.submit_on_stream(
+            task_id,
+            num_tokens,
+            x_gpu.data_ptr(),
+            x_gpu.shape[1],
+            x_gpu.stride(0),
+            x_gpu.stride(1),
+            stream,
+        )
+    finally:
+        if _COTS_DIAG_ENABLED:
+            torch.cuda.nvtx.range_pop()
 
 
 def _cots_submit_gemm_fake(
@@ -311,27 +327,30 @@ def _cots_sync_then_uva_impl(
     """
     infer = _lookup_infer(runner_id, "cots_sync_then_uva")
     stream = torch.cuda.current_stream().cuda_stream
-    infer.sync_on_stream(stream)
-    # Build the CPU view over the slab pointer locally — never escapes
-    # back to Python in a way Inductor would see.
-    y_pinned = infer.y_pinned_view(task_id, num_tokens)
-    # §1c.22 measurement: bumps `uva_record_bytes` /
-    # `uva_record_count` — record-time only, since this Python impl
-    # runs once during graph capture but NOT on replay. For
-    # per-replay UVA bytes use `uva_replay_bucket_bytes_`
-    # (incremented in C++ RunSlabOnWorker which fires per replay).
-    # Compare record-time numbers against
-    # `worker_output_live_bytes` for the over-transfer ratio at
-    # the record/warmup scope; per-replay diagnostics need the
-    # corresponding `*_replay_bucket_bytes_` fields.
-    infer.note_uva_request(num_tokens, y_pinned.shape[1])
-    # Lazy import to avoid a top-level circular import (cots.py imports
-    # this module via cots_ops and we'd loop on `from .cots import ...`).
-    from vllm.model_executor.offloader.cots import (
-        _uva_copy_trusted_host_into_gpu,
-    )
+    if _COTS_DIAG_ENABLED:
+        torch.cuda.nvtx.range_push("cots:py_sync_then_uva")
+    try:
+        infer.sync_on_stream(stream)
+        # Build the CPU view over the slab pointer locally — never escapes
+        # back to Python in a way Inductor would see.
+        y_pinned = infer.y_pinned_view(task_id, num_tokens)
+        infer.note_uva_request(num_tokens, y_pinned.shape[1])
+        # Lazy import to avoid a top-level circular import (cots.py imports
+        # this module via cots_ops and we'd loop on `from .cots import ...`).
+        from vllm.model_executor.offloader.cots import (
+            _uva_copy_trusted_host_into_gpu,
+        )
 
-    _uva_copy_trusted_host_into_gpu(y_pinned, y_gpu)
+        if _COTS_DIAG_ENABLED:
+            torch.cuda.nvtx.range_push("cots:py_uva_copy")
+        try:
+            _uva_copy_trusted_host_into_gpu(y_pinned, y_gpu)
+        finally:
+            if _COTS_DIAG_ENABLED:
+                torch.cuda.nvtx.range_pop()
+    finally:
+        if _COTS_DIAG_ENABLED:
+            torch.cuda.nvtx.range_pop()
 
 
 def _cots_sync_then_uva_fake(

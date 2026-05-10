@@ -64,6 +64,12 @@ struct alignas(64) TaskSlab {
   // worker dequeue (CUDA stream ordering + cv_ notify in TaskQueue::enqueue).
   std::atomic<int32_t> num_tokens{0};
 
+  // §1c.24 diagnostic-only: written in DispatchCallback when
+  // VLLM_COTS_DIAG=1 so the worker can attribute (worker_start −
+  // enqueue_time) as TaskQueue wait. 0 = unset (production-default
+  // mode never writes this).
+  std::atomic<int64_t> enqueue_time_ns{0};
+
   // §1c.22 review-fix: immutable bucket capacity, populated once at
   // install time from the (layer, bucket, op_kind) descriptor and
   // never written again. Replay-time byte accounting MUST read this
@@ -447,6 +453,27 @@ class CotsCpuInfer {
   // UVA bytes use `uva_replay_bucket_bytes_` above.
   std::atomic<int64_t> uva_record_bytes_{0};
   std::atomic<int64_t> uva_record_count_{0};
+
+  // §1c.24 diagnostic attribution counters. Wall-clock totals
+  // (steady_clock ns) and invocation counts that let the bench
+  // summary split a generate's COTS time into worker compute,
+  // queue wait, sync wait, and dispatch_cb fires — without nsys.
+  // Useful as a quick check when nsys is unavailable; nsys NVTX
+  // markers (also gated by VLLM_COTS_DIAG=1) are the primary tool
+  // for full timeline attribution. All increments are gated on
+  // `nvtx_internal::diag_enabled()` in the .cpp so this is purely
+  // diagnostic — the production-default hot path skips the
+  // timestamp + atomic-add work entirely.
+  std::atomic<int64_t> dispatch_cb_count_{0};
+  std::atomic<int64_t> sync_cb_count_{0};
+  std::atomic<int64_t> sync_cb_wait_total_ns_{0};
+  std::atomic<int64_t> worker_run_count_{0};
+  std::atomic<int64_t> worker_busy_total_ns_{0};
+  // (worker_start - dispatch_cb_enqueue_time) per task. Time the
+  // task spent waiting in the TaskQueue cv before the worker picked
+  // it up. Distinct from `sync_cb_wait_total_ns_` (the driver
+  // thread's wait inside SyncCallback).
+  std::atomic<int64_t> worker_queue_wait_total_ns_{0};
 };
 
 }  // namespace cots

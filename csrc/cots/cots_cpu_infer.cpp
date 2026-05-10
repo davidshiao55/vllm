@@ -8,10 +8,13 @@
 #include <ATen/ops/linear.h>
 #include <ATen/ops/silu.h>
 #include <c10/core/InferenceMode.h>
+#include <nvtx3/nvToolsExt.h>
 #include <pthread.h>
 #include <sched.h>
 #include <torch/torch.h>
 
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <stdexcept>
@@ -23,6 +26,39 @@ namespace cots {
 namespace {
 
 constexpr int kMaxCpus = 64;
+
+// §1c.24 instrumentation. NVTX ranges around the hot paths so nsys
+// timeline can attribute time to the specific COTS phase. Gated by
+// `VLLM_COTS_DIAG=1` (read once at first call) — when no profiler is
+// attached `nvtxRangePush*` is a near-no-op but it still costs ~10ns
+// in dispatch, which adds up across 7k+ hot-path calls per generate.
+// Diagnostic-only; the production hot path stays clean.
+namespace nvtx_internal {
+inline bool diag_enabled() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("VLLM_COTS_DIAG");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+  }();
+  return enabled;
+}
+}  // namespace nvtx_internal
+
+struct NvtxScope {
+  explicit NvtxScope(const char* name) {
+    if (nvtx_internal::diag_enabled()) nvtxRangePushA(name);
+  }
+  ~NvtxScope() {
+    if (nvtx_internal::diag_enabled()) nvtxRangePop();
+  }
+  NvtxScope(const NvtxScope&) = delete;
+  NvtxScope& operator=(const NvtxScope&) = delete;
+};
+
+inline int64_t now_ns() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
 
 // Phase 1c is bfloat16-locked (see header comment + cpu_dtype literal in
 // `vllm/config/offload.py`). Centralizing the dtype here keeps the slab
@@ -194,6 +230,7 @@ void CotsCpuInfer::submit_on_stream(int64_t task_id, int32_t num_tokens,
                                     uintptr_t x_gpu_ptr, int64_t x_cols,
                                     int64_t x_stride0, int64_t x_stride1,
                                     uintptr_t cuda_stream) {
+  NvtxScope nvtx_scope("cots:submit_on_stream");
   // Surface any prior worker error BEFORE queueing more work.
   check_error();
   TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
@@ -271,6 +308,7 @@ void CotsCpuInfer::submit_on_stream(int64_t task_id, int32_t num_tokens,
     const size_t width_bytes =
         static_cast<size_t>(slab->in_dim) * sizeof(at::BFloat16);
     cudaError_t copy_err;
+    NvtxScope d2h_scope("cots:d2h_record");
     if (x_stride0 == x_cols) {
       // Contiguous row layout — single 1D copy is fastest.
       const size_t bytes = static_cast<size_t>(num_tokens) * width_bytes;
@@ -301,6 +339,7 @@ void CotsCpuInfer::submit_on_stream(int64_t task_id, int32_t num_tokens,
                 (x_stride0 == x_cols ? "1D" : "2D"),
                 "): ", cudaGetErrorString(copy_err));
   }
+  NvtxScope launch_scope("cots:launch_dispatch_cb");
   cudaError_t err = cudaLaunchHostFunc(stream, &CotsCpuInfer::DispatchCallback,
                                        static_cast<void*>(slab));
   TORCH_CHECK(
@@ -309,6 +348,7 @@ void CotsCpuInfer::submit_on_stream(int64_t task_id, int32_t num_tokens,
 }
 
 void CotsCpuInfer::sync_on_stream(uintptr_t cuda_stream) {
+  NvtxScope nvtx_scope("cots:sync_on_stream");
   check_error();
   // sync_args_ is a stable member of *this; safe to take its address as
   // userData for cudaLaunchHostFunc, including across CUDA graph replays.
@@ -435,8 +475,19 @@ at::Tensor CotsCpuInfer::y_pinned_view(int64_t task_id,
 // block (CUDA stream is paused while we run). Just enqueues to the
 // TaskQueue worker.
 void CotsCpuInfer::DispatchCallback(void* user_data) {
+  NvtxScope nvtx_scope("cots:dispatch_cb");
   TaskSlab* slab = static_cast<TaskSlab*>(user_data);
   CotsCpuInfer* self = static_cast<CotsCpuInfer*>(slab->self);
+  // §1c.24 attribution: stamp enqueue time so the worker can later
+  // compute queue_wait = worker_start - enqueue_time. Gated together
+  // with the NVTX scopes by VLLM_COTS_DIAG=1; in production-default
+  // mode neither now_ns() nor the atomic write fires. Worker reads
+  // enqueue_time_ns conditionally on the same flag, so a
+  // diag-disabled run leaves it at its initial value (0).
+  if (nvtx_internal::diag_enabled()) {
+    slab->enqueue_time_ns.store(now_ns(), std::memory_order_release);
+    self->dispatch_cb_count_.fetch_add(1, std::memory_order_relaxed);
+  }
   // Copy the pointer into the lambda capture; this is safe because
   // `slab` is a member of `self->slabs_` which is reserve-once.
   self->task_queue_->enqueue([self, slab] { self->RunSlabOnWorker(slab); });
@@ -445,14 +496,54 @@ void CotsCpuInfer::DispatchCallback(void* user_data) {
 // Sync-side host callback. Blocks the CUDA driver thread until the
 // TaskQueue drains. The user_data is `&self->sync_args_` (stable member).
 void CotsCpuInfer::SyncCallback(void* user_data) {
+  NvtxScope nvtx_scope("cots:sync_cb_wait");
   SyncArgs* args = static_cast<SyncArgs*>(user_data);
   CotsCpuInfer* self = static_cast<CotsCpuInfer*>(args->infer);
-  self->task_queue_->sync(args->allow_n_pending);
+  // §1c.24 attribution: time the sync wait — distinguishes "driver
+  // blocked waiting for the worker" from "driver doing other work
+  // then unblocking immediately". Same VLLM_COTS_DIAG gate as the
+  // dispatch counter; in production-default mode the timestamps
+  // and atomic adds are skipped.
+  if (nvtx_internal::diag_enabled()) {
+    const int64_t t0 = now_ns();
+    self->task_queue_->sync(args->allow_n_pending);
+    const int64_t t1 = now_ns();
+    self->sync_cb_wait_total_ns_.fetch_add(t1 - t0, std::memory_order_relaxed);
+    self->sync_cb_count_.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    self->task_queue_->sync(args->allow_n_pending);
+  }
 }
 
 // --- worker-thread task body ----------------------------------------------
 
 void CotsCpuInfer::RunSlabOnWorker(TaskSlab* slab) {
+  // §1c.24 attribution: stamp worker start + queue wait, gated by
+  // VLLM_COTS_DIAG. Production-default leaves worker_t0 at 0 (the
+  // worker_busy_total_ns add at the end is also gated). NVTX scope
+  // is independently gated inside NvtxScope's ctor.
+  const bool diag = nvtx_internal::diag_enabled();
+  const int64_t worker_t0 = diag ? now_ns() : 0;
+  if (diag) {
+    const int64_t enq = slab->enqueue_time_ns.load(std::memory_order_acquire);
+    if (enq > 0) {
+      worker_queue_wait_total_ns_.fetch_add(worker_t0 - enq,
+                                            std::memory_order_relaxed);
+    }
+  }
+  const char* nvtx_name = "cots:worker";
+  switch (slab->op_kind) {
+    case TaskSlab::kQkv:
+      nvtx_name = "cots:worker_qkv";
+      break;
+    case TaskSlab::kMlpBlock:
+      nvtx_name = "cots:worker_mlp";
+      break;
+    case TaskSlab::kDryrunNoop:
+      nvtx_name = "cots:worker_dryrun";
+      break;
+  }
+  NvtxScope nvtx_scope(nvtx_name);
   // Worker exception policy: every body wrapped in try/catch so that
   // pending-decrement / cv_ notify in TaskQueue::Worker still happens
   // (we return normally from this function), and the next Python-side
@@ -621,6 +712,14 @@ void CotsCpuInfer::RunSlabOnWorker(TaskSlab* slab) {
     last_error_msg_ = "[cots worker] unknown exception";
     has_error_.store(true, std::memory_order_release);
   }
+  // §1c.24: worker compute duration (NVTX scope ends when the
+  // function returns; this counter sums it for the bench summary).
+  // Gated together with the start-of-function timestamp.
+  if (diag) {
+    worker_busy_total_ns_.fetch_add(now_ns() - worker_t0,
+                                    std::memory_order_relaxed);
+    worker_run_count_.fetch_add(1, std::memory_order_relaxed);
+  }
 }
 
 // --- §1c.21 live-token override ---------------------------------------
@@ -700,6 +799,14 @@ std::vector<std::pair<std::string, int64_t>> CotsCpuInfer::get_counters()
   // note_uva_request).
   out.emplace_back("uva_record_bytes", load(uva_record_bytes_));
   out.emplace_back("uva_record_count", load(uva_record_count_));
+  // §1c.24 attribution counters. ns totals + invocation counts.
+  out.emplace_back("dispatch_cb_count", load(dispatch_cb_count_));
+  out.emplace_back("sync_cb_count", load(sync_cb_count_));
+  out.emplace_back("sync_cb_wait_total_ns", load(sync_cb_wait_total_ns_));
+  out.emplace_back("worker_run_count", load(worker_run_count_));
+  out.emplace_back("worker_busy_total_ns", load(worker_busy_total_ns_));
+  out.emplace_back("worker_queue_wait_total_ns",
+                   load(worker_queue_wait_total_ns_));
   return out;
 }
 
@@ -727,6 +834,13 @@ void CotsCpuInfer::reset_counters() {
   uva_record_count_.store(0, std::memory_order_relaxed);
   d2h_replay_bucket_bytes_.store(0, std::memory_order_relaxed);
   uva_replay_bucket_bytes_.store(0, std::memory_order_relaxed);
+  // §1c.24 attribution counters.
+  dispatch_cb_count_.store(0, std::memory_order_relaxed);
+  sync_cb_count_.store(0, std::memory_order_relaxed);
+  sync_cb_wait_total_ns_.store(0, std::memory_order_relaxed);
+  worker_run_count_.store(0, std::memory_order_relaxed);
+  worker_busy_total_ns_.store(0, std::memory_order_relaxed);
+  worker_queue_wait_total_ns_.store(0, std::memory_order_relaxed);
 }
 
 }  // namespace cots
