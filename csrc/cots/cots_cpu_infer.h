@@ -582,6 +582,15 @@ class CotsCpuInfer {
   // it up. Distinct from `sync_cb_wait_total_ns_` (the driver
   // thread's wait inside SyncCallback).
   std::atomic<int64_t> worker_queue_wait_total_ns_{0};
+  // §1c.31: counts replays where `runtime_num_tokens > slab.num_tokens`
+  // — the global live-token override was set for a larger row count
+  // than this slab's bucket can hold. The worker clamps to slab
+  // capacity rather than reading past the pinned buffer's tail. Most
+  // common under eager mode where the global override applies to
+  // whatever slab fires next, regardless of which bucket sized it.
+  // Surfaced via get_counters(); non-zero means at least one
+  // submit/replay was clamped (informational, not an error).
+  std::atomic<int64_t> worker_clamp_override_count_{0};
 
   // §1c.26 / §1c.27 ablation flags. Probe-only; gated by Python
   // install checking dry_run + VLLM_COTS_DIAG. See set_ablations()

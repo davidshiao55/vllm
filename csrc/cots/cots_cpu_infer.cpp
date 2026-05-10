@@ -705,17 +705,31 @@ void CotsCpuInfer::RunSlabOnWorker(TaskSlab* slab, uint32_t seq) {
     // §1c.21: prefer runtime_num_tokens_ (live unpadded count, set
     // OUT OF GRAPH by `set_runtime_num_tokens` before each captured
     // replay) over `slab->num_tokens` (captured bucket capacity).
-    // Sentinel 0 → fall back to slab capacity; bounded by
-    // effective_n <= slab->num_tokens so the worker never reads past
-    // the slab's pinned buffer.
+    // Sentinel 0 → fall back to slab capacity.
+    //
+    // §1c.31 (commit-3-real fix): the override is a CAP, not a
+    // required row count. If it exceeds slab capacity, clamp to
+    // slab_cap and bump worker_clamp_override_count_ for
+    // observability. Pinned-buffer reads past slab_cap rows is UB,
+    // so the clamp is the safe behavior. This commonly happens in
+    // eager mode where set_runtime_num_tokens() applies globally to
+    // whatever slab fires next, regardless of which bucket sized
+    // that slab (e.g., B=4 prefill at input_len=8 → 32 tokens, but
+    // an MLP slab keyed by the smallest bucket has capacity 8).
     const int32_t slab_cap = slab->num_tokens.load(std::memory_order_acquire);
     const int32_t override_n =
         runtime_num_tokens_.load(std::memory_order_acquire);
-    const int32_t n = (override_n > 0) ? override_n : slab_cap;
-    TORCH_CHECK(n <= slab_cap, "RunSlabOnWorker: runtime_num_tokens=", n,
-                " exceeds slab capacity (slab.num_tokens=", slab_cap,
-                ") at task_id=", static_cast<int64_t>(slab - slabs_.get()),
-                " — would read past the pinned buffer's tail");
+    int32_t n;
+    if (override_n > 0) {
+      if (override_n > slab_cap) {
+        n = slab_cap;
+        worker_clamp_override_count_.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        n = override_n;
+      }
+    } else {
+      n = slab_cap;
+    }
 
     // §1c.21 fix-validation: bin the effective_n the worker
     // actually used. If submit-time num_tokens histogram is mostly
@@ -962,6 +976,8 @@ std::vector<std::pair<std::string, int64_t>> CotsCpuInfer::get_counters()
   out.emplace_back("worker_busy_total_ns", load(worker_busy_total_ns_));
   out.emplace_back("worker_queue_wait_total_ns",
                    load(worker_queue_wait_total_ns_));
+  out.emplace_back("worker_clamp_override_count",
+                   load(worker_clamp_override_count_));
   // §1c.29 M3 diag counters. Populated only when
   // `VLLM_COTS_DIAG=1` AND a captured graph that fires
   // `m3_wait_kernel_diag` runs (production-default path skips
@@ -1007,6 +1023,7 @@ void CotsCpuInfer::reset_counters() {
   worker_run_count_.store(0, std::memory_order_relaxed);
   worker_busy_total_ns_.store(0, std::memory_order_relaxed);
   worker_queue_wait_total_ns_.store(0, std::memory_order_relaxed);
+  worker_clamp_override_count_.store(0, std::memory_order_relaxed);
   // §1c.29 M3 diag counters. Lazy-allocated; only zero them
   // if they exist (i.e., M3 was installed at least once).
   if (m3_immediate_resume_host_) *m3_immediate_resume_host_ = 0;
