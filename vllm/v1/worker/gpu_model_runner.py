@@ -103,6 +103,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.tracing import instrument
 from vllm.utils import length_from_prompt_token_ids_or_embeds
+from vllm.utils.cots_diag import ENABLED as _COTS_DIAG_ENABLED
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.nvtx_pytorch_hooks import PytHooks
@@ -3772,6 +3773,22 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        # §1c.25: fast path skips the NVTX wrapper entirely when
+        # VLLM_COTS_DIAG=0 — single attr load + branch, no
+        # range_push/pop call cost on the per-forward hot path.
+        if not _COTS_DIAG_ENABLED:
+            return self._execute_model_impl(scheduler_output, intermediate_tensors)
+        torch.cuda.nvtx.range_push("cots:execute_model")
+        try:
+            return self._execute_model_impl(scheduler_output, intermediate_tensors)
+        finally:
+            torch.cuda.nvtx.range_pop()
+
+    def _execute_model_impl(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -4041,13 +4058,36 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
+            # §1c.25: NVTX around the model call tagged with dispatch
+            # mode. Fast path skips both the mode-name string build
+            # AND the NVTX call when VLLM_COTS_DIAG=0.
+            if not _COTS_DIAG_ENABLED:
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+            else:
+                _mode_name = (
+                    "FULL"
+                    if cudagraph_mode == CUDAGraphMode.FULL
+                    else "PIECEWISE"
+                    if cudagraph_mode == CUDAGraphMode.PIECEWISE
+                    else "NONE"
+                )
+                torch.cuda.nvtx.range_push(f"cots:model_forward[{_mode_name}]")
+                try:
+                    model_output = self._model_forward(
+                        input_ids=input_ids,
+                        positions=positions,
+                        intermediate_tensors=intermediate_tensors,
+                        inputs_embeds=inputs_embeds,
+                        **model_kwargs,
+                    )
+                finally:
+                    torch.cuda.nvtx.range_pop()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:

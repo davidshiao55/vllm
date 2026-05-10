@@ -53,13 +53,8 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from vllm.utils.cots_diag import ENABLED as _COTS_DIAG_ENABLED
 from vllm.utils.torch_utils import direct_register_custom_op
-
-# §1c.24: env-gated diagnostic flag. When 0 (default), the NVTX
-# range_push/pop pairs in the custom-op impls are skipped — they
-# cost ~hundreds of ns each across the 7k+ hot-path calls per
-# generate.
-_COTS_DIAG_ENABLED = os.environ.get("VLLM_COTS_DIAG", "0") == "1"
 
 if TYPE_CHECKING:
     # Type-only import; avoids forcing _cots_C at module load on

@@ -21,6 +21,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.utils.cots_diag import ENABLED as _COTS_DIAG_ENABLED
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
@@ -278,20 +279,42 @@ class CudaGraphManager:
         # H2D copies on copy_stream that the graph's captured events
         # cannot see. Without this, replay could overwrite static buffers
         # while those copies are still in flight.
+        # §1c.25 — diagnostic NVTX around FULL replay boundaries
+        # (latent on the v1 active runner path; only fires under the
+        # spec-decode / older runner that calls
+        # `cudagraph_manager.run_fullgraph`). Env-gated by
+        # VLLM_COTS_DIAG=1; production default skips the wrapper.
         offloader = get_offloader()
-        # §1c.21: push the live unpadded token count to the offloader's
-        # C++ worker BEFORE prepare_before_forward (which stays
-        # Dynamo-clean for the captured pre-hook path). No-op for
-        # offloaders that don't override the default.
-        if actual_num_tokens is not None:
-            offloader.set_runtime_num_tokens(actual_num_tokens)
-        # FULL graph replay bypasses Python model hooks, so repair any
-        # active-bucket state that normally lives in forward pre-hooks.
-        # A single sync after repair drains both prior copy-stream work
-        # and any repair H2Ds before graph execution begins.
-        offloader.prepare_before_forward(desc.num_tokens)
-        offloader.sync_prev_onload()
-        self.graphs[desc].replay()
+        if not _COTS_DIAG_ENABLED:
+            if actual_num_tokens is not None:
+                offloader.set_runtime_num_tokens(actual_num_tokens)
+            offloader.prepare_before_forward(desc.num_tokens)
+            offloader.sync_prev_onload()
+            self.graphs[desc].replay()
+            return
+        torch.cuda.nvtx.range_push("cots:replay_prep_full")
+        try:
+            # §1c.21: push the live unpadded token count to the
+            # offloader's C++ worker BEFORE prepare_before_forward
+            # (which stays Dynamo-clean for the captured pre-hook
+            # path). No-op for offloaders that don't override the
+            # default.
+            if actual_num_tokens is not None:
+                offloader.set_runtime_num_tokens(actual_num_tokens)
+            # FULL graph replay bypasses Python model hooks, so repair
+            # any active-bucket state that normally lives in forward
+            # pre-hooks. A single sync after repair drains both prior
+            # copy-stream work and any repair H2Ds before graph
+            # execution begins.
+            offloader.prepare_before_forward(desc.num_tokens)
+            offloader.sync_prev_onload()
+        finally:
+            torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("cots:cudagraph_replay_full")
+        try:
+            self.graphs[desc].replay()
+        finally:
+            torch.cuda.nvtx.range_pop()
 
 
 class ModelCudaGraphManager(CudaGraphManager):

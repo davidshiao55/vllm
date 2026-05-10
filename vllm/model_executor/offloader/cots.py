@@ -2261,6 +2261,12 @@ def _scatter_col_outputs_three_way(
       `out_perm is None`     → skipped (f_cpu_store=1.0; permanent slice empty).
       `out_pref is None`     → skipped (f_prefetch=0).
       `out_cpu_on_gpu is None` → skipped (n_cpu_compute=0)."""
+    # §1c.25 note: a Python-side NVTX scope here would only fire at
+    # trace time, not on captured-graph replay (NVTX range_push/pop
+    # are host CPU calls, not stream ops; they don't get captured).
+    # Per-replay scatter cost is best attributed via
+    # `nsys stats --report cuda_gpu_kern_sum` filtering for
+    # `index_copy_*_kernel` / `IndexCopy*Kernel` rather than NVTX.
     assert handle.gpu_indices_cuda is not None
     ref = next(t for t in (out_perm, out_pref, out_cpu_on_gpu) if t is not None)
     out = torch.empty((num_tokens, handle.out_dim), dtype=ref.dtype, device=ref.device)
