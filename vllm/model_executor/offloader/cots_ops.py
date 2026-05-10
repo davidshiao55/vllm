@@ -56,12 +56,14 @@ import torch
 from vllm.utils.cots_diag import ENABLED as _COTS_DIAG_ENABLED
 from vllm.utils.torch_utils import direct_register_custom_op
 
-# §1c.26: UVA-side ablation flag. The C++ side has its own
-# `set_ablations(ablate_d2h, ablate_hostfn)` for the captured
-# cudaMemcpyAsync (D2H) and cudaLaunchHostFunc (dispatch + sync)
-# nodes; UVA is launched from the Python `_cots_sync_then_uva_impl`
-# so its ablation gate lives here. Toggled via `set_uva_ablation`
-# at offloader install time, only when dry_run + DIAG. Probe-only.
+# §1c.26 / §1c.27: UVA-side ablation flag. The C++ side has its
+# own `set_ablations(ablate_d2h, ablate_hostfn,
+# ablate_submit_hostfn=False, ablate_sync_hostfn=False)` for the
+# captured cudaMemcpyAsync (D2H) and cudaLaunchHostFunc (dispatch +
+# sync, with the §1c.27 split-side narrow flags); UVA is launched
+# from the Python `_cots_sync_then_uva_impl` so its ablation gate
+# lives here. Toggled via `set_uva_ablation` at offloader install
+# time, only when dry_run + DIAG. Probe-only.
 _COTS_ABLATE_UVA: bool = False
 
 

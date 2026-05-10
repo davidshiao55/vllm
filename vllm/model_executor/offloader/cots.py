@@ -2989,17 +2989,27 @@ class CotsOffloader(BaseOffloader):
                 cots_ops.set_worker_affinity(self._runner._runner_id, mask)
 
     def _install_ablations(self) -> None:
-        """§1c.26: install probe-only ablation flags that omit specific
-        captured-graph node classes — used to attribute the +0.571 s
-        dryrun − none gap to host_fn vs D2H vs UVA. See
-        `David/Docs/phase1c_findings.md` §1c.26.
+        """§1c.26 / §1c.27: install probe-only ablation flags that omit
+        specific captured-graph node classes — used to attribute the
+        +0.571 s dryrun − none gap to host_fn vs D2H vs UVA, and (in
+        §1c.27) to split the host_fn ablation into submit-only vs
+        sync-only. See `David/Docs/phase1c_findings.md` §1c.26 / §1c.27.
 
-        Three env vars, each `=1` to enable:
-          VLLM_COTS_ABLATE_HOSTFN — skip captured cudaLaunchHostFunc
-                                   for both submit and sync.
-          VLLM_COTS_ABLATE_D2H    — skip captured cudaMemcpyAsync
-                                   (activation D2H per layer/op).
-          VLLM_COTS_ABLATE_UVA    — skip captured Triton UVA copy.
+        Five env vars, each `=1` to enable:
+          VLLM_COTS_ABLATE_HOSTFN
+              §1c.26 broad: skip captured cudaLaunchHostFunc for BOTH
+              submit/dispatch and sync ("submit+sync" macro).
+          VLLM_COTS_ABLATE_SUBMIT_HOSTFN
+              §1c.27 narrow: skip ONLY the submit/dispatch
+              cudaLaunchHostFunc; keep sync host_fn.
+          VLLM_COTS_ABLATE_SYNC_HOSTFN
+              §1c.27 narrow: skip ONLY the sync cudaLaunchHostFunc;
+              keep submit/dispatch.
+          VLLM_COTS_ABLATE_D2H
+              skip captured cudaMemcpyAsync (activation D2H per
+              layer/op).
+          VLLM_COTS_ABLATE_UVA
+              skip captured Triton UVA copy.
 
         Honored ONLY when:
           - `cpu_runner='native'` (Python runner has no captured graph)
@@ -3010,8 +3020,7 @@ class CotsOffloader(BaseOffloader):
         but the gate is not met. These flags silently corrupt outputs
         in real (non-dryrun) mode — a warn-and-skip would let a
         mistyped run silently measure the NON-ablated path and
-        produce false conclusions. Loud failure forces the operator
-        to either fix the run or unset the env var.
+        produce false conclusions.
 
         Always resets the process-global `_COTS_ABLATE_UVA` to False
         first, even when no env vars are set, so a prior install in
@@ -3030,19 +3039,31 @@ class CotsOffloader(BaseOffloader):
         cots_ops.set_uva_ablation(False)
 
         ablate_hostfn = os.environ.get("VLLM_COTS_ABLATE_HOSTFN", "0") == "1"
+        ablate_submit_hostfn = (
+            os.environ.get("VLLM_COTS_ABLATE_SUBMIT_HOSTFN", "0") == "1"
+        )
+        ablate_sync_hostfn = os.environ.get("VLLM_COTS_ABLATE_SYNC_HOSTFN", "0") == "1"
         ablate_d2h = os.environ.get("VLLM_COTS_ABLATE_D2H", "0") == "1"
         ablate_uva = os.environ.get("VLLM_COTS_ABLATE_UVA", "0") == "1"
-        any_ablation = ablate_hostfn or ablate_d2h or ablate_uva
+        any_ablation = (
+            ablate_hostfn
+            or ablate_submit_hostfn
+            or ablate_sync_hostfn
+            or ablate_d2h
+            or ablate_uva
+        )
         if not any_ablation:
             return
         from vllm.utils.cots_diag import ENABLED as _diag_on
 
         if not (self.config.dry_run and _diag_on):
             raise RuntimeError(
-                "[cots §1c.26] ablation env vars set "
-                f"(HOSTFN={int(ablate_hostfn)}, D2H={int(ablate_d2h)}, "
-                f"UVA={int(ablate_uva)}) but gate not met: "
-                f"dry_run={self.config.dry_run}, "
+                "[cots §1c.26/§1c.27] ablation env vars set "
+                f"(HOSTFN={int(ablate_hostfn)}, "
+                f"SUBMIT_HOSTFN={int(ablate_submit_hostfn)}, "
+                f"SYNC_HOSTFN={int(ablate_sync_hostfn)}, "
+                f"D2H={int(ablate_d2h)}, UVA={int(ablate_uva)}) but "
+                f"gate not met: dry_run={self.config.dry_run}, "
                 f"VLLM_COTS_DIAG={int(_diag_on)}. These flags will "
                 "silently corrupt outputs in real (non-dryrun) mode "
                 "and would produce a false measurement here. To "
@@ -3051,12 +3072,20 @@ class CotsOffloader(BaseOffloader):
             )
         # All gates passed; push to the C++ infer + cots_ops module.
         infer = cots_ops._lookup_infer(self._runner._runner_id, "_install_ablations")
-        infer.set_ablations(ablate_d2h=ablate_d2h, ablate_hostfn=ablate_hostfn)
+        infer.set_ablations(
+            ablate_d2h=ablate_d2h,
+            ablate_hostfn=ablate_hostfn,
+            ablate_submit_hostfn=ablate_submit_hostfn,
+            ablate_sync_hostfn=ablate_sync_hostfn,
+        )
         cots_ops.set_uva_ablation(ablate_uva)
         logger.info(
-            "[cots §1c.26] ablations active: HOSTFN=%d, D2H=%d, UVA=%d "
+            "[cots §1c.26/§1c.27] ablations active: HOSTFN=%d, "
+            "SUBMIT_HOSTFN=%d, SYNC_HOSTFN=%d, D2H=%d, UVA=%d "
             "(probe-only; dryrun outputs are garbage)",
             int(ablate_hostfn),
+            int(ablate_submit_hostfn),
+            int(ablate_sync_hostfn),
             int(ablate_d2h),
             int(ablate_uva),
         )
@@ -3385,10 +3414,11 @@ class CotsOffloader(BaseOffloader):
         # post-allocation regardless of when their views are taken.
         self._install_runner()
 
-        # §1c.26 ablation install. Probe-only: read three env vars
-        # (VLLM_COTS_ABLATE_HOSTFN/D2H/UVA), but only honor them when
-        # dry_run AND VLLM_COTS_DIAG=1 are both set. Otherwise warn-
-        # and-skip so misuse is loud. Only meaningful for
+        # §1c.26 / §1c.27 ablation install. Probe-only: read five env
+        # vars (VLLM_COTS_ABLATE_HOSTFN / SUBMIT_HOSTFN / SYNC_HOSTFN /
+        # D2H / UVA), but only honor them when dry_run AND
+        # VLLM_COTS_DIAG=1 are both set. Otherwise hard-fail with
+        # RuntimeError so misuse is loud. Only meaningful for
         # `cpu_runner='native'`.
         self._install_ablations()
 

@@ -54,7 +54,8 @@ PYBIND11_MODULE(_cots_C, m) {
       .def("set_worker_affinity", &CotsCpuInfer::set_worker_affinity,
            py::arg("cpu_set"))
       .def("set_ablations", &CotsCpuInfer::set_ablations, py::arg("ablate_d2h"),
-           py::arg("ablate_hostfn"))
+           py::arg("ablate_hostfn"), py::arg("ablate_submit_hostfn") = false,
+           py::arg("ablate_sync_hostfn") = false)
       .def("last_observed_num_threads",
            &CotsCpuInfer::last_observed_num_threads)
       .def("has_error", &CotsCpuInfer::has_error)

@@ -344,10 +344,14 @@ void CotsCpuInfer::submit_on_stream(int64_t task_id, int32_t num_tokens,
                 (x_stride0 == x_cols ? "1D" : "2D"),
                 "): ", cudaGetErrorString(copy_err));
   }
-  // §1c.26 ablation: skip the captured cudaLaunchHostFunc entirely
-  // when ablate_hostfn_ is set. Worker is never enqueued; in dryrun
-  // there's nothing to enqueue anyway.
-  if (!ablate_hostfn_.load(std::memory_order_relaxed)) {
+  // §1c.26/§1c.27 ablation: skip the captured submit/dispatch
+  // cudaLaunchHostFunc when either the broad `ablate_hostfn_` or
+  // the narrow `ablate_submit_hostfn_` flag is set. Worker is
+  // never enqueued; in dryrun there's nothing to enqueue anyway.
+  const bool skip_submit_hostfn =
+      ablate_hostfn_.load(std::memory_order_relaxed) ||
+      ablate_submit_hostfn_.load(std::memory_order_relaxed);
+  if (!skip_submit_hostfn) {
     NvtxScope launch_scope("cots:launch_dispatch_cb");
     cudaError_t err = cudaLaunchHostFunc(
         stream, &CotsCpuInfer::DispatchCallback, static_cast<void*>(slab));
@@ -360,9 +364,13 @@ void CotsCpuInfer::submit_on_stream(int64_t task_id, int32_t num_tokens,
 void CotsCpuInfer::sync_on_stream(uintptr_t cuda_stream) {
   NvtxScope nvtx_scope("cots:sync_on_stream");
   check_error();
-  // §1c.26 ablation: skip captured sync host_fn when ablate_hostfn_
-  // is set. In dryrun there is nothing to drain.
-  if (ablate_hostfn_.load(std::memory_order_relaxed)) {
+  // §1c.26/§1c.27 ablation: skip captured sync host_fn when either
+  // the broad `ablate_hostfn_` or the narrow `ablate_sync_hostfn_`
+  // flag is set. In dryrun there is nothing to drain.
+  const bool skip_sync_hostfn =
+      ablate_hostfn_.load(std::memory_order_relaxed) ||
+      ablate_sync_hostfn_.load(std::memory_order_relaxed);
+  if (skip_sync_hostfn) {
     return;
   }
   // sync_args_ is a stable member of *this; safe to take its address as
@@ -390,9 +398,13 @@ void CotsCpuInfer::sync_blocking() {
   check_error();
 }
 
-void CotsCpuInfer::set_ablations(bool ablate_d2h, bool ablate_hostfn) {
+void CotsCpuInfer::set_ablations(bool ablate_d2h, bool ablate_hostfn,
+                                 bool ablate_submit_hostfn,
+                                 bool ablate_sync_hostfn) {
   ablate_d2h_.store(ablate_d2h, std::memory_order_relaxed);
   ablate_hostfn_.store(ablate_hostfn, std::memory_order_relaxed);
+  ablate_submit_hostfn_.store(ablate_submit_hostfn, std::memory_order_relaxed);
+  ablate_sync_hostfn_.store(ablate_sync_hostfn, std::memory_order_relaxed);
 }
 
 void CotsCpuInfer::set_worker_affinity(uint64_t cpu_set) {

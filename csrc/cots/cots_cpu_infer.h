@@ -227,18 +227,32 @@ class CotsCpuInfer {
     return last_observed_num_threads_.load(std::memory_order_acquire);
   }
 
-  // §1c.26 diagnostic ablation flags. Probe-only — meaningful ONLY
-  // under `dry_run=True` AND `VLLM_COTS_DIAG=1`. The Python-side
-  // installer is the gatekeeper: it reads the env vars + checks
-  // dry_run, and only then calls set_ablations(...). In real
-  // (non-dryrun) mode, setting these would silently corrupt
-  // outputs (worker never enqueued, or worker reads stale x_pinned,
-  // or y_gpu never updated). Used to attribute the +0.571 s/gen
-  // dryrun − none gap to specific captured-graph node classes by
-  // omitting one class at a time and re-measuring
-  // cudaGraphLaunch_v10000 delta. See §1c.26 in
+  // §1c.26 / §1c.27 diagnostic ablation flags. Probe-only —
+  // meaningful ONLY under `dry_run=True` AND `VLLM_COTS_DIAG=1`.
+  // The Python-side installer is the gatekeeper: it reads the env
+  // vars + checks dry_run, and only then calls set_ablations(...).
+  // In real (non-dryrun) mode, setting these would silently
+  // corrupt outputs (worker never enqueued, or worker reads stale
+  // x_pinned, or sync never drains). Used to attribute the
+  // +0.571 s/gen dryrun − none gap to specific captured-graph
+  // node classes by omitting one class at a time and re-measuring
+  // cudaGraphLaunch_v10000 delta. See §1c.26 / §1c.27 in
   // David/Docs/phase1c_findings.md.
-  void set_ablations(bool ablate_d2h, bool ablate_hostfn);
+  //
+  // Flag semantics:
+  //   ablate_d2h           — skip captured cudaMemcpyAsync.
+  //   ablate_hostfn        — skip BOTH submit/dispatch AND sync
+  //                          cudaLaunchHostFunc. §1c.26 macro
+  //                          ("submit+sync host_fns combined").
+  //   ablate_submit_hostfn — §1c.27: skip ONLY the submit/dispatch
+  //                          cudaLaunchHostFunc; keep sync host_fn.
+  //   ablate_sync_hostfn   — §1c.27: skip ONLY the sync
+  //                          cudaLaunchHostFunc; keep dispatch.
+  // The narrow flags compose with `ablate_hostfn` (a true on either
+  // skips the corresponding host_fn). Default false for all four.
+  void set_ablations(bool ablate_d2h, bool ablate_hostfn,
+                     bool ablate_submit_hostfn = false,
+                     bool ablate_sync_hostfn = false);
 
   // §1c.22 review-fix test helpers: read the immutable
   // `bucket_capacity_tokens` and the mutable `num_tokens` for a
@@ -488,10 +502,13 @@ class CotsCpuInfer {
   // thread's wait inside SyncCallback).
   std::atomic<int64_t> worker_queue_wait_total_ns_{0};
 
-  // §1c.26 ablation flags. Probe-only; gated by Python install
-  // checking dry_run + VLLM_COTS_DIAG. See set_ablations() above.
+  // §1c.26 / §1c.27 ablation flags. Probe-only; gated by Python
+  // install checking dry_run + VLLM_COTS_DIAG. See set_ablations()
+  // above for semantics.
   std::atomic<bool> ablate_d2h_{false};
   std::atomic<bool> ablate_hostfn_{false};
+  std::atomic<bool> ablate_submit_hostfn_{false};
+  std::atomic<bool> ablate_sync_hostfn_{false};
 };
 
 }  // namespace cots
