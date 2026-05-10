@@ -433,8 +433,23 @@ void CotsCpuInfer::sync_or_wait_on_stream(int64_t task_id,
               "sync_or_wait_on_stream: task_id ", task_id, " out of range");
   TaskSlab& s = slabs_[task_id];
   if (s.m3_installed.load(std::memory_order_acquire)) {
-    m3_wait_on_stream(task_id, cuda_stream);
+    // §1c.29 commit 2 review-fix: route through the no-check
+    // launcher so a prior worker error does not block the wait
+    // kernel from being recorded/launched. Without this, a worker
+    // throw would set has_error_, then the next captured
+    // sync_or_wait_on_stream would raise from check_error before
+    // the wait kernel was launched, wedging the stream with no
+    // done_slot consumer. Errors are still surfaced by
+    // check_error() at the next safe Python entry point (the next
+    // submit_on_stream, sync_blocking, etc.).
+    m3_wait_on_stream_no_check(task_id, cuda_stream);
   } else {
+    // Legacy path: keep check_error() in sync_on_stream. The
+    // captured SyncCallback host_fn blocks the driver thread on
+    // TaskQueue::sync(0); if the host_fn never gets recorded
+    // (because check_error raised), the stream isn't really
+    // "wedged" — it just hasn't been told to drain anything. The
+    // worker still completes; the next call surfaces the error.
     sync_on_stream(cuda_stream);
   }
 }
@@ -584,28 +599,36 @@ void CotsCpuInfer::DispatchCallback(void* user_data) {
     self->dispatch_cb_count_.fetch_add(1, std::memory_order_relaxed);
   }
   // §1c.29 commit 2 — M3 sequence publish. When M3 is installed
-  // for this slab, increment the slab-local seq, write it into
-  // host_req_slot (with a release fence so the value precedes the
-  // worker enqueue), and capture it into the worker lambda. The
-  // worker publishes `done_slot = seq` after finishing (or on
-  // exception), and the captured `m3_wait_kernel` on the GPU side
-  // spins until it sees `done >= req`. seq=0 in the lambda
-  // signals "no M3 publish needed" — RunSlabOnWorker skips the
-  // done_slot store, preserving the legacy non-M3 path bit-for-bit.
+  // for this slab, increment the slab-local seq, capture it into
+  // the worker lambda, ENQUEUE the lambda FIRST, THEN publish
+  // host_req_slot=seq. Per §1c.29 commit 2 review-fix this is the
+  // strictly stronger order: the GPU wait kernel cannot observe
+  // req=seq before the worker for that seq is queued. The two
+  // CPU operations execute back-to-back and the wait kernel only
+  // fires later as a captured stream node; in practice the GPU
+  // never observes the in-between state, but the cleaner order
+  // matches the standalone smoke and costs nothing.
+  //
+  // Wrap behavior: uint32_t monotonically increases. At ~1k ops/
+  // generate this overflows after 2^32 ≈ 4.3e6 generates, far
+  // beyond any practical run. Documented inline rather than
+  // reset-on-wrap to keep the hot path branch-free.
+  //
+  // seq=0 in the lambda signals "no M3 publish needed" —
+  // RunSlabOnWorker skips the done_slot store, preserving the
+  // legacy non-M3 path bit-for-bit.
   uint32_t seq = 0;
-  if (slab->m3_installed.load(std::memory_order_acquire)) {
-    // Wrap behavior: uint32_t monotonically increases. At ~1k ops/
-    // generate this overflows after 2^32 ≈ 4.3e6 generates, far
-    // beyond any practical run. Documented inline rather than
-    // reset-on-wrap to keep the hot path branch-free.
+  const bool m3 = slab->m3_installed.load(std::memory_order_acquire);
+  if (m3) {
     seq = slab->next_seq.fetch_add(1, std::memory_order_relaxed) + 1u;
+  }
+  // Enqueue worker BEFORE publishing req_slot.
+  self->task_queue_->enqueue(
+      [self, slab, seq] { self->RunSlabOnWorker(slab, seq); });
+  if (m3) {
     std::atomic_thread_fence(std::memory_order_release);
     *static_cast<volatile uint32_t*>(slab->host_req_slot) = seq;
   }
-  // Copy the pointer + seq into the lambda capture; this is safe because
-  // `slab` is a member of `self->slabs_` which is reserve-once.
-  self->task_queue_->enqueue(
-      [self, slab, seq] { self->RunSlabOnWorker(slab, seq); });
 }
 
 // Sync-side host callback. Blocks the CUDA driver thread until the
@@ -1091,6 +1114,19 @@ void CotsCpuInfer::install_m3_for_task(int64_t task_id) {
 
 void CotsCpuInfer::m3_wait_on_stream(int64_t task_id, uintptr_t cuda_stream) {
   check_error();
+  m3_wait_on_stream_no_check(task_id, cuda_stream);
+}
+
+void CotsCpuInfer::m3_wait_on_stream_no_check(int64_t task_id,
+                                              uintptr_t cuda_stream) {
+  // §1c.29 commit 2 review-fix — DO NOT call check_error() here.
+  // This launcher is used by `sync_or_wait_on_stream` on the
+  // captured-graph hot path; if a prior worker task set
+  // has_error_, raising here would prevent the wait kernel from
+  // being recorded/launched and the stream would be wedged with
+  // no done_slot consumer. The error is surfaced at the next
+  // Python-side entry point that is safe to short-circuit
+  // (submit_on_stream's check_error, sync_blocking's, etc.).
   TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
               "m3_wait_on_stream: task_id ", task_id, " out of range");
   TaskSlab& s = slabs_[task_id];

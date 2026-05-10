@@ -270,9 +270,12 @@ class CotsCpuInfer {
   // Launch the captured-graph wait kernel for `task_id` on
   // `cuda_stream`. Selects production vs diag kernel based on
   // VLLM_COTS_DIAG. Hard-fails if M3 was not installed for this
-  // task. Used inside the captured `cots_sync_then_uva` op when
-  // the M3 feature flag is on (commit 2 wires it; commit 1
-  // exposes the launcher for direct testing).
+  // task. This entry point CALLS check_error() first; it's the
+  // public/test-helper variant. Production captured ops should
+  // use `sync_or_wait_on_stream` (which routes through the
+  // no-check launcher to avoid wedging the stream when a prior
+  // worker task has set has_error_; see §1c.29 commit 2
+  // review-fix).
   void m3_wait_on_stream(int64_t task_id, uintptr_t cuda_stream);
 
   // §1c.29 test helpers. Direct slot access from CPU — used by
@@ -420,6 +423,15 @@ class CotsCpuInfer {
   // `void(*)(void*)`.
   static void DispatchCallback(void* user_data);
   static void SyncCallback(void* user_data);
+
+  // §1c.29 commit 2 review-fix — internal launcher that does NOT
+  // call check_error(). Used by `sync_or_wait_on_stream` so a
+  // prior worker error cannot prevent the captured wait kernel
+  // from being recorded/launched (which would leave the stream
+  // wedged with no done_slot consumer). Errors are still surfaced
+  // by check_error() at the next Python-side entry point that is
+  // safe to short-circuit (submit_on_stream, sync_blocking, etc.).
+  void m3_wait_on_stream_no_check(int64_t task_id, uintptr_t cuda_stream);
 
   // Worker-thread task body; runs whatever op_kind says. The `seq`
   // parameter (0 == no M3, > 0 == M3 enabled for this dispatch)
