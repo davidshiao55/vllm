@@ -227,6 +227,19 @@ class CotsCpuInfer {
     return last_observed_num_threads_.load(std::memory_order_acquire);
   }
 
+  // §1c.26 diagnostic ablation flags. Probe-only — meaningful ONLY
+  // under `dry_run=True` AND `VLLM_COTS_DIAG=1`. The Python-side
+  // installer is the gatekeeper: it reads the env vars + checks
+  // dry_run, and only then calls set_ablations(...). In real
+  // (non-dryrun) mode, setting these would silently corrupt
+  // outputs (worker never enqueued, or worker reads stale x_pinned,
+  // or y_gpu never updated). Used to attribute the +0.571 s/gen
+  // dryrun − none gap to specific captured-graph node classes by
+  // omitting one class at a time and re-measuring
+  // cudaGraphLaunch_v10000 delta. See §1c.26 in
+  // David/Docs/phase1c_findings.md.
+  void set_ablations(bool ablate_d2h, bool ablate_hostfn);
+
   // §1c.22 review-fix test helpers: read the immutable
   // `bucket_capacity_tokens` and the mutable `num_tokens` for a
   // given slab. The pair lets test_bucket_capacity_immutable assert
@@ -474,6 +487,11 @@ class CotsCpuInfer {
   // it up. Distinct from `sync_cb_wait_total_ns_` (the driver
   // thread's wait inside SyncCallback).
   std::atomic<int64_t> worker_queue_wait_total_ns_{0};
+
+  // §1c.26 ablation flags. Probe-only; gated by Python install
+  // checking dry_run + VLLM_COTS_DIAG. See set_ablations() above.
+  std::atomic<bool> ablate_d2h_{false};
+  std::atomic<bool> ablate_hostfn_{false};
 };
 
 }  // namespace cots

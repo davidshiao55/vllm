@@ -56,6 +56,23 @@ import torch
 from vllm.utils.cots_diag import ENABLED as _COTS_DIAG_ENABLED
 from vllm.utils.torch_utils import direct_register_custom_op
 
+# §1c.26: UVA-side ablation flag. The C++ side has its own
+# `set_ablations(ablate_d2h, ablate_hostfn)` for the captured
+# cudaMemcpyAsync (D2H) and cudaLaunchHostFunc (dispatch + sync)
+# nodes; UVA is launched from the Python `_cots_sync_then_uva_impl`
+# so its ablation gate lives here. Toggled via `set_uva_ablation`
+# at offloader install time, only when dry_run + DIAG. Probe-only.
+_COTS_ABLATE_UVA: bool = False
+
+
+def set_uva_ablation(enabled: bool) -> None:
+    """§1c.26: enable/disable the UVA captured-kernel ablation.
+    Probe-only — only meaningful with dry_run + VLLM_COTS_DIAG=1.
+    Called from `CotsOffloader.post_init` after reading the env."""
+    global _COTS_ABLATE_UVA
+    _COTS_ABLATE_UVA = bool(enabled)
+
+
 if TYPE_CHECKING:
     # Type-only import; avoids forcing _cots_C at module load on
     # non-CUDA builds.
@@ -339,7 +356,12 @@ def _cots_sync_then_uva_impl(
         if _COTS_DIAG_ENABLED:
             torch.cuda.nvtx.range_push("cots:py_uva_copy")
         try:
-            _uva_copy_trusted_host_into_gpu(y_pinned, y_gpu)
+            # §1c.26 ablation: skip the captured Triton UVA kernel
+            # entirely. Probe-only; gated upstream to dryrun + DIAG.
+            # y_gpu is left with stale data; harmless in dryrun
+            # because downstream consumers don't validate output.
+            if not _COTS_ABLATE_UVA:
+                _uva_copy_trusted_host_into_gpu(y_pinned, y_gpu)
         finally:
             if _COTS_DIAG_ENABLED:
                 torch.cuda.nvtx.range_pop()

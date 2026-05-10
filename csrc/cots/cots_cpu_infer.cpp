@@ -285,11 +285,16 @@ void CotsCpuInfer::submit_on_stream(int64_t task_id, int32_t num_tokens,
     }
   }
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  // §1c.26 ablation: skip the captured cudaMemcpyAsync entirely when
+  // ablate_d2h_ is set. Probe-only — gated upstream to dryrun + DIAG;
+  // worker reads stale x_pinned, output is garbage, but in dryrun
+  // worker doesn't compute so this is safe for the diagnostic.
+  const bool skip_d2h = ablate_d2h_.load(std::memory_order_relaxed);
   // §1c.20: D2H from x_gpu to slab's pinned input buffer.
   // Stride-aware: contiguous → 1D cudaMemcpyAsync, row-strided →
   // 2D cudaMemcpy2DAsync. Both graph-capturable. Skipped when
   // `x_gpu_ptr == 0` (test fixtures that exercise dispatch only).
-  if (x_gpu_ptr != 0) {
+  if (x_gpu_ptr != 0 && !skip_d2h) {
     TORCH_CHECK(slab->x_pinned_ptr != nullptr,
                 "submit_on_stream: slab.x_pinned_ptr is null at task_id=",
                 task_id, " (slab not populated?)");
@@ -339,17 +344,27 @@ void CotsCpuInfer::submit_on_stream(int64_t task_id, int32_t num_tokens,
                 (x_stride0 == x_cols ? "1D" : "2D"),
                 "): ", cudaGetErrorString(copy_err));
   }
-  NvtxScope launch_scope("cots:launch_dispatch_cb");
-  cudaError_t err = cudaLaunchHostFunc(stream, &CotsCpuInfer::DispatchCallback,
-                                       static_cast<void*>(slab));
-  TORCH_CHECK(
-      err == cudaSuccess,
-      "cudaLaunchHostFunc(DispatchCallback) failed: ", cudaGetErrorString(err));
+  // §1c.26 ablation: skip the captured cudaLaunchHostFunc entirely
+  // when ablate_hostfn_ is set. Worker is never enqueued; in dryrun
+  // there's nothing to enqueue anyway.
+  if (!ablate_hostfn_.load(std::memory_order_relaxed)) {
+    NvtxScope launch_scope("cots:launch_dispatch_cb");
+    cudaError_t err = cudaLaunchHostFunc(
+        stream, &CotsCpuInfer::DispatchCallback, static_cast<void*>(slab));
+    TORCH_CHECK(err == cudaSuccess,
+                "cudaLaunchHostFunc(DispatchCallback) failed: ",
+                cudaGetErrorString(err));
+  }
 }
 
 void CotsCpuInfer::sync_on_stream(uintptr_t cuda_stream) {
   NvtxScope nvtx_scope("cots:sync_on_stream");
   check_error();
+  // §1c.26 ablation: skip captured sync host_fn when ablate_hostfn_
+  // is set. In dryrun there is nothing to drain.
+  if (ablate_hostfn_.load(std::memory_order_relaxed)) {
+    return;
+  }
   // sync_args_ is a stable member of *this; safe to take its address as
   // userData for cudaLaunchHostFunc, including across CUDA graph replays.
   cudaError_t err = cudaLaunchHostFunc(
@@ -373,6 +388,11 @@ void CotsCpuInfer::sync_blocking() {
   task_queue_->sync(0);
   // Surface any worker error that fired while we were waiting.
   check_error();
+}
+
+void CotsCpuInfer::set_ablations(bool ablate_d2h, bool ablate_hostfn) {
+  ablate_d2h_.store(ablate_d2h, std::memory_order_relaxed);
+  ablate_hostfn_.store(ablate_hostfn, std::memory_order_relaxed);
 }
 
 void CotsCpuInfer::set_worker_affinity(uint64_t cpu_set) {

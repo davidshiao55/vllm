@@ -34,6 +34,7 @@ for the design rationale and empirical numbers.
 from __future__ import annotations
 
 import contextlib
+import os
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING
@@ -2987,6 +2988,79 @@ class CotsOffloader(BaseOffloader):
                     mask |= 1 << int(cpu_id)
                 cots_ops.set_worker_affinity(self._runner._runner_id, mask)
 
+    def _install_ablations(self) -> None:
+        """§1c.26: install probe-only ablation flags that omit specific
+        captured-graph node classes — used to attribute the +0.571 s
+        dryrun − none gap to host_fn vs D2H vs UVA. See
+        `David/Docs/phase1c_findings.md` §1c.26.
+
+        Three env vars, each `=1` to enable:
+          VLLM_COTS_ABLATE_HOSTFN — skip captured cudaLaunchHostFunc
+                                   for both submit and sync.
+          VLLM_COTS_ABLATE_D2H    — skip captured cudaMemcpyAsync
+                                   (activation D2H per layer/op).
+          VLLM_COTS_ABLATE_UVA    — skip captured Triton UVA copy.
+
+        Honored ONLY when:
+          - `cpu_runner='native'` (Python runner has no captured graph)
+          - `dry_run=True` (worker doesn't compute; ablations are safe)
+          - `VLLM_COTS_DIAG=1` (diagnostic tooling on)
+
+        Hard-fails with RuntimeError if any ablation env var is set
+        but the gate is not met. These flags silently corrupt outputs
+        in real (non-dryrun) mode — a warn-and-skip would let a
+        mistyped run silently measure the NON-ablated path and
+        produce false conclusions. Loud failure forces the operator
+        to either fix the run or unset the env var.
+
+        Always resets the process-global `_COTS_ABLATE_UVA` to False
+        first, even when no env vars are set, so a prior install in
+        the same process can't leak its UVA ablation into a later
+        non-ablating offloader.
+        """
+        if not isinstance(self._runner, NativeCotsRunner):
+            return
+        # §1c.26 review-fix: clear prior process-global UVA ablation
+        # state at every native install — guards against stale flags
+        # bleeding from a prior offloader in the same process. The
+        # C++ side is per-CotsCpuInfer instance and starts fresh
+        # (atomic-bool default = false), so it doesn't need a reset.
+        from vllm.model_executor.offloader import cots_ops
+
+        cots_ops.set_uva_ablation(False)
+
+        ablate_hostfn = os.environ.get("VLLM_COTS_ABLATE_HOSTFN", "0") == "1"
+        ablate_d2h = os.environ.get("VLLM_COTS_ABLATE_D2H", "0") == "1"
+        ablate_uva = os.environ.get("VLLM_COTS_ABLATE_UVA", "0") == "1"
+        any_ablation = ablate_hostfn or ablate_d2h or ablate_uva
+        if not any_ablation:
+            return
+        from vllm.utils.cots_diag import ENABLED as _diag_on
+
+        if not (self.config.dry_run and _diag_on):
+            raise RuntimeError(
+                "[cots §1c.26] ablation env vars set "
+                f"(HOSTFN={int(ablate_hostfn)}, D2H={int(ablate_d2h)}, "
+                f"UVA={int(ablate_uva)}) but gate not met: "
+                f"dry_run={self.config.dry_run}, "
+                f"VLLM_COTS_DIAG={int(_diag_on)}. These flags will "
+                "silently corrupt outputs in real (non-dryrun) mode "
+                "and would produce a false measurement here. To "
+                "enable: pass --cots-dry-run AND set VLLM_COTS_DIAG=1. "
+                "To disable: unset the VLLM_COTS_ABLATE_* env vars."
+            )
+        # All gates passed; push to the C++ infer + cots_ops module.
+        infer = cots_ops._lookup_infer(self._runner._runner_id, "_install_ablations")
+        infer.set_ablations(ablate_d2h=ablate_d2h, ablate_hostfn=ablate_hostfn)
+        cots_ops.set_uva_ablation(ablate_uva)
+        logger.info(
+            "[cots §1c.26] ablations active: HOSTFN=%d, D2H=%d, UVA=%d "
+            "(probe-only; dryrun outputs are garbage)",
+            int(ablate_hostfn),
+            int(ablate_d2h),
+            int(ablate_uva),
+        )
+
     def _install_bucket_prehook(self) -> None:
         """Phase 1c (Stage 3): install the first-decoder pre-hook
         UNCONDITIONALLY whenever COTS has handles, not gated on
@@ -3310,6 +3384,13 @@ class CotsOffloader(BaseOffloader):
         # `w_cpu`/`_x_pinned`/`_y_pinned` storages are stable
         # post-allocation regardless of when their views are taken.
         self._install_runner()
+
+        # §1c.26 ablation install. Probe-only: read three env vars
+        # (VLLM_COTS_ABLATE_HOSTFN/D2H/UVA), but only honor them when
+        # dry_run AND VLLM_COTS_DIAG=1 are both set. Otherwise warn-
+        # and-skip so misuse is loud. Only meaningful for
+        # `cpu_runner='native'`.
+        self._install_ablations()
 
         # Post-init max-fill for layer 0. It is consumed before the current
         # forward can issue any pre-compute prefetch; every later layer is
