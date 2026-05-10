@@ -478,6 +478,7 @@ class EngineArgs:
     cots_cpu_runner: Literal["native", "python"] = CotsOffloadConfig.cpu_runner
     cots_cpu_worker_affinity: list[int] | None = CotsOffloadConfig.cpu_worker_affinity
     cots_dry_run: bool = CotsOffloadConfig.dry_run
+    cots_m3_wait_kernel: bool = CotsOffloadConfig.cots_m3_wait_kernel
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
     max_num_batched_tokens: int | None = None
@@ -1092,6 +1093,9 @@ class EngineArgs:
             **cots_kwargs["cpu_worker_affinity"],
         )
         offload_group.add_argument("--cots-dry-run", **cots_kwargs["dry_run"])
+        offload_group.add_argument(
+            "--cots-m3-wait-kernel", **cots_kwargs["cots_m3_wait_kernel"]
+        )
 
         # Multimodal related configs
         multimodal_kwargs = get_kwargs(MultiModalConfig)
@@ -2001,6 +2005,7 @@ class EngineArgs:
             cpu_runner=self.cots_cpu_runner,
             cpu_worker_affinity=self.cots_cpu_worker_affinity,
             dry_run=self.cots_dry_run,
+            cots_m3_wait_kernel=self.cots_m3_wait_kernel,
         )
         offload_config = config_replace(
             OffloadConfig(),
