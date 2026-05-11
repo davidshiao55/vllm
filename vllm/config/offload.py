@@ -158,18 +158,26 @@ class CotsOffloadConfig:
     Only consulted by `cpu_runner='native'`."""
 
     cpu_runner: Literal["native", "python"] = "native"
-    """Phase 1c runner selector — production default flipped at Stage
-    5 once CUDA Graph capture was verified end-to-end. "native" routes
-    CPU work through `cudaLaunchHostFunc` + a C++ `TaskQueue` worker;
-    supports `enforce_eager=False` (production decode path) and
-    delivers the §1.14 orch collapse. "python" is the kill-switch:
-    keeps the Phase 1a/1b `ThreadPoolExecutor` substrate for A/B
-    diagnostics. That path is NOT graph-capturable, so
-    `cpu_runner="python"` requires `enforce_eager=True` and is
-    rejected at engine launch otherwise. Slated for deprecation one
-    quarter post-Phase-1c. See `David/Docs/implementation_roadmap.md`
-    Phase 1c and the approved plan at
-    /root/.claude/plans/pleaes-implement-phase1c-in-quizzical-mist.md."""
+    """Phase 1c runner selector.
+
+    * `"native"` (default): CPU work runs on a C++ `TaskQueue`
+      worker; submit/sync go through `cudaLaunchHostFunc` host
+      callbacks. Supports both eager mode (the
+      production-recommended path for Phase 2 per §1c.32 / §1c.33
+      / §1c.34 — native eager beats native+capture+wait-kernel
+      on the measured Qwen2.5-7B workload grid) AND graph capture
+      (`enforce_eager=False`, opt-in research path; see
+      `cots_capture_sync_mode` for the sync mechanism options
+      under capture).
+    * `"python"` (kill-switch): keeps the Phase 1a/1b
+      `ThreadPoolExecutor` substrate for A/B diagnostics. NOT
+      graph-capturable; `cpu_runner='python'` requires
+      `enforce_eager=True` and is rejected at engine launch
+      otherwise. Slated for deprecation after Phase 2.
+
+    See `David/Docs/implementation_roadmap.md` Phase 1c and
+    `phase1c_findings.md` §1c.29 / §1c.32 / §1c.33 for the
+    measurements that motivate the native-eager recommendation."""
 
     dry_run: bool = Field(default=False)
     """Diagnostic: install all wrappers but skip the CPU GEMM in the worker.

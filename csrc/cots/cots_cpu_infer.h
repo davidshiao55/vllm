@@ -88,16 +88,15 @@ struct alignas(64) TaskSlab {
   std::atomic<uint32_t> next_seq{0};
   std::atomic<bool> wait_kernel_sync_installed{false};
 
-  // §1c.33: per-task fire counter. Incremented once per
-  // DispatchCallback invocation (the captured graph's host_fn
-  // fire OR the eager-mode equivalent). Read out via
-  // `CotsCpuInfer::get_task_fire_counts()` so the Python side
-  // can cross-reference each task_id with its
-  // (layer_idx, bucket, op_kind) descriptor and identify which
-  // tuples produce the captured-vs-eager op-count delta seen in
-  // §1c.32. Diagnostic only — production-default reads/writes
-  // are a single relaxed atomic add, on the order of 1 ns per
-  // dispatch_cb fire.
+  // §1c.33: per-task fire counter. Diagnostic only — the
+  // DispatchCallback increment is gated behind
+  // `nvtx_internal::diag_enabled()` (VLLM_COTS_DIAG=1), so the
+  // production-default hot path pays zero overhead. Read out via
+  // `CotsCpuInfer::get_task_fire_counts()` and cross-referenced
+  // Python-side with each task_id's (layer_idx, bucket, op_kind)
+  // descriptor to attribute fires per slab (used in §1c.33's
+  // reset-isolated rerun that retracted the §1c.32 op-count
+  // hypothesis).
   std::atomic<int64_t> fire_count{0};
 
   // §1c.22 review-fix: immutable bucket capacity, populated once at

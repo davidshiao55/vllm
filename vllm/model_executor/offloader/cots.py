@@ -3176,26 +3176,14 @@ class CotsOffloader(BaseOffloader):
         bucket and repairs layer 0's slot if it's underfilled relative to
         the active bucket.
 
-        KNOWN ISSUE (Phase 1c Stage 6 anchor blocker): when vLLM's model
-        runner wraps the model forward in `torch.compile(fullgraph=True)`,
-        Dynamo traces through forward pre-hooks via
-        `nn.Module._call_impl`. This pre-hook calls
-        `prepare_before_forward` → `_bucket_for` → `bisect_left`, which
-        Dynamo can't trace; it raises a graph-break / unsupported error.
-
-        Marking this with `@torch._dynamo.disable` doesn't help: under
-        `fullgraph=True` Dynamo raises on disabled functions. Stage 6
-        ships the synthetic collapse-shape gate (raw `torch.cuda.graph`
-        capture, which DOES respect the pre-hook boundary by manual
-        placement) but the real-model anchor on Qwen2.5-7B + FastTTS
-        with `cudagraph_mode=FULL` requires either (a) the pre-hook
-        being traceable end-to-end (replace bisect_left with a
-        Dynamo-friendly bucket lookup; convert `_capture_buckets` to a
-        constant tuple), or (b) `cudagraph_mode=NONE` so torch.compile
-        is bypassed and `cudagraph_utils.py:267`'s out-of-graph
-        `prepare_before_forward` boundary is the only call site.
-        Tracked as Stage 6 follow-up; see `phase1c_findings.md
-        §1c.18`.
+        Invariant: this hook is traced into the captured graph under
+        `torch.compile(fullgraph=True)`, so the call chain
+        (`prepare_before_forward` → `_bucket_for`) must stay
+        Dynamo-traceable. `_bucket_for` uses a linear scan over the
+        capture buckets (treated as a constant by Dynamo and unrolled
+        at trace time) rather than `bisect.bisect_left` (a C builtin
+        Dynamo cannot trace). Resolved as §1c.18 — see
+        `phase1c_findings.md` for the history.
 
         Layer 0 is the only slot consumed before the current forward can
         issue a prefetch for it; all other layers are prefetched by their
@@ -3384,13 +3372,16 @@ class CotsOffloader(BaseOffloader):
         from vllm.config import get_current_vllm_config
 
         vllm_config = get_current_vllm_config()
-        # Phase 1c Stage 5: the `enforce_eager` requirement is now
-        # CONDITIONAL on runner type:
+        # Phase 1c: the `enforce_eager` requirement is CONDITIONAL on
+        # runner type:
         #   * cpu_runner='native': the C++ `cudaLaunchHostFunc`
         #     substrate IS graph-capturable (CUDA Graph host-function
         #     nodes, supported since CUDA 11.1). `enforce_eager=False`
-        #     is permitted and is the production path that delivers
-        #     the §1.14 orch collapse.
+        #     is SUPPORTED but is NOT the Phase 2 production
+        #     recommendation — §1c.32 / §1c.33 nsys attribution showed
+        #     native eager beats native+capture+wait-kernel on the
+        #     measured Qwen2.5-7B workload grid. Captured-graph mode is
+        #     preserved as an opt-in research path.
         #   * cpu_runner='python': the `ThreadPoolExecutor.submit` /
         #     `future.result()` substrate is NOT graph-capturable —
         #     capturing it would silently produce wrong results, not
@@ -3404,8 +3395,7 @@ class CotsOffloader(BaseOffloader):
                     "enforce_eager=True — Python runner uses "
                     "ThreadPoolExecutor + future.result() which is NOT "
                     "graph-capturable. Either set enforce_eager=True or "
-                    "switch to cpu_runner='native' (the Phase 1c "
-                    "production path; supports CUDA Graph capture)."
+                    "switch to cpu_runner='native'."
                 )
 
         # §1c.21 review-fix: native runner is incompatible with vLLM
