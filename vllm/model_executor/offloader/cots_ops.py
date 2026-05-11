@@ -170,7 +170,7 @@ def populate_slab_via_spec(
 
 
 def install_wait_kernel_sync_for_all_tasks(runner_id: int, n_slabs: int) -> None:
-    """§1c.29 commit 2: install M3 (host-mapped pinned req/done
+    """§1c.29 commit 2: install wait-kernel sync (host-mapped pinned req/done
     slots, lazy diag-counter alloc when VLLM_COTS_DIAG=1) for
     every slab in the pool. Called from `CotsOffloader.post_init`
     only when `cots_capture_sync_mode="wait_kernel"`.
@@ -422,14 +422,15 @@ def _cots_sync_then_uva_impl(
         torch.cuda.nvtx.range_push("cots:py_sync_then_uva")
     try:
         # §1c.29 commit 2: unified entry. C++ side branches per-slab
-        # on `slab.wait_kernel_sync_installed` — when M3 was installed at offloader
+        # on `slab.wait_kernel_sync_installed` — when wait-kernel sync
+        # was installed at offloader
         # post_init under `cots_capture_sync_mode="wait_kernel"`, the captured
         # node is the wait kernel reading the worker-published
         # `done_slot=seq`. Otherwise the captured node stays the
         # legacy SyncCallback host_fn that blocks the driver thread
         # on TaskQueue::sync(0). Python ALWAYS calls this entry —
         # the A/B is controlled exclusively by whether the
-        # offloader installed M3 for this task at startup.
+        # offloader installed wait-kernel sync for this task at startup.
         infer.sync_or_wait_on_stream(task_id, stream)
         # Build the CPU view over the slab pointer locally — never escapes
         # back to Python in a way Inductor would see.

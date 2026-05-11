@@ -93,7 +93,7 @@ CotsCpuInfer::~CotsCpuInfer() {
   if (task_queue_) {
     task_queue_->sync(0);
   }
-  // §1c.29 M3: free per-slab host-mapped pinned slots. These are
+  // §1c.29 wait-kernel sync: free per-slab host-mapped pinned slots. These are
   // allocated lazily via cudaHostAlloc(cudaHostAllocMapped) by
   // install_wait_kernel_sync_for_task; teardown must release them or the host
   // pinned region leaks. Walk the slabs_ array (sized at install
@@ -114,7 +114,7 @@ CotsCpuInfer::~CotsCpuInfer() {
       }
     }
   }
-  // Free M3 diag counter cells if allocated.
+  // Free wait-kernel sync diag counter cells if allocated.
   if (wait_kernel_immediate_resume_host_ != nullptr) {
     cudaFreeHost(wait_kernel_immediate_resume_host_);
     wait_kernel_immediate_resume_host_ = nullptr;
@@ -425,7 +425,7 @@ void CotsCpuInfer::sync_on_stream(uintptr_t cuda_stream) {
 
 void CotsCpuInfer::sync_or_wait_on_stream(int64_t task_id,
                                           uintptr_t cuda_stream) {
-  // §1c.29 commit 2 — unified entry. Per-slab branch: if M3 is
+  // §1c.29 commit 2 — unified entry. Per-slab branch: if wait-kernel sync is
   // installed for this task, the captured node is the wait kernel
   // (reads the worker-published done_slot=seq). Otherwise the
   // captured node stays the legacy SyncCallback host_fn that
@@ -630,8 +630,8 @@ void CotsCpuInfer::DispatchCallback(void* user_data) {
   if (nvtx_internal::diag_enabled()) {
     slab->fire_count.fetch_add(1, std::memory_order_relaxed);
   }
-  // §1c.29 commit 2 — M3 sequence publish. When M3 is installed
-  // for this slab, increment the slab-local seq, capture it into
+  // §1c.29 commit 2 — wait-kernel sync sequence publish. When wait-kernel sync
+  // is installed for this slab, increment the slab-local seq, capture it into
   // the worker lambda, ENQUEUE the lambda FIRST, THEN publish
   // host_req_slot=seq. Per §1c.29 commit 2 review-fix this is the
   // strictly stronger order: the GPU wait kernel cannot observe
@@ -646,9 +646,9 @@ void CotsCpuInfer::DispatchCallback(void* user_data) {
   // beyond any practical run. Documented inline rather than
   // reset-on-wrap to keep the hot path branch-free.
   //
-  // seq=0 in the lambda signals "no M3 publish needed" —
+  // seq=0 in the lambda signals "no wait-kernel sync publish needed" —
   // RunSlabOnWorker skips the done_slot store, preserving the
-  // legacy non-M3 path bit-for-bit.
+  // legacy non-wait-kernel-sync path bit-for-bit.
   uint32_t seq = 0;
   const bool m3 =
       slab->wait_kernel_sync_installed.load(std::memory_order_acquire);
@@ -892,17 +892,16 @@ void CotsCpuInfer::RunSlabOnWorker(TaskSlab* slab, uint32_t seq) {
     last_error_msg_ = "[cots worker] unknown exception";
     has_error_.store(true, std::memory_order_release);
   }
-  // §1c.29 commit 2 — finally-publish for M3. Even on exception we
-  // MUST write done_slot=seq so the captured cots_wait_done_kernel can
-  // exit its spin loop. Without this publish a worker throw would
-  // wedge the GPU stream in an infinite spin and the next Python-
-  // side check would never see the error (because the next
-  // submit/sync is itself behind the wedged stream). On the
-  // success path, has_error_ stays false and the consumer reads
+  // §1c.29 commit 2 — finally-publish for wait-kernel sync. Even on exception
+  // we MUST write done_slot=seq so the captured cots_wait_done_kernel can exit
+  // its spin loop. Without this publish a worker throw would wedge the GPU
+  // stream in an infinite spin and the next Python- side check would never see
+  // the error (because the next submit/sync is itself behind the wedged
+  // stream). On the success path, has_error_ stays false and the consumer reads
   // y_pinned normally; on the failure path, has_error_ + msg
   // surface at the next Python-side submit/sync as a
   // RuntimeError, but the GPU stream is unblocked first so that
-  // check actually runs. seq=0 means "no M3 installed for this
+  // check actually runs. seq=0 means "no wait-kernel sync installed for this
   // slab" — skip the publish to keep the legacy path bit-for-bit
   // identical.
   if (seq != 0 &&
@@ -1012,7 +1011,7 @@ std::vector<std::pair<std::string, int64_t>> CotsCpuInfer::get_counters()
                    load(worker_queue_wait_total_ns_));
   out.emplace_back("worker_clamp_override_count",
                    load(worker_clamp_override_count_));
-  // §1c.29 M3 diag counters. Populated only when
+  // §1c.29 wait-kernel sync diag counters. Populated only when
   // `VLLM_COTS_DIAG=1` AND a captured graph that fires
   // `cots_wait_done_kernel_diag` runs (production-default path skips
   // these). Stored as host-mapped pinned int64_t cells so the
@@ -1068,15 +1067,15 @@ void CotsCpuInfer::reset_counters() {
       slabs_[i].fire_count.store(0, std::memory_order_relaxed);
     }
   }
-  // §1c.29 M3 diag counters. Lazy-allocated; only zero them
-  // if they exist (i.e., M3 was installed at least once).
+  // §1c.29 wait-kernel sync diag counters. Lazy-allocated; only zero them
+  // if they exist (i.e., wait-kernel sync was installed at least once).
   if (wait_kernel_immediate_resume_host_)
     *wait_kernel_immediate_resume_host_ = 0;
   if (wait_kernel_lagging_wait_host_) *wait_kernel_lagging_wait_host_ = 0;
   if (wait_kernel_spin_iters_host_) *wait_kernel_spin_iters_host_ = 0;
 }
 
-// §1c.29 M3 — install per-slab host-mapped pinned slots.
+// §1c.29 wait-kernel sync — install per-slab host-mapped pinned slots.
 // Forward declarations of the launchers in cots_wait_done_kernel.cu
 // so we can call them from this C++ TU without a header pulling
 // in CUDA-specific symbols.
@@ -1117,12 +1116,12 @@ void CotsCpuInfer::install_wait_kernel_sync_for_task(int64_t task_id) {
               "install_wait_kernel_sync_for_task: task_id ", task_id,
               " out of range");
   TaskSlab& s = slabs_[task_id];
-  TORCH_CHECK(
-      !s.wait_kernel_sync_installed.load(std::memory_order_acquire),
-      "install_wait_kernel_sync_for_task: M3 already installed for task_id=",
-      task_id, " (idempotency violation)");
+  TORCH_CHECK(!s.wait_kernel_sync_installed.load(std::memory_order_acquire),
+              "install_wait_kernel_sync_for_task: wait-kernel sync already "
+              "installed for task_id=",
+              task_id, " (idempotency violation)");
   // Lazy-alloc the per-runner diag counter cells, but ONLY when
-  // VLLM_COTS_DIAG=1 — production M3 should not pay the pinned-
+  // VLLM_COTS_DIAG=1 — production wait-kernel sync should not pay the pinned-
   // allocation surface for cells the diag kernel will never read.
   // Per reviewer (§1c.29 commit 1 fix): diag-only allocation
   // surface keeps the production failure space minimal.
@@ -1205,9 +1204,10 @@ void CotsCpuInfer::wait_kernel_sync_on_stream_no_check(int64_t task_id,
   TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
               "wait_kernel_sync_on_stream: task_id ", task_id, " out of range");
   TaskSlab& s = slabs_[task_id];
-  TORCH_CHECK(s.wait_kernel_sync_installed.load(std::memory_order_acquire),
-              "wait_kernel_sync_on_stream: M3 not installed for task_id=",
-              task_id, "; call install_wait_kernel_sync_for_task first");
+  TORCH_CHECK(
+      s.wait_kernel_sync_installed.load(std::memory_order_acquire),
+      "wait_kernel_sync_on_stream: wait-kernel sync not installed for task_id=",
+      task_id, "; call install_wait_kernel_sync_for_task first");
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   if (nvtx_internal::diag_enabled()) {
     // Diag counter cells are lazy-allocated by
@@ -1247,7 +1247,8 @@ uint32_t CotsCpuInfer::wait_kernel_get_req_slot(int64_t task_id) const {
   const TaskSlab& s = slabs_[task_id];
   TORCH_CHECK(
       s.wait_kernel_sync_installed.load(std::memory_order_acquire),
-      "wait_kernel_get_req_slot: M3 not installed for task_id=", task_id);
+      "wait_kernel_get_req_slot: wait-kernel sync not installed for task_id=",
+      task_id);
   return *static_cast<volatile uint32_t*>(s.host_req_slot);
 }
 
@@ -1257,7 +1258,8 @@ uint32_t CotsCpuInfer::wait_kernel_get_done_slot(int64_t task_id) const {
   const TaskSlab& s = slabs_[task_id];
   TORCH_CHECK(
       s.wait_kernel_sync_installed.load(std::memory_order_acquire),
-      "wait_kernel_get_done_slot: M3 not installed for task_id=", task_id);
+      "wait_kernel_get_done_slot: wait-kernel sync not installed for task_id=",
+      task_id);
   return *static_cast<volatile uint32_t*>(s.host_done_slot);
 }
 
@@ -1267,7 +1269,8 @@ void CotsCpuInfer::wait_kernel_set_req_slot(int64_t task_id, uint32_t value) {
   TaskSlab& s = slabs_[task_id];
   TORCH_CHECK(
       s.wait_kernel_sync_installed.load(std::memory_order_acquire),
-      "wait_kernel_set_req_slot: M3 not installed for task_id=", task_id);
+      "wait_kernel_set_req_slot: wait-kernel sync not installed for task_id=",
+      task_id);
   std::atomic_thread_fence(std::memory_order_release);
   *static_cast<volatile uint32_t*>(s.host_req_slot) = value;
   std::atomic_thread_fence(std::memory_order_release);
@@ -1279,7 +1282,8 @@ void CotsCpuInfer::wait_kernel_set_done_slot(int64_t task_id, uint32_t value) {
   TaskSlab& s = slabs_[task_id];
   TORCH_CHECK(
       s.wait_kernel_sync_installed.load(std::memory_order_acquire),
-      "wait_kernel_set_done_slot: M3 not installed for task_id=", task_id);
+      "wait_kernel_set_done_slot: wait-kernel sync not installed for task_id=",
+      task_id);
   // Worker-side publish ordering (§1c.29 reminder): in production
   // the worker writes y_pinned, releases via fence, THEN writes
   // done_slot=seq. The test helper omits y_pinned (no real CPU

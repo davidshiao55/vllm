@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
-// §1c.29 M3 — captured wait kernel that replaces the
+// §1c.29 wait-kernel sync — captured wait kernel that replaces the
 // `cudaLaunchHostFunc(sync_cb)` node in the COTS captured graph
 // when `cots_capture_sync_mode="wait_kernel"`. Compiled as CUDA so nvcc
 // handles `__global__` and PTX inline asm; rest of `_cots_C`

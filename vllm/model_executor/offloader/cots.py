@@ -1679,7 +1679,7 @@ class NativeCotsRunner:
         if not self._installed:
             raise RuntimeError(
                 "NativeCotsRunner.install_wait_kernel_sync() called before install(); "
-                "M3 needs the slab pool to exist first"
+                "wait-kernel sync needs the slab pool to exist first"
             )
         cots_ops.install_wait_kernel_sync_for_all_tasks(self._runner_id, self._n_slabs)
 
@@ -2308,6 +2308,22 @@ def _scatter_col_outputs_three_way(
     if out_cpu_on_gpu is not None:
         out.index_copy_(1, cpu_idx, out_cpu_on_gpu)
     return out
+
+
+# §1c.34 cleanup D / cleanup-fix: the five ablation env-var names
+# are duplicated locally so `CotsOffloader._install_ablations`'s
+# precheck does not need to import `_cots_ablations` (which would
+# pull the helper into memory on the production hot path even when
+# no ablation is active). This tuple MUST stay in sync with
+# `_ABLATION_ENVS` in `_cots_ablations.py` — a comment there
+# cross-references this constant.
+_COTS_ABLATION_ENV_NAMES: tuple[str, ...] = (
+    "VLLM_COTS_ABLATE_HOSTFN",
+    "VLLM_COTS_ABLATE_SUBMIT_HOSTFN",
+    "VLLM_COTS_ABLATE_SYNC_HOSTFN",
+    "VLLM_COTS_ABLATE_D2H",
+    "VLLM_COTS_ABLATE_UVA",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -3019,20 +3035,17 @@ class CotsOffloader(BaseOffloader):
                 cots_ops.set_worker_affinity(self._runner._runner_id, mask)
 
     def _install_ablations(self) -> None:
-        """§1c.34 cleanup D: thin shim. Always resets the process-
-        global `_COTS_ABLATE_UVA` flag (so a prior install in the
-        same process can't leak into a non-ablating offloader),
-        then lazy-imports the full diagnostic-only ablation helper
-        ONLY when at least one VLLM_COTS_ABLATE_* env var is set.
+        """§1c.34 cleanup D / cleanup-fix: thin shim.
 
-        Production-default path (no ablation envs): O(5) env reads
-        for the precheck + one Python-side bool write to reset the
-        sticky UVA flag. The full ablation install logic lives in
-        `vllm/model_executor/offloader/_cots_ablations.py` and is
-        never imported on the production hot path.
+        Production-default path (no ablation envs set): O(5) env
+        reads done LOCALLY (no module import) + one Python-side
+        bool write to reset the sticky process-global UVA flag.
+        The helper module `_cots_ablations.py` is not touched.
 
-        See `_cots_ablations.py` for the full semantics + hard-fail
-        gate (cpu_runner='native' + dry_run=True + VLLM_COTS_DIAG=1).
+        Diagnostic path (any ablation env set): lazy-import the
+        helper and delegate. The helper validates the gate
+        (`cpu_runner='native' + dry_run=True + VLLM_COTS_DIAG=1`)
+        and hard-fails on misuse.
         """
         if not isinstance(self._runner, NativeCotsRunner):
             return
@@ -3043,13 +3056,19 @@ class CotsOffloader(BaseOffloader):
 
         _cots_ops.set_uva_ablation(False)
 
+        # Local env precheck — keeps `_cots_ablations` import-fenced
+        # from production. The env-var name tuple is duplicated above
+        # rather than imported to avoid touching the helper module
+        # on the no-ablation path.
+        if not any(
+            os.environ.get(name, "0") == "1" for name in _COTS_ABLATION_ENV_NAMES
+        ):
+            return
+
         from vllm.model_executor.offloader._cots_ablations import (
-            any_ablation_env_set,
             install_ablations_from_env,
         )
 
-        if not any_ablation_env_set():
-            return
         install_ablations_from_env(self)
 
     def _install_bucket_prehook(self) -> None:
@@ -3424,7 +3443,7 @@ class CotsOffloader(BaseOffloader):
         # post-allocation regardless of when their views are taken.
         self._install_runner()
 
-        # §1c.29 commit 2 — install M3 host-mapped pinned slots once
+        # §1c.29 commit 2 — install wait-kernel sync host-mapped pinned slots once
         # the slab pool exists. install_m3 walks every slab in the
         # pool and allocates the req/done slot pair (and the diag
         # counter cells lazily, only when VLLM_COTS_DIAG=1 — see

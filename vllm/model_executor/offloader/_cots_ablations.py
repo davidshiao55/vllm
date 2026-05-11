@@ -27,14 +27,23 @@ so misuse — any env var set without both gate conditions — must
 HARD-FAIL with `RuntimeError`. Warn-and-skip would silently measure
 the NON-ablated path.
 
-§1c.34 cleanup D: moved out of `cots.py` so the production hot
-path doesn't import this module at all unless `VLLM_COTS_DIAG=1`.
-`CotsOffloader.post_init` short-circuits the env reads upstream;
-this file is only imported when diagnostics are active.
+§1c.34 cleanup D / cleanup-fix: moved out of `cots.py` so the
+production hot path doesn't import this module at all unless at
+least one `VLLM_COTS_ABLATE_*` env var is set. `CotsOffloader.
+_install_ablations` performs the cheap O(5)-env-read precheck
+INLINE (using `_ABLATION_ENV_NAMES` duplicated on the shim) so
+the precheck path does not pull this helper into memory; the
+helper is only imported when the precheck observes at least one
+flag set.
 
-This module is import-fenced from production: only
-`CotsOffloader._install_ablations` (a thin shim) imports it, and
-only when `VLLM_COTS_DIAG=1`.
+The hard-fail gate (`cpu_runner='native' + dry_run=True +
+VLLM_COTS_DIAG=1`) runs inside `install_ablations_from_env`, so
+DIAG itself is not a precondition to entering this module —
+misuse of an ablation env without DIAG raises a `RuntimeError`
+with a clear message.
+
+The name tuple `_ABLATION_ENVS` below MUST stay in sync with
+`_COTS_ABLATION_ENV_NAMES` (module-level) in `cots.py`.
 """
 
 from __future__ import annotations
@@ -56,13 +65,6 @@ _ABLATION_ENVS = (
     "VLLM_COTS_ABLATE_D2H",
     "VLLM_COTS_ABLATE_UVA",
 )
-
-
-def any_ablation_env_set() -> bool:
-    """Cheap O(5)-env-read precheck. Called from
-    `CotsOffloader.post_init` so the rest of this module never has
-    to import on the production hot path."""
-    return any(os.environ.get(k, "0") == "1" for k in _ABLATION_ENVS)
 
 
 def install_ablations_from_env(offloader: CotsOffloader) -> None:

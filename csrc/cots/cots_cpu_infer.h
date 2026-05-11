@@ -70,9 +70,9 @@ struct alignas(64) TaskSlab {
   // mode never writes this).
   std::atomic<int64_t> enqueue_time_ns{0};
 
-  // §1c.29 M3 (sync host_fn replacement). One req/done slot pair
+  // §1c.29 wait-kernel sync (sync host_fn replacement). One req/done slot pair
   // per slab, allocated lazily by `install_wait_kernel_sync_for_task` only when
-  // the M3 feature flag is on. host_*_ptr is the CPU-visible
+  // the wait-kernel sync flag is on. host_*_ptr is the CPU-visible
   // address (worker reads/writes); dev_*_ptr is the GPU-visible
   // address (cots_wait_done_kernel reads via host-mapped pinned).
   // `next_seq` is incremented per dispatch_cb fire from the
@@ -235,14 +235,15 @@ class CotsCpuInfer {
   void sync_on_stream(uintptr_t cuda_stream);
 
   // §1c.29 commit 2 — unified sync/wait dispatch. Per-slab choice
-  // based on `slab.wait_kernel_sync_installed`: when M3 is installed for this
-  // task (offloader called `install_wait_kernel_sync_for_task` in post_init
-  // under `cots_capture_sync_mode="wait_kernel"`), the captured graph node is
-  // the M3 wait kernel reading the worker-published `done_slot=seq`. Otherwise
+  // based on `slab.wait_kernel_sync_installed`: when wait-kernel sync is
+  // installed for this task (offloader called
+  // `install_wait_kernel_sync_for_task` in post_init under
+  // `cots_capture_sync_mode="wait_kernel"`), the captured graph node is the
+  // wait-kernel sync reading the worker-published `done_slot=seq`. Otherwise
   // the captured node is the legacy `cudaLaunchHostFunc(SyncCallback)` blocking
   // the driver thread on `TaskQueue::sync(0)`. The Python side
   // (`cots_sync_then_uva`) ALWAYS calls this entry; the A/B is
-  // controlled exclusively by whether the offloader installed M3
+  // controlled exclusively by whether the offloader installed wait-kernel sync
   // for this task at startup.
   void sync_or_wait_on_stream(int64_t task_id, uintptr_t cuda_stream);
 
@@ -268,7 +269,7 @@ class CotsCpuInfer {
     return last_observed_num_threads_.load(std::memory_order_acquire);
   }
 
-  // §1c.29 M3 — install per-slab host-mapped pinned req/done
+  // §1c.29 wait-kernel sync — install per-slab host-mapped pinned req/done
   // slots. Idempotent; calling twice for the same task_id raises.
   // Hard-fails on cudaHostAlloc(cudaHostAllocMapped) or
   // cudaHostGetDevicePointer error (per §1c.29 safety gate (c)/(d)
@@ -279,7 +280,7 @@ class CotsCpuInfer {
 
   // Launch the captured-graph wait kernel for `task_id` on
   // `cuda_stream`. Selects production vs diag kernel based on
-  // VLLM_COTS_DIAG. Hard-fails if M3 was not installed for this
+  // VLLM_COTS_DIAG. Hard-fails if wait-kernel sync was not installed for this
   // task. This entry point CALLS check_error() first; it's the
   // public/test-helper variant. Production captured ops should
   // use `sync_or_wait_on_stream` (which routes through the
@@ -456,9 +457,9 @@ class CotsCpuInfer {
                                            uintptr_t cuda_stream);
 
   // Worker-thread task body; runs whatever op_kind says. The `seq`
-  // parameter (0 == no M3, > 0 == M3 enabled for this dispatch)
-  // controls whether the worker publishes `done_slot = seq` after
-  // the task completes — see §1c.29 commit 2. The publish is in a
+  // parameter (0 == no wait-kernel sync, > 0 == wait-kernel sync enabled for
+  // this dispatch) controls whether the worker publishes `done_slot = seq`
+  // after the task completes — see §1c.29 commit 2. The publish is in a
   // finally-style block so a worker exception still releases the
   // captured wait kernel (otherwise `cots_wait_done_kernel` would spin
   // forever on `done < req` and the GPU stream would deadlock,
@@ -622,9 +623,9 @@ class CotsCpuInfer {
   std::atomic<bool> ablate_submit_hostfn_{false};
   std::atomic<bool> ablate_sync_hostfn_{false};
 
-  // §1c.29 M3 diag counters. Allocated once at first
+  // §1c.29 wait-kernel sync diag counters. Allocated once at first
   // install_wait_kernel_sync_for_task call (lazily — most instances don't
-  // use M3) as host-mapped pinned int64_t cells so the GPU
+  // use wait-kernel sync) as host-mapped pinned int64_t cells so the GPU
   // cots_wait_done_kernel_diag can atomicAdd directly. host_ptr is
   // CPU-readable for get_counters/reset_counters; dev_ptr is
   // GPU-visible for the kernel. Counters meaning:

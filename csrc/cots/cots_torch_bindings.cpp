@@ -69,7 +69,7 @@ PYBIND11_MODULE(_cots_C, m) {
       .def("set_ablations", &CotsCpuInfer::set_ablations, py::arg("ablate_d2h"),
            py::arg("ablate_hostfn"), py::arg("ablate_submit_hostfn") = false,
            py::arg("ablate_sync_hostfn") = false)
-      // §1c.29 M3 — install + wait launcher + test helpers.
+      // §1c.29 wait-kernel sync — install + wait launcher + test helpers.
       .def("install_wait_kernel_sync_for_task",
            &CotsCpuInfer::install_wait_kernel_sync_for_task, py::arg("task_id"))
       .def("wait_kernel_sync_on_stream",
