@@ -38,10 +38,9 @@ namespace cots {
 //   * Every w_*_ptr is a POST-narrow data_ptr() — never base + manual offset.
 //     `at::from_blob` has no storage-offset parameter, so the offset must be
 //     baked into the pointer.
-//   * For column-narrowed views (down-proj), w_down_stride_row /
-//     w_down_stride_col mirror the source tensor's stride() so the C++ side
-//     can reconstruct the strided view via `at::from_blob(ptr, sizes,
-//     strides, opts)`.
+//   * Stage 7-C: down-proj is row-narrow on transposed `(n_cpu_total,
+//     out_dim)` storage → contiguous (dn_n_cpu, out_dim) view, no strides
+//     needed (kernel takes ContigCpuViewFromBlob, not StridedCpuViewFromBlob).
 //   * num_tokens is the only field written per-call (by the submit-callback
 //     before TaskQueue::enqueue). All other fields are constant after
 //     populate_slab() and remain valid across CUDA graph re-replays.
@@ -135,14 +134,13 @@ struct alignas(64) TaskSlab {
   int32_t w_gate_rows = 0;
   void* w_up_ptr = nullptr;
   int32_t w_up_rows = 0;
-  // Down-proj is a column-narrow on (out_dim, n_cpu) row-major storage.
-  // w_down_ptr is the post-narrow data_ptr() (already offset by
-  // dn_n_pref * elem_size); strides mirror the source tensor.
+  // Stage 7-C: down-proj weight is stored as transposed `(n_cpu_total,
+  // out_dim)` row-major. The slab carries a `narrow(0, dn_n_pref,
+  // dn_n_cpu)` view — contiguous `(dn_n_cpu, out_dim) = (K, N)` —
+  // feedable to the custom `bf16_gemm_transposed` kernel.
   void* w_down_ptr = nullptr;
-  int32_t w_down_rows = 0;        // = out_dim
-  int32_t w_down_cols = 0;        // = dn_n_cpu
-  int64_t w_down_stride_row = 0;  // = original n_cpu (in elements)
-  int64_t w_down_stride_col = 1;
+  int32_t w_down_rows = 0;            // = K (dn_n_cpu)
+  int32_t w_down_cols = 0;            // = N (out_dim)
   int32_t intermediate_per_half = 0;  // for silu*up shape
 };
 
@@ -161,13 +159,18 @@ class CotsCpuInfer {
   CotsCpuInfer(const CotsCpuInfer&) = delete;
   CotsCpuInfer& operator=(const CotsCpuInfer&) = delete;
 
-  // Reserves N slabs, sized once. Allocates the worker-local MLP scratch
-  // (`scratch_silu_up_`) at the worst-case shape across all MLP slabs.
-  // After install(), slabs_.size() == n_slabs is invariant for the
-  // lifetime of this CotsCpuInfer. Subsequent populate_slab calls only
-  // mutate the pre-existing slab entries.
-  void install(int64_t n_slabs, int64_t scratch_max_tokens,
-               int64_t scratch_max_intermediate_per_half);
+  // Reserves N slabs, sized once. After install(), slabs_.size() ==
+  // n_slabs is invariant for the lifetime of this CotsCpuInfer.
+  // `max_num_tokens` is the upper bound on per-call num_tokens; it
+  // gates submit/run-side bounds checks against the pinned x/y
+  // buffers. Subsequent populate_slab calls only mutate the
+  // pre-existing slab entries.
+  //
+  // Stage 7-C removed the `scratch_max_intermediate_per_half`
+  // parameter: the silu(gate)*up intermediate is now a fresh contig
+  // tensor allocated per call by the elementwise op, no worker-local
+  // scratch needed.
+  void install(int64_t n_slabs, int64_t max_num_tokens);
 
   // Populate a previously-reserved slab. All pointers must be POST-narrow
   // data_ptr()s (see TaskSlab doc above). Idempotent. dtype is hard-coded
@@ -192,7 +195,6 @@ class CotsCpuInfer {
                          int32_t w_gate_rows, uintptr_t w_up_ptr,
                          int32_t w_up_rows, uintptr_t w_down_ptr,
                          int32_t w_down_rows, int32_t w_down_cols,
-                         int64_t w_down_stride_row, int64_t w_down_stride_col,
                          int32_t intermediate_per_half);
 
   // Populate a slab as a dryrun-noop. §1c.20: dryrun must still
@@ -373,6 +375,25 @@ class CotsCpuInfer {
   // user-managed; this just calls into ATen.
   void run_at_linear_inline(at::Tensor x, at::Tensor w, at::Tensor y_out);
 
+  // Stage 7 — inline call to the custom BF16 row-major-weight GEMM
+  // kernel (csrc/cots/bf16_gemm_transposed.cpp). All tensors
+  // BF16 row-major contiguous. Used by the Stage 7 microbench to
+  // compare against `run_at_linear_inline` on the layouts oneDNN's
+  // BF16 path doesn't dispatch on. Caller-managed tensors; no
+  // TaskQueue involvement (single-thread, inline like the at::linear
+  // helper above).
+  void run_bf16_gemm_transposed_inline(at::Tensor x, at::Tensor w,
+                                       at::Tensor y_out);
+
+  // Stage 7-D PROBE — natural (N, K) row-major BF16 GEMM kernel.
+  // Sibling to run_bf16_gemm_transposed_inline; same casting
+  // and parallelism strategy but with loop nest swapped for the
+  // natural-layout fast access direction. Used by the Stage 7-D
+  // perf probe in David/Tests/phase1c. Caller-managed tensors;
+  // no TaskQueue involvement.
+  void run_bf16_gemm_natural_inline(at::Tensor x, at::Tensor w,
+                                    at::Tensor y_out);
+
   // §1c.20: produce an `at::from_blob` CPU tensor view over the slab's
   // pinned output buffer for the given task. Trusted: the y_pinned_ptr
   // came from `_y_pinned`, which was allocated with `pin_memory=True`
@@ -477,11 +498,14 @@ class CotsCpuInfer {
   std::unique_ptr<TaskSlab[]> slabs_;
   int64_t slab_count_ = 0;
 
-  // Worker-local scratch for MLP intermediates (silu(gate) * up). One
-  // max-sized tensor, sized at install. NOT one-per-slab.
-  at::Tensor scratch_silu_up_;
-  int64_t scratch_max_tokens_ = 0;
-  int64_t scratch_max_intermediate_per_half_ = 0;
+  // Upper bound on per-call num_tokens, set at install. Gates the
+  // pinned-buffer bounds check in submit_on_stream + RunSlabOnWorker
+  // so a misconfigured slab can't read past x_pinned / y_pinned.
+  // Stage 7-C removed the `scratch_silu_up_` worker-local scratch
+  // (MLP silu*up intermediate is now a fresh contig tensor per call,
+  // allocated by the elementwise op), so this is the only remaining
+  // "max tokens" state.
+  int64_t max_num_tokens_ = 0;
 
   // Stable userData for sync_on_stream's cudaLaunchHostFunc — must be
   // a member, NOT a stack/heap-per-call alloc. CUDA graph capture freezes

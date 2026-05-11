@@ -1024,7 +1024,20 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     "csrc/cots/task_queue.cpp"
     "csrc/cots/cots_cpu_infer.cpp"
     "csrc/cots/cots_torch_bindings.cpp"
-    # §1c.29 M3 wait kernel — compiled as CUDA so nvcc handles
+    # Stage 7 — custom BF16 GEMM kernel for the row-major-weight
+    # layout (oneDNN has no AVX2 fast path for this layout; see
+    # csrc/cots/bf16_gemm_transposed.cpp for the rationale).
+    # Plain C++ host code with AVX2/FMA intrinsics; nvcc compiles
+    # transparently when LANGUAGE=CUDA.
+    "csrc/cots/bf16_gemm_transposed.cpp"
+    # Stage 7-D PROBE — sibling kernel for the natural (N, K)
+    # row-major weight layout. Same casting/parallelism strategy
+    # as Path H (pipelined upcast in inner loop, at::parallel_for
+    # on N) but with the loop nest swapped to keep w access
+    # sequential in natural layout. Goal: measure perf parity
+    # with Path H before committing to the full Stage 7-D.
+    "csrc/cots/bf16_gemm_natural.cpp"
+    # §1c.29 wait kernel — compiled as CUDA so nvcc handles
     # the __global__ kernel and PTX inline asm. The other
     # sources stay C++ host code; nvcc compiles them
     # transparently when LANGUAGE=CUDA.
@@ -1039,6 +1052,37 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   set_gencode_flags_for_srcs(
     SRCS "csrc/cots/cots_wait_done_kernel.cu"
     CUDA_ARCHS "${CUDA_ARCHS}")
+
+  # Stage 7 — the row-major-weight BF16 GEMM kernel uses AVX2 +
+  # FMA intrinsics + `at::parallel_for` for intra-op parallelism.
+  #
+  # `-fopenmp` here is **required for correctness of
+  # `at::parallel_for` performance**, not for any `#pragma omp` in
+  # our own source. ATen's `parallel_for` is defined in
+  # `ATen/Parallel-inl.h`: when our TU's `_OPENMP` macro is set,
+  # it routes through `at::internal::invoke_parallel`
+  # (`ATen/ParallelOpenMP.h:18-53`, which is itself OpenMP-backed).
+  # When `_OPENMP` is unset in our TU, `INTRA_OP_PARALLEL` is not
+  # defined and `parallel_for` silently falls through to a serial
+  # path — observed empirically as ~5× slowdown at thr=16. PyTorch
+  # itself is OMP-built; libgomp is already loaded by libtorch_cpu
+  # so we add no extra link step here, just the compile-time
+  # `-fopenmp` to make our TU see `_OPENMP`.
+  #
+  # If PyTorch is ever rebuilt with TBB (`USE_TBB=1,
+  # USE_NATIVE_PARALLEL=0`), `at::parallel_for` would route through
+  # `ParallelNative.h` instead, and this `-fopenmp` would be a
+  # no-op in terms of dispatch — but it would still pull libgomp
+  # into our link line. We document the OMP runtime dependency
+  # here and rely on it being present for this kernel to scale.
+  set_source_files_properties(
+    "csrc/cots/bf16_gemm_transposed.cpp"
+    PROPERTIES COMPILE_FLAGS "-mavx2 -mfma -fopenmp")
+  # Stage 7-D probe — same compile flags as Path H (AVX2/FMA +
+  # OpenMP for at::parallel_for routing into INTRA_OP_PARALLEL).
+  set_source_files_properties(
+    "csrc/cots/bf16_gemm_natural.cpp"
+    PROPERTIES COMPILE_FLAGS "-mavx2 -mfma -fopenmp")
 
   message(STATUS "Enabling cots_C extension.")
   define_extension_target(

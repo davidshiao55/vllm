@@ -452,16 +452,10 @@ class CotsLinearHandle:
         #   prefix rows for qkv/row. 0 = empty.
         self.prefetch_owner_in_slot: list[CotsLinearHandle | None] = []
         self.prefetch_available_rows_in_slot: list[int] = []
-        # Row-handle only: pinned-CPU duplicate of the prefetched-cols
-        # prefix in transposed layout (max_n_prefetch, out_dim). The
-        # primary w_cpu is (out_dim, n_cpu); narrowing it on dim 1
-        # yields a pitched (strided) H2D source that costs ~1.85x at
-        # f_prefetch=0.15 (microprobe at down_proj shape). This buffer
-        # makes the per-bucket H2D fully contiguous. Allocated by the
-        # offloader once max_n_prefetch is known; populated by
-        # _row_weight_loader. qkv/col prefetch via narrow(0, ...) is
-        # already contiguous and needs no duplicate.
-        self.w_row_prefetch_src_t: torch.Tensor | None = None
+        # Stage 7-C: row-handle `w_cpu` is stored in transposed
+        # `(n_cpu, out_dim)` layout (see install()); its first
+        # `n_pref` rows are the contiguous prefetch source. No
+        # separate duplicate buffer.
 
     # ------------------------------------------------------------------
     # Construction helpers — compute indices, snap n_cpu, build handle.
@@ -601,7 +595,13 @@ class CotsLinearHandle:
             w_cpu_shape = (self.n_cpu, self.in_dim)
         else:  # row
             gpu_slice_shape = (self.out_dim, self.in_dim - self.n_cpu)
-            w_cpu_shape = (self.out_dim, self.n_cpu)
+            # Stage 7-C: row-handle (down_proj) stores CPU weight as
+            # transposed `(n_cpu, out_dim)` row-major. Both the
+            # row-prefetch slice and the CPU-compute slice are
+            # `w_cpu.narrow(0, ...)` — contiguous, no duplicate
+            # buffer, directly feedable to `bf16_gemm_transposed`
+            # which expects (K, N) row-major BF16.
+            w_cpu_shape = (self.n_cpu, self.out_dim)
         weight_param.data = torch.empty(
             gpu_slice_shape, dtype=self.dtype, device=device
         )
@@ -734,7 +734,11 @@ class CotsLinearHandle:
     def _row_weight_loader(self, param, loaded_weight):
         """RowParallelLinear (down_proj): single call, full
         (out_dim, in_dim) loaded_weight. GPU keeps FIRST keep_gpu input cols;
-        CPU gets LAST n_cpu.
+        CPU gets LAST n_cpu — stored in TRANSPOSED orientation
+        `(n_cpu, out_dim)` per Stage 7-C unified storage (see install()
+        docstring). One-shot transpose at load time so every per-forward
+        slice (prefetch row-narrow + CPU-compute row-narrow) is
+        contiguous.
         """
         assert self.w_cpu is not None
         assert loaded_weight.shape == (self.out_dim, self.in_dim), (
@@ -743,20 +747,14 @@ class CotsLinearHandle:
         )
         keep_gpu = self.in_dim - self.n_cpu
         param.data.copy_(loaded_weight[:, :keep_gpu], non_blocking=False)
-        self.w_cpu.copy_(loaded_weight[:, keep_gpu:], non_blocking=False)
-        # Phase 1b row-prefetch fix: also populate the transposed pinned
-        # H2D source for the prefetched-cols prefix. The first
-        # max_n_prefetch input cols of the CPU portion match the runtime
-        # prefetch slice (`_compute_bucket_split` row branch), and per-
-        # bucket `n_prefetch <= max_n_prefetch`. One-shot transpose is
-        # paid here at load time so per-forward H2D is contiguous.
-        if self.w_row_prefetch_src_t is not None:
-            m = self.max_n_prefetch
-            src_block = loaded_weight[:, keep_gpu : keep_gpu + m]  # (out_dim, m)
-            self.w_row_prefetch_src_t.copy_(
-                src_block.transpose(0, 1).contiguous(),  # (m, out_dim)
-                non_blocking=False,
-            )
+        # `loaded_weight[:, keep_gpu:]` is (out_dim, n_cpu); we want
+        # (n_cpu, out_dim) for our unified transposed-storage layout.
+        # `.transpose(0, 1).contiguous()` materializes the transposed
+        # tensor once at load.
+        self.w_cpu.copy_(
+            loaded_weight[:, keep_gpu:].transpose(0, 1).contiguous(),
+            non_blocking=False,
+        )
 
     def _merged_col_weight_loader(self, param, loaded_weight, loaded_shard_id=None):
         """MergedColumnParallelLinear (gate_up_proj): per-shard call
@@ -892,10 +890,10 @@ class CotsPrefetchBufferPool:
                 h.prefetch_available_rows_in_slot = []
                 continue
             if h.kind == "row":
-                # Phase 1b row-prefetch fix: transposed slot layout so
-                # H2D narrow(0, ...) is contiguous (matches the new
-                # w_row_prefetch_src_t source). Same numel as the prior
-                # (out_dim, max_n_prefetch) shape.
+                # Row slot is (max_n_prefetch, out_dim) — matches the
+                # unified transposed-storage `w_cpu` layout
+                # (n_cpu, out_dim) so H2D `narrow(0, ...)` on both
+                # ends is contiguous.
                 slot_shape = (h.max_n_prefetch, h.out_dim)
             else:  # col, qkv
                 slot_shape = (h.max_n_prefetch, h.in_dim)
@@ -1011,17 +1009,15 @@ class WeightPrefetchStreamer:
                 # measured cost is host orchestration only.
                 if not self._dry_run:
                     if h.kind == "row":
-                        # Phase 1b row-prefetch fix: source is the pinned
-                        # transposed `w_row_prefetch_src_t` of shape
-                        # (max_n_prefetch, out_dim); slot is also
-                        # (max_n_prefetch, out_dim). Both narrow on dim 0
-                        # → contiguous H2D, ~1.85x faster than the prior
-                        # pitched `w_cpu.narrow(1, 0, n)`.
-                        assert h.w_row_prefetch_src_t is not None, (
-                            f"row handle {h.qualified_name} has prefetch "
-                            f"requested but w_row_prefetch_src_t is None"
-                        )
-                        src = h.w_row_prefetch_src_t.narrow(0, 0, n)
+                        # Stage 7-C: row-handle `w_cpu` is now stored in
+                        # transposed `(n_cpu, out_dim)` layout. The
+                        # prefetch source is `w_cpu.narrow(0, 0, n)` —
+                        # a contiguous `(n, out_dim)` view, no separate
+                        # duplicate buffer. Slot is `(max_n_prefetch,
+                        # out_dim)`; both ends narrow on dim 0,
+                        # contiguous H2D as Phase 1b's fix required.
+                        assert h.w_cpu is not None
+                        src = h.w_cpu.narrow(0, 0, n)
                         dst = h.w_prefetch_slots[h.slot_idx].narrow(0, 0, n)
                         dst.copy_(src, non_blocking=True)
                     elif h.kind == "col":
@@ -1115,8 +1111,10 @@ class WeightPrefetchStreamer:
             with torch.cuda.stream(self.copy_stream):
                 if not self._dry_run:
                     if h.kind == "row":
-                        assert h.w_row_prefetch_src_t is not None
-                        src = h.w_row_prefetch_src_t[avail:required, :]
+                        # Stage 7-C: read from the unified transposed
+                        # `w_cpu` instead of the dropped duplicate.
+                        assert h.w_cpu is not None
+                        src = h.w_cpu[avail:required, :]
                         h.w_prefetch_slots[h.slot_idx][avail:required, :].copy_(
                             src, non_blocking=True
                         )
@@ -1320,8 +1318,6 @@ class _NativeSlabSpecMlp(NativeSlabSpec):
         w_down_ptr: int,
         w_down_rows: int,
         w_down_cols: int,
-        w_down_stride_row: int,
-        w_down_stride_col: int,
         intermediate_per_half: int,
     ) -> None:
         super().__init__(op_descriptor)
@@ -1337,8 +1333,6 @@ class _NativeSlabSpecMlp(NativeSlabSpec):
         self.w_down_ptr = w_down_ptr
         self.w_down_rows = w_down_rows
         self.w_down_cols = w_down_cols
-        self.w_down_stride_row = w_down_stride_row
-        self.w_down_stride_col = w_down_stride_col
         self.intermediate_per_half = intermediate_per_half
 
     def populate(self, infer: object, task_id: int, *, dry_run: bool) -> None:
@@ -1374,8 +1368,6 @@ class _NativeSlabSpecMlp(NativeSlabSpec):
             w_down_ptr=self.w_down_ptr,
             w_down_rows=self.w_down_rows,
             w_down_cols=self.w_down_cols,
-            w_down_stride_row=self.w_down_stride_row,
-            w_down_stride_col=self.w_down_stride_col,
             intermediate_per_half=self.intermediate_per_half,
         )
 
@@ -1611,8 +1603,7 @@ class NativeCotsRunner:
     def install(
         self,
         slab_specs: list[NativeSlabSpec],
-        scratch_max_tokens: int,
-        scratch_max_intermediate_per_half: int,
+        max_num_tokens: int,
     ) -> None:
         """Allocate the C++ slab pool, populate slabs, and build the
         op_descriptor -> task_id map. Called once at offloader
@@ -1643,8 +1634,7 @@ class NativeCotsRunner:
         cots_ops.install_infer(
             self._runner_id,
             n_slabs=n_slabs,
-            scratch_max_tokens=scratch_max_tokens,
-            scratch_max_intermediate_per_half=scratch_max_intermediate_per_half,
+            max_num_tokens=max_num_tokens,
         )
         for tid, spec in enumerate(slab_specs):
             self._task_id_for[spec.op_descriptor] = tid
@@ -1894,30 +1884,6 @@ def _cpu_dryrun_noop(
     garbage; only host bookkeeping cost is measured. See `phase1a_findings.md
     §1.14`."""
     d2h_event.synchronize()
-
-
-def _cpu_mlp_block_work(
-    d2h_event: torch.cuda.Event,
-    x_pinned: torch.Tensor,
-    w_gate_cpu: torch.Tensor,
-    w_up_cpu: torch.Tensor,
-    w_mlp2_cpu: torch.Tensor,
-    y2_pinned: torch.Tensor,
-) -> None:
-    """Fused MLP block: D2H wait → gate / up → SwiGLU → MLP2.
-
-    Gate and up are passed separately so Phase 1b can hand the worker
-    non-contiguous CPU-compute slices (each half's prefetched-row prefix
-    is excluded). Phase 1a behavior at `f_prefetch=0`: the slices reduce
-    to the full halves of `gu.w_cpu`. Matched-index invariant unchanged —
-    `gate_out` and `up_out` are worker-local; only `y2_pinned` crosses
-    to GPU via UVA.
-    """
-    d2h_event.synchronize()
-    gate_out = F.linear(x_pinned, w_gate_cpu)
-    up_out = F.linear(x_pinned, w_up_cpu)
-    z = F.silu(gate_out) * up_out
-    y2_pinned.copy_(F.linear(z, w_mlp2_cpu))
 
 
 # ---------------------------------------------------------------------------
@@ -2759,18 +2725,12 @@ class CotsOffloader(BaseOffloader):
             if h.layer_idx >= 0:
                 h.slot_idx = h.layer_idx % CotsPrefetchBufferPool.K
 
-        # Row-handle only: allocate the transposed pinned-CPU prefetch
-        # source. See CotsLinearHandle.w_row_prefetch_src_t for the
-        # contiguous-vs-pitched-H2D rationale. Skipped when
-        # max_n_prefetch == 0 so f_prefetch=0.0 is bit-exact to Phase 1a.
-        for h in self._handles:
-            if h.kind == "row" and h.max_n_prefetch > 0:
-                h.w_row_prefetch_src_t = torch.empty(
-                    (h.max_n_prefetch, h.out_dim),
-                    dtype=h.dtype,
-                    device="cpu",
-                    pin_memory=is_pin_memory_available(),
-                )
+        # Stage 7-C: dropped the `w_row_prefetch_src_t` duplicate
+        # allocation. The unified transposed-storage `w_cpu` (allocated
+        # in `CotsLinearHandle.install()` for row-handle as
+        # `(n_cpu, out_dim)`) IS the contiguous prefetch source — no
+        # second buffer needed. Saves ~max_n_prefetch * out_dim * 2
+        # bytes pinned per row-handle.
 
         n_layers = len(self._layer_modules)
         self._streamer = WeightPrefetchStreamer(n_layers=n_layers, dry_run=self.dry_run)
@@ -2802,9 +2762,16 @@ class CotsOffloader(BaseOffloader):
         w_gate: torch.Tensor, w_up: torch.Tensor, w_down: torch.Tensor
     ) -> PyCotsCallback:
         """Closure for the fused MLP block (gate + up + silu*up + down).
-        Mirrors `_cpu_mlp_block_work` but with weights captured at
-        install time so the operator-side call only carries
-        x_pinned/y_pinned views."""
+        Encapsulates the fused MLP block (gate + up + silu*up + down)
+        with weights captured at install time so the operator-side call
+        only carries x_pinned/y_pinned views.
+
+        Stage 7-C: `w_down` is now Stage 7-C's transposed-storage view
+        `(dn_n_cpu, out_dim) = (K, N)` row-major contig — passed to
+        `torch.matmul` directly (the GEMM is `y = z @ w_down`, no
+        F.linear-style implicit `.T`). gate / up stay on F.linear
+        because they use the PyTorch-natural `(out, in)` layout.
+        """
 
         def cb(
             event: torch.cuda.Event,
@@ -2815,7 +2782,7 @@ class CotsOffloader(BaseOffloader):
             gate_out = F.linear(x_pinned, w_gate)
             up_out = F.linear(x_pinned, w_up)
             z = F.silu(gate_out) * up_out
-            y_pinned.copy_(F.linear(z, w_down))
+            y_pinned.copy_(torch.matmul(z, w_down))
 
         return cb
 
@@ -2858,7 +2825,11 @@ class CotsOffloader(BaseOffloader):
                     n_cpu_per_half_total + n_pref_per_half : 2 * n_cpu_per_half_total,
                     :,
                 ]
-                w_down_view = dn_h.w_cpu.narrow(1, dn_n_pref, dn_n_cpu)
+                # Stage 7-C: `dn_h.w_cpu` is now (n_cpu, out_dim) row-major.
+                # The CPU-compute slice is rows `[dn_n_pref, dn_n_pref+dn_n_cpu)`
+                # → contiguous `(dn_n_cpu, out_dim)` = `(K, N)` view for the
+                # transposed-storage kernel path.
+                w_down_view = dn_h.w_cpu.narrow(0, dn_n_pref, dn_n_cpu)
                 callbacks[(gu_h.layer_idx, bucket, "mlp_block")] = (
                     self._make_mlp_python_callback(w_gate_view, w_up_view, w_down_view)
                 )
@@ -2960,7 +2931,12 @@ class CotsOffloader(BaseOffloader):
                     n_cpu_per_half_total + n_pref_per_half : 2 * n_cpu_per_half_total,
                     :,
                 ]
-                w_down_view = dn_h.w_cpu.narrow(1, dn_n_pref, dn_n_cpu)
+                # Stage 7-C: `dn_h.w_cpu` is (n_cpu_total, out_dim);
+                # narrow on dim 0 yields a contiguous (dn_n_cpu, out_dim)
+                # = (K, N) view feedable to the transposed-storage kernel.
+                #   w_down_rows = K (= dn_n_cpu)
+                #   w_down_cols = N (= out_dim)
+                w_down_view = dn_h.w_cpu.narrow(0, dn_n_pref, dn_n_cpu)
                 specs.append(
                     _NativeSlabSpecMlp(
                         op_descriptor=(gu_h.layer_idx, bucket, "mlp_block"),
@@ -2976,8 +2952,6 @@ class CotsOffloader(BaseOffloader):
                         w_down_ptr=int(w_down_view.data_ptr()),
                         w_down_rows=int(w_down_view.shape[0]),
                         w_down_cols=int(w_down_view.shape[1]),
-                        w_down_stride_row=int(w_down_view.stride(0)),
-                        w_down_stride_col=int(w_down_view.stride(1)),
                         intermediate_per_half=int(inter_per_half),
                     )
                 )
@@ -2999,18 +2973,14 @@ class CotsOffloader(BaseOffloader):
             self._runner.install(callbacks)
         elif isinstance(self._runner, NativeCotsRunner):
             slab_specs = self._build_native_slab_specs()
-            # Worst-case scratch: max(n_cpu_per_half) over all fused MLP
-            # blocks. The C++ worker uses one shared `scratch_silu_up_`
-            # tensor sized to (max_num_batched_tokens × max_inter_per_half)
-            # for the silu(gate)*up intermediate.
-            max_inter_per_half = 0
-            for fop in self._fused_ops:
-                n_cpu_per_half = fop._gate_up.n_cpu // 2
-                max_inter_per_half = max(max_inter_per_half, n_cpu_per_half)
+            # Stage 7-C: `max_num_tokens` gates the C++ worker's
+            # submit-side / run-side bounds checks against the pinned
+            # x/y buffers. The prior `scratch_max_intermediate_per_half`
+            # parameter is gone — the silu(gate)*up intermediate is
+            # now a fresh contig tensor allocated per call.
             self._runner.install(
                 slab_specs=slab_specs,
-                scratch_max_tokens=int(self._max_num_tokens),
-                scratch_max_intermediate_per_half=int(max_inter_per_half),
+                max_num_tokens=int(self._max_num_tokens),
             )
             # Stage 4: optional worker-thread CPU affinity. The C++
             # `set_worker_affinity` packs cpu IDs into a uint64 bitmask,
@@ -3491,10 +3461,12 @@ class CotsOffloader(BaseOffloader):
                         )
                         h.prefetch_available_rows_in_slot[h.slot_idx] = max_half
                     elif h.kind == "row":
-                        assert h.w_row_prefetch_src_t is not None
+                        # Stage 7-C: unified transposed `w_cpu` —
+                        # `w_cpu[:m, :]` is the prefetch source.
+                        assert h.w_cpu is not None
                         m = h.max_n_prefetch
                         h.w_prefetch_slots[h.slot_idx][:m, :].copy_(
-                            h.w_row_prefetch_src_t[:m, :],
+                            h.w_cpu[:m, :],
                             non_blocking=True,
                         )
                         h.prefetch_available_rows_in_slot[h.slot_idx] = m

@@ -143,15 +143,13 @@ def _lookup_infer(runner_id: int, op_name: str) -> Any:
 def install_infer(
     runner_id: int,
     n_slabs: int,
-    scratch_max_tokens: int,
-    scratch_max_intermediate_per_half: int,
+    max_num_tokens: int,
 ) -> None:
     """Allocate the C++ slab pool. Called once at offloader post_init."""
     infer = _lookup_infer(runner_id, "install_infer")
     infer.install(
         n_slabs=int(n_slabs),
-        scratch_max_tokens=int(scratch_max_tokens),
-        scratch_max_intermediate_per_half=int(scratch_max_intermediate_per_half),
+        max_num_tokens=int(max_num_tokens),
     )
 
 

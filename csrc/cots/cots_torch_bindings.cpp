@@ -19,8 +19,7 @@ PYBIND11_MODULE(_cots_C, m) {
   py::class_<CotsCpuInfer>(m, "CotsCpuInfer")
       .def(py::init<>())
       .def("install", &CotsCpuInfer::install, py::arg("n_slabs"),
-           py::arg("scratch_max_tokens"),
-           py::arg("scratch_max_intermediate_per_half"))
+           py::arg("max_num_tokens"))
       .def("populate_slab_qkv", &CotsCpuInfer::populate_slab_qkv,
            py::arg("task_id"), py::arg("n_threads"),
            py::arg("bucket_capacity_tokens"), py::arg("x_pinned_ptr"),
@@ -32,8 +31,7 @@ PYBIND11_MODULE(_cots_C, m) {
            py::arg("in_dim"), py::arg("y_pinned_ptr"), py::arg("cpu_out_dim"),
            py::arg("w_gate_ptr"), py::arg("w_gate_rows"), py::arg("w_up_ptr"),
            py::arg("w_up_rows"), py::arg("w_down_ptr"), py::arg("w_down_rows"),
-           py::arg("w_down_cols"), py::arg("w_down_stride_row"),
-           py::arg("w_down_stride_col"), py::arg("intermediate_per_half"))
+           py::arg("w_down_cols"), py::arg("intermediate_per_half"))
       .def("populate_slab_dryrun", &CotsCpuInfer::populate_slab_dryrun,
            py::arg("task_id"), py::arg("bucket_capacity_tokens"),
            py::arg("x_pinned_ptr"), py::arg("in_dim"), py::arg("y_pinned_ptr"),
@@ -91,6 +89,18 @@ PYBIND11_MODULE(_cots_C, m) {
       .def("check_error", &CotsCpuInfer::check_error)
       .def("run_at_linear_inline", &CotsCpuInfer::run_at_linear_inline,
            py::arg("x"), py::arg("w"), py::arg("y_out"))
+      // Stage 7 — custom AVX2 BF16 GEMM kernel inline (Path H in
+      // test_stage7_layout_microbench). Same signature shape as
+      // run_at_linear_inline; w must be (K, N) row-major BF16 (the
+      // transposed-storage layout that oneDNN doesn't fast-path on
+      // AVX2).
+      .def("run_bf16_gemm_transposed_inline",
+           &CotsCpuInfer::run_bf16_gemm_transposed_inline, py::arg("x"),
+           py::arg("w"), py::arg("y_out"))
+      // Stage 7-D probe — natural (N, K) BF16 GEMM kernel.
+      .def("run_bf16_gemm_natural_inline",
+           &CotsCpuInfer::run_bf16_gemm_natural_inline, py::arg("x"),
+           py::arg("w"), py::arg("y_out"))
       .def("y_pinned_view", &CotsCpuInfer::y_pinned_view, py::arg("task_id"),
            py::arg("num_tokens"))
       .def("set_runtime_num_tokens", &CotsCpuInfer::set_runtime_num_tokens,

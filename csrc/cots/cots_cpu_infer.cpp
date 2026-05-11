@@ -23,6 +23,18 @@
 namespace vllm {
 namespace cots {
 
+// Forward declaration — defined in bf16_gemm_transposed.cpp.
+// Used by run_bf16_gemm_transposed_inline below to call into
+// the Stage 7 custom AVX2 BF16 GEMM kernel without a header.
+void bf16_gemm_transposed_at(const at::Tensor& x, const at::Tensor& w,
+                             at::Tensor& y_out);
+
+// Forward declaration — defined in
+// bf16_gemm_natural.cpp. Stage 7-D probe entry
+// for the natural (N, K) row-major BF16 GEMM kernel.
+void bf16_gemm_natural_at(const at::Tensor& x, const at::Tensor& w,
+                          at::Tensor& y_out);
+
 namespace {
 
 constexpr int kMaxCpus = 64;
@@ -70,15 +82,6 @@ constexpr auto kCpuDtype = at::kBFloat16;
 at::Tensor ContigCpuViewFromBlob(void* ptr, int64_t rows, int64_t cols) {
   auto opts = at::TensorOptions().dtype(kCpuDtype).device(at::kCPU);
   return at::from_blob(ptr, {rows, cols}, opts);
-}
-
-// Build an ATen tensor view over a column-narrowed pinned-CPU pointer.
-// `ptr` is the post-narrow data pointer (offset already baked in).
-// strides {row_stride, col_stride} reflect the source tensor.
-at::Tensor StridedCpuViewFromBlob(void* ptr, int64_t rows, int64_t cols,
-                                  int64_t row_stride, int64_t col_stride) {
-  auto opts = at::TensorOptions().dtype(kCpuDtype).device(at::kCPU);
-  return at::from_blob(ptr, {rows, cols}, {row_stride, col_stride}, opts);
 }
 
 }  // namespace
@@ -129,8 +132,7 @@ CotsCpuInfer::~CotsCpuInfer() {
   }
 }
 
-void CotsCpuInfer::install(int64_t n_slabs, int64_t scratch_max_tokens,
-                           int64_t scratch_max_intermediate_per_half) {
+void CotsCpuInfer::install(int64_t n_slabs, int64_t max_num_tokens) {
   TORCH_CHECK(n_slabs >= 0, "install: n_slabs must be >= 0, got ", n_slabs);
   TORCH_CHECK(!slabs_,
               "install: CotsCpuInfer already installed; call once per "
@@ -146,15 +148,7 @@ void CotsCpuInfer::install(int64_t n_slabs, int64_t scratch_max_tokens,
     }
   }
   slab_count_ = n_slabs;
-
-  scratch_max_tokens_ = scratch_max_tokens;
-  scratch_max_intermediate_per_half_ = scratch_max_intermediate_per_half;
-  if (scratch_max_tokens > 0 && scratch_max_intermediate_per_half > 0) {
-    auto opts = at::TensorOptions().dtype(at::kBFloat16).device(at::kCPU);
-    // Worker-local scratch for silu(gate)*up. One max-sized tensor.
-    scratch_silu_up_ = at::empty(
-        {scratch_max_tokens, scratch_max_intermediate_per_half}, opts);
-  }
+  max_num_tokens_ = max_num_tokens;
 }
 
 void CotsCpuInfer::check_error() {
@@ -210,8 +204,7 @@ void CotsCpuInfer::populate_slab_mlp(
     uintptr_t x_pinned_ptr, int32_t in_dim, uintptr_t y_pinned_ptr,
     int32_t cpu_out_dim, uintptr_t w_gate_ptr, int32_t w_gate_rows,
     uintptr_t w_up_ptr, int32_t w_up_rows, uintptr_t w_down_ptr,
-    int32_t w_down_rows, int32_t w_down_cols, int64_t w_down_stride_row,
-    int64_t w_down_stride_col, int32_t intermediate_per_half) {
+    int32_t w_down_rows, int32_t w_down_cols, int32_t intermediate_per_half) {
   check_error();
   TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
               "populate_slab_mlp: task_id ", task_id, " out of range");
@@ -233,8 +226,6 @@ void CotsCpuInfer::populate_slab_mlp(
   s.w_down_ptr = reinterpret_cast<void*>(w_down_ptr);
   s.w_down_rows = w_down_rows;
   s.w_down_cols = w_down_cols;
-  s.w_down_stride_row = w_down_stride_row;
-  s.w_down_stride_col = w_down_stride_col;
   s.intermediate_per_half = intermediate_per_half;
 }
 
@@ -272,13 +263,13 @@ void CotsCpuInfer::submit_on_stream(int64_t task_id, int32_t num_tokens,
   TaskSlab* slab = &slabs_[task_id];
   TORCH_CHECK(num_tokens >= 0, "submit_on_stream: num_tokens=", num_tokens,
               " < 0");
-  // §1c.20: bound check against scratch_max_tokens_ catches Planner
+  // §1c.20: bound check against max_num_tokens_ catches Planner
   // mistakes where an oversized batch reaches a slab. Skipped when
-  // scratch_max_tokens_==0 (test fixtures that don't allocate scratch
-  // / don't run real tokens through the slab — diagnostic-only path).
-  TORCH_CHECK(scratch_max_tokens_ == 0 || num_tokens <= scratch_max_tokens_,
+  // max_num_tokens_==0 (test fixtures that don't run real tokens
+  // through the slab — diagnostic-only path).
+  TORCH_CHECK(max_num_tokens_ == 0 || num_tokens <= max_num_tokens_,
               "submit_on_stream: num_tokens=", num_tokens,
-              " exceeds scratch_max_tokens=", scratch_max_tokens_,
+              " exceeds max_num_tokens=", max_num_tokens_,
               " (would write past the pinned buffer's tail)");
   slab->num_tokens.store(num_tokens, std::memory_order_release);
   // §1c.21 counters: bump submit_count + num_tokens histogram for
@@ -563,6 +554,28 @@ void CotsCpuInfer::run_at_linear_inline(at::Tensor x, at::Tensor w,
   y_out.copy_(at::linear(x, w));
 }
 
+void CotsCpuInfer::run_bf16_gemm_transposed_inline(at::Tensor x, at::Tensor w,
+                                                   at::Tensor y_out) {
+  // Stage 7 microbench helper: drive the custom BF16 row-major-weight
+  // GEMM kernel (csrc/cots/bf16_gemm_transposed.cpp) inline. No
+  // TaskQueue, no host callback — used by
+  // test_stage7_layout_microbench's Path H comparison against the
+  // at::linear baseline (Path A). The wrapped function does its own
+  // dtype/contiguity validation and TORCH_CHECK calls on shape; we just
+  // hold InferenceMode so the dispatcher does not record autograd
+  // metadata.
+  c10::InferenceMode g;
+  bf16_gemm_transposed_at(x, w, y_out);
+}
+
+void CotsCpuInfer::run_bf16_gemm_natural_inline(at::Tensor x, at::Tensor w,
+                                                at::Tensor y_out) {
+  // Stage 7-D probe — sibling kernel for the natural (N, K) row-major
+  // BF16 GEMM layout. Same harness pattern as the Path H helper above.
+  c10::InferenceMode g;
+  bf16_gemm_natural_at(x, w, y_out);
+}
+
 at::Tensor CotsCpuInfer::y_pinned_view(int64_t task_id,
                                        int32_t num_tokens) const {
   // §1c.20: build an `at::from_blob` CPU tensor view over the slab's
@@ -584,11 +597,11 @@ at::Tensor CotsCpuInfer::y_pinned_view(int64_t task_id,
     throw std::invalid_argument("CotsCpuInfer::y_pinned_view: num_tokens=" +
                                 std::to_string(num_tokens) + " < 0");
   }
-  if (scratch_max_tokens_ != 0 && num_tokens > scratch_max_tokens_) {
+  if (max_num_tokens_ != 0 && num_tokens > max_num_tokens_) {
     throw std::invalid_argument(
         "CotsCpuInfer::y_pinned_view: num_tokens=" +
         std::to_string(num_tokens) +
-        " exceeds scratch_max_tokens=" + std::to_string(scratch_max_tokens_) +
+        " exceeds max_num_tokens=" + std::to_string(max_num_tokens_) +
         " (would read past the pinned buffer's tail)");
   }
   // dtype is hard-coded bfloat16 (matches populate_slab_*'s contract).
@@ -833,53 +846,54 @@ void CotsCpuInfer::RunSlabOnWorker(TaskSlab* slab, uint32_t seq) {
         break;
       }
       case TaskSlab::kQkv: {
-        // y_view <- at::linear(x_view, w_view).
+        // Stage 7-C: replace at::linear (oneDNN bf16:bf16 emulation
+        // path, ~30 µs dispatch + scratch reorder per call) with our
+        // custom natural-layout BF16 GEMM. Same (N, K) row-major
+        // weight layout the slab already carries; output is written
+        // in-place into y_view's pinned-memory backing.
         auto x_view =
             ContigCpuViewFromBlob(slab->x_pinned_ptr, n, slab->in_dim);
         auto w_view = ContigCpuViewFromBlob(slab->w_cpu_ptr, slab->w_cpu_rows,
                                             slab->in_dim);
         auto y_view =
             ContigCpuViewFromBlob(slab->y_pinned_ptr, n, slab->cpu_out_dim);
-        y_view.copy_(at::linear(x_view, w_view));
+        bf16_gemm_natural_at(x_view, w_view, y_view);
         break;
       }
       case TaskSlab::kMlpBlock: {
         // gate / up are contiguous prefix views of their respective halves
         // of the gate_up CPU buffer (Phase 1b populates them this way).
+        // Stage 7-C: gate/up swap at::linear → bf16_gemm_natural_at.
+        // gate_out / up_out are per-call at::empty allocs (matches the
+        // pre-Stage-7-C at::linear path's internal output alloc count).
         auto x_view =
             ContigCpuViewFromBlob(slab->x_pinned_ptr, n, slab->in_dim);
         auto w_gate = ContigCpuViewFromBlob(slab->w_gate_ptr, slab->w_gate_rows,
                                             slab->in_dim);
         auto w_up = ContigCpuViewFromBlob(slab->w_up_ptr, slab->w_up_rows,
                                           slab->in_dim);
-        auto gate_out =
-            at::linear(x_view, w_gate);  // (n, intermediate_per_half)
-        auto up_out = at::linear(x_view, w_up);
+        auto gate_out = at::empty(
+            {static_cast<int64_t>(n), static_cast<int64_t>(slab->w_gate_rows)},
+            w_gate.options());
+        auto up_out = at::empty(
+            {static_cast<int64_t>(n), static_cast<int64_t>(slab->w_up_rows)},
+            w_up.options());
+        bf16_gemm_natural_at(x_view, w_gate, gate_out);
+        bf16_gemm_natural_at(x_view, w_up, up_out);
 
-        // Worker-local scratch — single max-sized tensor.
-        TORCH_CHECK(scratch_silu_up_.defined(),
-                    "MLP slab dispatched but scratch_silu_up_ not "
-                    "allocated; install() must be called with non-zero "
-                    "scratch sizes.");
-        TORCH_CHECK(n <= scratch_max_tokens_, "MLP slab num_tokens (", n,
-                    ") exceeds scratch_max_tokens_ (", scratch_max_tokens_,
-                    ")");
-        TORCH_CHECK(
-            slab->intermediate_per_half <= scratch_max_intermediate_per_half_,
-            "MLP slab intermediate_per_half (", slab->intermediate_per_half,
-            ") exceeds scratch_max_intermediate_per_half_ (",
-            scratch_max_intermediate_per_half_, ")");
-        auto z = scratch_silu_up_.narrow(0, 0, n).narrow(
-            1, 0, slab->intermediate_per_half);
-        z.copy_(at::silu(gate_out) * up_out);
+        // silu(gate)*up intermediate is a fresh contig tensor (the
+        // elementwise op allocates it). Feeds directly into the down
+        // kernel — no worker-local scratch needed.
+        auto z = at::silu(gate_out).mul_(up_out);
 
-        // Down-proj: column-strided view.
-        auto w_down = StridedCpuViewFromBlob(
-            slab->w_down_ptr, slab->w_down_rows, slab->w_down_cols,
-            slab->w_down_stride_row, slab->w_down_stride_col);
+        // Down-proj weight: transposed (K=dn_n_cpu, N=out_dim) row-major
+        // contiguous view (see TaskSlab doc in cots_cpu_infer.h). Output
+        // is written in-place into the pinned y_view.
+        auto w_down = ContigCpuViewFromBlob(slab->w_down_ptr, slab->w_down_rows,
+                                            slab->w_down_cols);
         auto y_view =
             ContigCpuViewFromBlob(slab->y_pinned_ptr, n, slab->cpu_out_dim);
-        y_view.copy_(at::linear(z, w_down));
+        bf16_gemm_transposed_at(z, w_down, y_view);
         break;
       }
     }
