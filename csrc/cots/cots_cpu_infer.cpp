@@ -282,9 +282,9 @@ void CotsCpuInfer::submit_on_stream(int64_t task_id, int32_t num_tokens,
               " (would write past the pinned buffer's tail)");
   slab->num_tokens.store(num_tokens, std::memory_order_release);
   // §1c.21 counters: bump submit_count + num_tokens histogram for
-  // this op kind. Bin index = position of msb of num_tokens, clamped
-  // to [0, 7]. nt<=1 → 0, nt<=2 → 1, ..., nt<=64 → 6, nt>64 → 7.
-  {
+  // this op kind. Diag-gated (§1c.34 cleanup C) — production-default
+  // path skips the atomic adds entirely.
+  if (nvtx_internal::diag_enabled()) {
     int hist_bin;
     if (num_tokens <= 1)
       hist_bin = 0;
@@ -348,12 +348,17 @@ void CotsCpuInfer::submit_on_stream(int64_t task_id, int32_t num_tokens,
         static_cast<size_t>(slab->in_dim) * sizeof(at::BFloat16);
     cudaError_t copy_err;
     NvtxScope d2h_scope("cots:d2h_record");
+    // §1c.34 cleanup C: D2H byte/count counters are diagnostic only;
+    // diag-gate them so the hot path skips the atomic adds.
+    const bool d2h_diag = nvtx_internal::diag_enabled();
     if (x_stride0 == x_cols) {
       // Contiguous row layout — single 1D copy is fastest.
       const size_t bytes = static_cast<size_t>(num_tokens) * width_bytes;
-      d2h_1d_count_.fetch_add(1, std::memory_order_relaxed);
-      d2h_record_bytes_1d_.fetch_add(static_cast<int64_t>(bytes),
-                                     std::memory_order_relaxed);
+      if (d2h_diag) {
+        d2h_1d_count_.fetch_add(1, std::memory_order_relaxed);
+        d2h_record_bytes_1d_.fetch_add(static_cast<int64_t>(bytes),
+                                       std::memory_order_relaxed);
+      }
       copy_err = cudaMemcpyAsync(slab->x_pinned_ptr,
                                  reinterpret_cast<void*>(x_gpu_ptr), bytes,
                                  cudaMemcpyDeviceToHost, stream);
@@ -365,9 +370,11 @@ void CotsCpuInfer::submit_on_stream(int64_t task_id, int32_t num_tokens,
       const size_t src_pitch =
           static_cast<size_t>(x_stride0) * sizeof(at::BFloat16);
       const size_t bytes_2d = width_bytes * static_cast<size_t>(num_tokens);
-      d2h_2d_count_.fetch_add(1, std::memory_order_relaxed);
-      d2h_record_bytes_2d_.fetch_add(static_cast<int64_t>(bytes_2d),
-                                     std::memory_order_relaxed);
+      if (d2h_diag) {
+        d2h_2d_count_.fetch_add(1, std::memory_order_relaxed);
+        d2h_record_bytes_2d_.fetch_add(static_cast<int64_t>(bytes_2d),
+                                       std::memory_order_relaxed);
+      }
       copy_err = cudaMemcpy2DAsync(
           slab->x_pinned_ptr, /*dpitch=*/width_bytes,
           reinterpret_cast<void*>(x_gpu_ptr), /*spitch=*/src_pitch,
@@ -749,7 +756,13 @@ void CotsCpuInfer::RunSlabOnWorker(TaskSlab* slab, uint32_t seq) {
     if (override_n > 0) {
       if (override_n > slab_cap) {
         n = slab_cap;
-        worker_clamp_override_count_.fetch_add(1, std::memory_order_relaxed);
+        // §1c.34 cleanup C: clamp counter is diag-gated. Production
+        // doesn't need observability of clamp events — the clamp
+        // itself is a safety behavior (correct vs reading past the
+        // pinned buffer); only the COUNT is observational.
+        if (diag) {
+          worker_clamp_override_count_.fetch_add(1, std::memory_order_relaxed);
+        }
       } else {
         n = override_n;
       }
@@ -757,11 +770,11 @@ void CotsCpuInfer::RunSlabOnWorker(TaskSlab* slab, uint32_t seq) {
       n = slab_cap;
     }
 
-    // §1c.21 fix-validation: bin the effective_n the worker
-    // actually used. If submit-time num_tokens histogram is mostly
-    // `nt_gt_64` but this is mostly `nt_le_1`, the override is
-    // working as intended.
-    {
+    // §1c.21 fix-validation + §1c.22 byte accounting: bin the
+    // effective_n the worker actually used, plus per-replay bucket
+    // and live byte counters. All diag-gated (§1c.34 cleanup C);
+    // production-default skips the atomic adds entirely.
+    if (diag) {
       int hist_bin;
       if (n <= 1)
         hist_bin = 0;
@@ -781,46 +794,35 @@ void CotsCpuInfer::RunSlabOnWorker(TaskSlab* slab, uint32_t seq) {
         hist_bin = 7;
       worker_effective_n_hist_[hist_bin].fetch_add(1,
                                                    std::memory_order_relaxed);
-    }
-    // §1c.22 byte accounting (replay-time). RunSlabOnWorker fires
-    // PER REPLAY because the captured host callback re-executes
-    // each time the graph replays. Two paired counters:
-    //
-    // - worker_*_live_bytes: bytes the worker actually reads/writes
-    //   for the live-token override (n).
-    // - *_replay_bucket_bytes: bytes attributable to the captured
-    //   cudaMemcpyAsync (input D2H) and Triton UVA kernel (output
-    //   H2D) — sized by the descriptor bucket capacity.
-    //
-    // §1c.22 review-fix: read the IMMUTABLE
-    // `bucket_capacity_tokens` populated at install time, NOT the
-    // mutable `slab->num_tokens` (which can be overwritten by later
-    // submit_on_stream calls during graph capture / PIECEWISE Python
-    // re-execution and is thus unreliable as a stable bucket
-    // estimate). bucket_capacity_tokens is still an ESTIMATE of the
-    // captured graph node's actual byte param — only authoritative
-    // value would come from inspecting the cuGraphNode at capture
-    // time, which is out of scope. Stable and descriptor-attributed
-    // is the best we can do without graph introspection.
-    const int64_t bucket_n = static_cast<int64_t>(slab->bucket_capacity_tokens);
-    if (slab->in_dim > 0) {
-      const int64_t row_bytes_in = static_cast<int64_t>(slab->in_dim) *
-                                   static_cast<int64_t>(sizeof(at::BFloat16));
-      d2h_replay_bucket_bytes_.fetch_add(bucket_n * row_bytes_in,
-                                         std::memory_order_relaxed);
-      if (n > 0) {
-        worker_input_live_bytes_.fetch_add(
-            static_cast<int64_t>(n) * row_bytes_in, std::memory_order_relaxed);
+      // §1c.22 byte accounting. Read the IMMUTABLE
+      // `bucket_capacity_tokens` populated at install time (NOT
+      // mutable `slab->num_tokens` which can be overwritten by
+      // later submit_on_stream calls during graph capture /
+      // PIECEWISE Python re-execution).
+      const int64_t bucket_n =
+          static_cast<int64_t>(slab->bucket_capacity_tokens);
+      if (slab->in_dim > 0) {
+        const int64_t row_bytes_in = static_cast<int64_t>(slab->in_dim) *
+                                     static_cast<int64_t>(sizeof(at::BFloat16));
+        d2h_replay_bucket_bytes_.fetch_add(bucket_n * row_bytes_in,
+                                           std::memory_order_relaxed);
+        if (n > 0) {
+          worker_input_live_bytes_.fetch_add(
+              static_cast<int64_t>(n) * row_bytes_in,
+              std::memory_order_relaxed);
+        }
       }
-    }
-    if (slab->cpu_out_dim > 0) {
-      const int64_t row_bytes_out = static_cast<int64_t>(slab->cpu_out_dim) *
-                                    static_cast<int64_t>(sizeof(at::BFloat16));
-      uva_replay_bucket_bytes_.fetch_add(bucket_n * row_bytes_out,
-                                         std::memory_order_relaxed);
-      if (n > 0) {
-        worker_output_live_bytes_.fetch_add(
-            static_cast<int64_t>(n) * row_bytes_out, std::memory_order_relaxed);
+      if (slab->cpu_out_dim > 0) {
+        const int64_t row_bytes_out =
+            static_cast<int64_t>(slab->cpu_out_dim) *
+            static_cast<int64_t>(sizeof(at::BFloat16));
+        uva_replay_bucket_bytes_.fetch_add(bucket_n * row_bytes_out,
+                                           std::memory_order_relaxed);
+        if (n > 0) {
+          worker_output_live_bytes_.fetch_add(
+              static_cast<int64_t>(n) * row_bytes_out,
+              std::memory_order_relaxed);
+        }
       }
     }
 
@@ -921,10 +923,10 @@ void CotsCpuInfer::RunSlabOnWorker(TaskSlab* slab, uint32_t seq) {
 // --- §1c.21 live-token override ---------------------------------------
 
 void CotsCpuInfer::note_uva_request(int32_t num_tokens, int32_t cpu_out_dim) {
-  // §1c.22 bookkeeping. No bound checks beyond non-negativity —
-  // this is a measurement-only path; the actual UVA kernel does
-  // its own validation.
+  // §1c.22 bookkeeping. Diag-gated (§1c.34 cleanup C) —
+  // measurement-only path; no functional dependency.
   if (num_tokens <= 0 || cpu_out_dim <= 0) return;
+  if (!nvtx_internal::diag_enabled()) return;
   const int64_t bytes = static_cast<int64_t>(num_tokens) *
                         static_cast<int64_t>(cpu_out_dim) *
                         static_cast<int64_t>(sizeof(at::BFloat16));
@@ -939,10 +941,15 @@ void CotsCpuInfer::set_runtime_num_tokens(int32_t n) {
   // with this. The caller's responsibility is to set this BEFORE the
   // captured graph replay begins (i.e., from
   // CotsOffloader.prepare_before_forward, called by
-  // cudagraph_utils.py:267 outside the captured region).
+  // cudagraph_utils.py:267 outside the captured region). This store
+  // is FUNCTIONAL (drives the worker's effective_n) and must stay
+  // always-on; the runtime_set_calls / runtime_last_value counters
+  // alongside are diagnostic only and diag-gated (§1c.34 cleanup C).
   runtime_num_tokens_.store(n, std::memory_order_release);
-  runtime_set_calls_.fetch_add(1, std::memory_order_relaxed);
-  runtime_last_value_.store(n, std::memory_order_relaxed);
+  if (nvtx_internal::diag_enabled()) {
+    runtime_set_calls_.fetch_add(1, std::memory_order_relaxed);
+    runtime_last_value_.store(n, std::memory_order_relaxed);
+  }
 }
 
 // --- §1c.21 perf-investigation counters --------------------------------
