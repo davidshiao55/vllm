@@ -164,8 +164,19 @@ def _uva_copy_trusted_host_into_gpu(
     captured-graph hot path.
     """
     assert dst_gpu.is_cuda, "dst must be on CUDA"
-    assert src_pinned.shape == dst_gpu.shape, (
-        f"shape mismatch: src={tuple(src_pinned.shape)}, dst={tuple(dst_gpu.shape)}"
+    # §1c.35 commit-2: src is the slab's pinned view, sized to the
+    # bucket capacity (via C++ y_pinned_view's clamp at
+    # slab.bucket_capacity_tokens). dst is the operator's view
+    # sized to int(y_gpu.shape[0]) which under Inductor
+    # specialization may be larger (typically max). The Triton
+    # kernel writes `src.numel()` elements into the prefix of dst;
+    # tail rows of dst stay stale, harmless because downstream
+    # uses only the first `live_count <= bucket` rows.
+    assert src_pinned.shape[1:] == dst_gpu.shape[1:], (
+        f"tail-dim mismatch: src={tuple(src_pinned.shape)}, dst={tuple(dst_gpu.shape)}"
+    )
+    assert src_pinned.numel() <= dst_gpu.numel(), (
+        f"src.numel()={src_pinned.numel()} > dst.numel()={dst_gpu.numel()}"
     )
     assert src_pinned.dtype == dst_gpu.dtype, (
         f"dtype mismatch: src={src_pinned.dtype}, dst={dst_gpu.dtype}"

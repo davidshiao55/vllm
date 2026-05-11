@@ -271,6 +271,21 @@ void CotsCpuInfer::submit_on_stream(int64_t task_id, int32_t num_tokens,
               "submit_on_stream: num_tokens=", num_tokens,
               " exceeds max_num_tokens=", max_num_tokens_,
               " (would write past the pinned buffer's tail)");
+  // §1c.35 commit-2: clamp the Python-passed num_tokens at the
+  // slab's bucket capacity. The passed value comes from
+  // `int(x_gpu.shape[0])` which under vLLM's PIECEWISE compile +
+  // BACKED dynamic shapes resolves to the SymInt hint
+  // (typically max_num_batched_tokens or another large constant),
+  // baked into the captured custom-op argument and shared across
+  // all per-bucket FULL captures. `slab->bucket_capacity_tokens`
+  // is IMMUTABLE (set at install time per (layer, bucket,
+  // op_kind) from `op_descriptor[1]`) and IS the dispatched
+  // bucket. Clamping here makes the captured D2H byte count and
+  // `slab.num_tokens` tight per-bucket — matching what
+  // §1c.21's runtime override clamps the worker GEMM to (live).
+  // For B=1 decode at bucket=1: effective_n=1 even without the
+  // override.
+  num_tokens = std::min(num_tokens, slab->bucket_capacity_tokens);
   slab->num_tokens.store(num_tokens, std::memory_order_release);
   // §1c.21 counters: bump submit_count + num_tokens histogram for
   // this op kind. Diag-gated (§1c.34 cleanup C) — production-default
@@ -604,6 +619,17 @@ at::Tensor CotsCpuInfer::y_pinned_view(int64_t task_id,
         " exceeds max_num_tokens=" + std::to_string(max_num_tokens_) +
         " (would read past the pinned buffer's tail)");
   }
+  // §1c.35 commit-2: clamp at the slab's bucket capacity (same
+  // rationale as submit_on_stream above). Makes the returned view
+  // bucket-sized — so the captured UVA Triton kernel's grid is
+  // sized to bucket * cpu_out_dim, not max * cpu_out_dim. The
+  // operator's destination view (sized to the
+  // Inductor-baked int(y_gpu.shape[0])) may be larger; the
+  // Triton kernel writes src.numel() elements into the prefix
+  // of dst, leaving the tail rows untouched. Downstream consumes
+  // only the first `live_count <= bucket` rows (see also
+  // _uva_copy_trusted_host_into_gpu's relaxed shape assertion).
+  num_tokens = std::min(num_tokens, slab.bucket_capacity_tokens);
   // dtype is hard-coded bfloat16 (matches populate_slab_*'s contract).
   // The pointer's underlying allocation came from `_y_pinned` (a
   // `torch.empty(..., pin_memory=True)`) and is page-locked; we trust
