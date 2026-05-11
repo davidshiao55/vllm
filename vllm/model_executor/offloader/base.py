@@ -6,6 +6,7 @@
 
 from abc import ABC, abstractmethod
 from collections.abc import Generator
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch.nn as nn
@@ -14,6 +15,30 @@ from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config import OffloadConfig
+    from vllm.forward_context import BatchDescriptor
+
+
+@dataclass(frozen=True)
+class ForwardDispatchInfo:
+    """All per-forward dispatch state the offloader needs, pushed OOG.
+
+    Single boundary between vLLM's model runner and the offloader so
+    future per-forward state can land here without another vLLM-side
+    call site. Pushed by `gpu_model_runner.execute_model` BEFORE every
+    forward (FULL/PIECEWISE/eager dispatch).
+
+    - `batch_descriptor.num_tokens` is the authoritative dispatched
+      bucket (padded). Replaces the in-graph pre-hook's
+      `anchor.shape[0]` inference, which saturated to the persistent
+      input-buffer size under FULL CUDA Graph capture and made
+      per-bucket Planner outputs ineffective at runtime.
+    - `num_tokens_unpadded` is the live row count, consumed by the
+      §1c.21 worker override.
+    """
+
+    batch_descriptor: "BatchDescriptor"
+    num_tokens_unpadded: int
+
 
 logger = init_logger(__name__)
 
@@ -82,6 +107,20 @@ class BaseOffloader(ABC):
         `phase1c_findings.md §1c.21`) override.
         """
         pass
+
+    def on_dispatch(self, info: ForwardDispatchInfo) -> None:
+        """Single OOG entry point for all per-forward dispatch state.
+
+        Called by `gpu_model_runner.execute_model` BEFORE every forward
+        (FULL/PIECEWISE/eager). Default impl delegates to the legacy
+        per-piece methods so existing offloaders (and the NEW path's
+        cudagraph_utils.py triplet) keep working unchanged. The COTS
+        offloader overrides this to add an env-var gate for the §1c.21
+        runtime-tokens override (used by the bucket-key-fix A/B).
+        """
+        self.prepare_before_forward(info.batch_descriptor.num_tokens)
+        self.sync_prev_onload()
+        self.set_runtime_num_tokens(info.num_tokens_unpadded)
 
     def post_cudagraph_capture(self) -> None:  # noqa: B027
         """One-shot hook fired by `cudagraph_utils.CudaGraphManager.capture`

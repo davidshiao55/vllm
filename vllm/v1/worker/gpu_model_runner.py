@@ -84,6 +84,7 @@ from vllm.model_executor.models.interfaces_base import (
     is_text_generation_model,
 )
 from vllm.model_executor.offloader import (
+    ForwardDispatchInfo,
     create_offloader,
     get_offloader,
     set_offloader,
@@ -4026,15 +4027,23 @@ class GPUModelRunner(
         )
 
         # Run the model.
-        # §1c.21: push the live unpadded token count to the offloader
-        # BEFORE the FULL/PIECEWISE/eager dispatch so the COTS native
-        # worker uses live row counts for CPU GEMM work, not the
-        # captured graph-bucket size at `batch_desc.num_tokens`. The
-        # captured graph shape stays at the bucket; only the worker's
-        # row-count arithmetic shrinks. No-op for offloaders that
-        # don't override `set_runtime_num_tokens`. `get_offloader` is
-        # imported at module scope (line 88).
-        get_offloader().set_runtime_num_tokens(num_tokens_unpadded)
+        # Bucket-key fix + §1c.21: single OOG entry that pushes the
+        # dispatched padded bucket (`batch_desc.num_tokens`) AND the
+        # live unpadded count to the offloader BEFORE the
+        # FULL/PIECEWISE/eager dispatch. Replaces the standalone
+        # `set_runtime_num_tokens` call that lived here pre-fix.
+        # `on_dispatch` default impl is a thin wrapper around the
+        # legacy `prepare_before_forward + sync_prev_onload +
+        # set_runtime_num_tokens` triplet, so non-COTS offloaders keep
+        # working unchanged. CotsOffloader overrides to add an
+        # env-var gate (`VLLM_COTS_DISABLE_RUNTIME_OVERRIDE=1`) for
+        # the bucket-key A/B experiment. No-op for NoopOffloader.
+        get_offloader().on_dispatch(
+            ForwardDispatchInfo(
+                batch_descriptor=batch_desc,
+                num_tokens_unpadded=num_tokens_unpadded,
+            )
+        )
 
         # Use persistent buffers for CUDA graphs.
         # When spec decode is enabled, defer connector finalization

@@ -4,6 +4,7 @@
 
 from vllm.model_executor.offloader.base import (
     BaseOffloader,
+    ForwardDispatchInfo,
     NoopOffloader,
     create_offloader,
     get_offloader,
@@ -16,6 +17,7 @@ from vllm.model_executor.offloader.uva import UVAOffloader
 __all__ = [
     "BaseOffloader",
     "CotsOffloader",
+    "ForwardDispatchInfo",
     "NoopOffloader",
     "UVAOffloader",
     "PrefetchOffloader",

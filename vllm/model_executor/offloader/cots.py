@@ -50,7 +50,7 @@ import torch.nn.functional as F
 import vllm.model_executor.offloader.prefetch_ops  # noqa: F401
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.offloader.base import BaseOffloader
+from vllm.model_executor.offloader.base import BaseOffloader, ForwardDispatchInfo
 from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.utils.platform_utils import is_pin_memory_available
 
@@ -1930,19 +1930,29 @@ class CotsQKVOp:
 
         h = self._handle
         assert h.w_cpu is not None
+        # NOTE: under torch.compile + BACKED dynamic shapes (vLLM's
+        # FULL_AND_PIECEWISE mode), `x.shape[0]` resolves at trace
+        # time to the SymInt hint = max_num_batched_tokens — NOT the
+        # live token count. So `num_tokens` here is really the
+        # activation buffer's row capacity (max-sized), not the
+        # number of live tokens. Used only for buffer-view shape
+        # alignment with x (y_dst / x_in / y_out / scatter `out` all
+        # carry the same row dim as x for index_copy_ consistency).
+        # Bucket selection uses `b`; CPU GEMM row count uses the
+        # §1c.21 `runtime_num_tokens` override on the C++ side.
         num_tokens = x.shape[0]
         # Phase 1c Stage 3: bucket lives on the offloader (set
-        # unconditionally by `prepare_before_forward`), NOT on the
-        # streamer. The operator must resolve `b` BEFORE reading
-        # per-bucket dicts so that y_pinned's shape (sized to
-        # `n_cpu_compute_by_bucket[b]`) agrees with the runner's install
-        # closure / slab (also keyed on `b`). If prefetch is inactive
-        # (`max_n_prefetch == 0`) every bucket has n_pref=0 and
-        # n_cpu_compute=h.n_cpu, so we can use h.n_cpu directly. If
-        # prefetch IS active but the pre-hook hasn't set _current_bucket
-        # yet (e.g., test that bypasses the hook), fall back to
-        # `_bucket_for(num_tokens)` here. The runner's lazy descriptor
-        # rebuild is still a defense-in-depth backup.
+        # unconditionally by `on_dispatch`), NOT on the streamer. The
+        # operator must resolve `b` BEFORE reading per-bucket dicts so
+        # that y_pinned's shape (sized to `n_cpu_compute_by_bucket[b]`)
+        # agrees with the runner's install closure / slab (also keyed
+        # on `b`). If prefetch is inactive (`max_n_prefetch == 0`)
+        # every bucket has n_pref=0 and n_cpu_compute=h.n_cpu, so we
+        # can use h.n_cpu directly. If prefetch IS active but
+        # _current_bucket hasn't been set (e.g., test that bypasses
+        # on_dispatch), fall back to `_bucket_for(x_rows)` here. The
+        # runner's lazy descriptor rebuild is still a defense-in-depth
+        # backup.
         # §1c.19: resolve bucket to a non-None int up-front. The runner
         # facade does NOT carry a `bucket_for_fallback` callable anymore
         # (that bound method dragged the offloader into Dynamo's guard
@@ -2093,6 +2103,10 @@ class CotsSwiGLUMLPOp:
         dn_h = self._down
         assert gu_h.w_cpu is not None
         assert dn_h.w_cpu is not None
+        # NOTE: under torch.compile + BACKED dynamic shapes, this is
+        # really the activation buffer's row capacity (= max_num_batched_tokens),
+        # not the live token count. See CotsQKVOp.apply for the full
+        # comment. Used only for shape-consistent buffer slicing.
         num_tokens = x.shape[0]
         # Phase 1c Stage 3: bucket from offloader, not streamer (see
         # CotsQKVOp.apply for the resolution rationale). gu and dn
@@ -2481,10 +2495,17 @@ class CotsOffloader(BaseOffloader):
         # f_prefetch == 0.
         if any(h.max_n_prefetch > 0 for h in self._handles):
             self._install_prefetch_machinery()
-        # Phase 1c: bucket pre-hook is independent of prefetch. Always
-        # install whenever COTS has handles so the operator slab/closure
-        # lookup has a valid `_current_bucket` even at f_prefetch=0.
-        self._install_bucket_prehook()
+        # NOTE: the in-graph pre-hook used to set `_current_bucket` via
+        # `anchor.shape[0]` (the persistent input buffer under FULL
+        # CUDA Graph capture). Under fullgraph trace it clobbered the
+        # OOG bucket set by cudagraph_utils.py and saturated the
+        # bucket key to the largest captured size. The replacement is
+        # `on_dispatch`, called OOG per-forward from
+        # `gpu_model_runner.execute_model`. `prepare_before_forward`
+        # is kept as a callable method (still used by the NEW path's
+        # cudagraph_utils.py:224/291 triplet) — only the pre-hook
+        # registration is removed. See bucket-key-fix discussion.
+        # self._install_bucket_prehook()  # DISABLED — see comment above
 
         logger.info_once(
             "CotsOffloader: wrapped %d linear modules and %d fused MLP blocks "
@@ -3187,6 +3208,41 @@ class CotsOffloader(BaseOffloader):
         from vllm.model_executor.offloader import cots_ops
 
         cots_ops.set_runtime_num_tokens(self._runner._runner_id, int(actual_num_tokens))
+
+    def on_dispatch(self, info: ForwardDispatchInfo) -> None:
+        """OOG per-forward entry. Owns ALL pre-forward state setup that
+        was previously split between the in-graph pre-hook (bucket +
+        slot repair) and the existing OOG `set_runtime_num_tokens`
+        call. Single boundary for both eager and FULL CUDA Graph paths
+        (replay-time too, not just capture-time).
+
+        Order matters:
+        1. `prepare_before_forward(num_tokens_padded)` — sets
+            `_current_bucket`, mirrors streamer's bucket, runs layer-0
+            slot repair (issues H2D on copy_stream). H2D is OOG so it
+            isn't captured; each replay gets fresh repair.
+        2. `sync_prev_onload()` — drains copy_stream into compute
+            stream so the forward sees the filled slot.
+        3. `set_runtime_num_tokens(num_tokens_unpadded)` — §1c.21
+            override pushed to the C++ worker. Env-gated by
+            `VLLM_COTS_DISABLE_RUNTIME_OVERRIDE=1` for the bucket-key
+            A/B: with the bucket-key fix in place, the captured graph
+            references the correct slab (`slab.num_tokens` matches the
+            live count for a B=1 decode), so the §1c.21 row-count
+            override should be redundant.
+        """
+        num_tokens_padded = int(info.batch_descriptor.num_tokens)
+        num_tokens_unpadded = int(info.num_tokens_unpadded)
+        self.prepare_before_forward(num_tokens_padded)
+        self.sync_prev_onload()
+        # `VLLM_COTS_DISABLE_RUNTIME_OVERRIDE=1` skips the §1c.21 push;
+        # used by the bucket-key A/B harness. Default keeps the override
+        # active because empirically Inductor specializes
+        # `int(x.shape[0])` to a single large constant across captured
+        # graphs (§1c.35 findings), so worker CPU GEMM rows would
+        # default to that value without the override.
+        if os.environ.get("VLLM_COTS_DISABLE_RUNTIME_OVERRIDE", "0") != "1":
+            self.set_runtime_num_tokens(num_tokens_unpadded)
 
     def post_cudagraph_capture(self) -> None:
         """§1c.22: env-gated counter reset after all bucket graphs are
