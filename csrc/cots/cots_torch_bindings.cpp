@@ -50,12 +50,13 @@ PYBIND11_MODULE(_cots_C, m) {
            py::arg("cuda_stream"))
       // §1c.29 commit 2 — unified entry. Always called by
       // `cots_sync_then_uva`'s impl; per-slab branch into
-      // sync_on_stream or m3_wait_on_stream lives in C++ so the
+      // sync_on_stream or wait_kernel_sync_on_stream lives in C++ so the
       // Python side does not need to know which mechanism each
       // task uses.
       .def("sync_or_wait_on_stream", &CotsCpuInfer::sync_or_wait_on_stream,
            py::arg("task_id"), py::arg("cuda_stream"))
-      .def("m3_installed_for_task", &CotsCpuInfer::m3_installed_for_task,
+      .def("wait_kernel_sync_installed_for_task",
+           &CotsCpuInfer::wait_kernel_sync_installed_for_task,
            py::arg("task_id"))
       // §1c.33 per-task fire counter — returns
       // List[int] indexed by task_id (size = slab_count_).
@@ -69,18 +70,20 @@ PYBIND11_MODULE(_cots_C, m) {
            py::arg("ablate_hostfn"), py::arg("ablate_submit_hostfn") = false,
            py::arg("ablate_sync_hostfn") = false)
       // §1c.29 M3 — install + wait launcher + test helpers.
-      .def("install_m3_for_task", &CotsCpuInfer::install_m3_for_task,
+      .def("install_wait_kernel_sync_for_task",
+           &CotsCpuInfer::install_wait_kernel_sync_for_task, py::arg("task_id"))
+      .def("wait_kernel_sync_on_stream",
+           &CotsCpuInfer::wait_kernel_sync_on_stream, py::arg("task_id"),
+           py::arg("cuda_stream"))
+      .def("wait_kernel_get_req_slot", &CotsCpuInfer::wait_kernel_get_req_slot,
            py::arg("task_id"))
-      .def("m3_wait_on_stream", &CotsCpuInfer::m3_wait_on_stream,
-           py::arg("task_id"), py::arg("cuda_stream"))
-      .def("m3_get_req_slot", &CotsCpuInfer::m3_get_req_slot,
-           py::arg("task_id"))
-      .def("m3_get_done_slot", &CotsCpuInfer::m3_get_done_slot,
-           py::arg("task_id"))
-      .def("m3_set_req_slot", &CotsCpuInfer::m3_set_req_slot,
+      .def("wait_kernel_get_done_slot",
+           &CotsCpuInfer::wait_kernel_get_done_slot, py::arg("task_id"))
+      .def("wait_kernel_set_req_slot", &CotsCpuInfer::wait_kernel_set_req_slot,
            py::arg("task_id"), py::arg("value"))
-      .def("m3_set_done_slot", &CotsCpuInfer::m3_set_done_slot,
-           py::arg("task_id"), py::arg("value"))
+      .def("wait_kernel_set_done_slot",
+           &CotsCpuInfer::wait_kernel_set_done_slot, py::arg("task_id"),
+           py::arg("value"))
       .def("last_observed_num_threads",
            &CotsCpuInfer::last_observed_num_threads)
       .def("has_error", &CotsCpuInfer::has_error)

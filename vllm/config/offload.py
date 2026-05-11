@@ -179,31 +179,40 @@ class CotsOffloadConfig:
     diagnostic — useful for verifying Phase 1c collapsed the orchestration
     column and for catching future regressions in the COTS host path."""
 
-    cots_m3_wait_kernel: bool = Field(default=False)
-    """Phase 1c §1c.29 M3 prototype: replace the captured
-    `cudaLaunchHostFunc(sync_cb)` node with a custom GPU wait kernel
-    that spins on a host-mapped pinned `done_slot` written by the
-    CPU worker. Submit-side host_fn (dispatch_cb) is unchanged so
-    CPU GEMM still starts overlapping immediately when the GPU
-    reaches the submit node. The split host_fn ablation (§1c.27)
-    showed the captured `sync_cb` host_fn alone costs ~273 ms cgl /
-    ~126 ms wall per generate at output_len=128, B=1, t=16, f=0.05
-    — that's the upper bound this flag tries to recover.
+    cots_capture_sync_mode: Literal["host_callback", "wait_kernel"] = "host_callback"
+    """Phase 1c sync-side mechanism for the captured-replay path
+    (formerly "M3" — pre-§1c.34 boolean
+    `cots_m3_wait_kernel=True` was removed in favor of this
+    enum; no backward-compat alias).
 
-    Hard-fail safety gates (commit 2 in `CotsOffloader.post_init`):
-    * Requires `cpu_runner='native'` — the Python runner cannot
-      participate (it has no slabs / no worker thread / no
-      host-mapped `done_slot`).
-    * Requires `enforce_eager=False` — the wait kernel is
-      meaningful only when the captured graph replays the wait
-      node; eager mode would launch+sync each iteration.
-    * Requires CUDA available + `_cots_C` extension built (defensive
-      checks; both are normal preconditions for `cpu_runner='native'`).
+    * `"host_callback"` (default, production-recommended): the
+      captured graph node is `cudaLaunchHostFunc(SyncCallback)`
+      which blocks the CUDA driver thread on
+      `TaskQueue::sync(0)`. This is the legacy / measured-baseline
+      mechanism.
+    * `"wait_kernel"` (opt-in research path): the captured node
+      is a custom GPU wait kernel that spins on a host-mapped
+      pinned `done_slot` written by the CPU worker. Replaces the
+      captured `cudaLaunchHostFunc(sync_cb)` only. Submit side
+      (dispatch_cb host_fn) is unchanged in both modes so CPU
+      GEMM still overlaps with GPU GEMM. See §1c.29 design +
+      §1c.32/§1c.33 evaluation: capture mode with this kernel
+      did NOT beat native eager on Qwen2.5-7B at B=1/4 across the
+      workload grid, so this stays opt-in.
 
-    Defaults to False; the existing `cudaLaunchHostFunc(sync_cb)`
-    path stays in the codebase as the production default and as
-    the fall-back if M3 is found inadequate. See
-    `David/Docs/phase1c_findings.md` §1c.29."""
+    Hard-fail safety gates (in `CotsOffloader.post_init`) for
+    `wait_kernel` mode:
+    * Requires `cpu_runner='native'` — Python runner has no
+      slabs / worker thread / host-mapped `done_slot`.
+    * Requires `enforce_eager=False` — kernel only makes sense
+      as a captured node.
+    * Requires CUDA + `_cots_C` extension built.
+
+    Phase 2 production guidance: **native eager + legacy
+    host_callback is faster on the measured workloads.** The
+    `wait_kernel` mode is preserved for research /
+    captured-graph experimentation only.
+    """
 
 
 @config

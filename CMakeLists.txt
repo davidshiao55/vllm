@@ -1028,7 +1028,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     # the __global__ kernel and PTX inline asm. The other
     # sources stay C++ host code; nvcc compiles them
     # transparently when LANGUAGE=CUDA.
-    "csrc/cots/cots_m3_wait_kernel.cu")
+    "csrc/cots/cots_wait_done_kernel.cu")
 
   # §1c.29: per-source gencode flags for the M3 .cu file. The
   # PTX `nanosleep` instruction requires sm_70+; without the
@@ -1037,7 +1037,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   # this CMakeLists (e.g., set_gencode_flags_for_srcs is the
   # repo-blessed way to apply CUDA_ARCHS per-source).
   set_gencode_flags_for_srcs(
-    SRCS "csrc/cots/cots_m3_wait_kernel.cu"
+    SRCS "csrc/cots/cots_wait_done_kernel.cu"
     CUDA_ARCHS "${CUDA_ARCHS}")
 
   message(STATUS "Enabling cots_C extension.")

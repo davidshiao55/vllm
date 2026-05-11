@@ -3,7 +3,7 @@
 //
 // §1c.29 M3 — captured wait kernel that replaces the
 // `cudaLaunchHostFunc(sync_cb)` node in the COTS captured graph
-// when `cots_m3_wait_kernel=True`. Compiled as CUDA so nvcc
+// when `cots_capture_sync_mode="wait_kernel"`. Compiled as CUDA so nvcc
 // handles `__global__` and PTX inline asm; rest of `_cots_C`
 // stays as plain C++ host code under the same target language.
 //
@@ -29,8 +29,8 @@ namespace {
 // The volatile reads are critical for host-mapped pinned
 // visibility — the worker writes done_slot from the CPU side and
 // the GPU read must not be cached.
-__global__ void m3_wait_kernel(volatile uint32_t* req_slot,
-                               volatile uint32_t* done_slot) {
+__global__ void cots_wait_done_kernel(volatile uint32_t* req_slot,
+                                      volatile uint32_t* done_slot) {
   uint32_t expected = *req_slot;
   uint32_t done = *done_slot;
   while (done < expected) {
@@ -51,11 +51,11 @@ __global__ void m3_wait_kernel(volatile uint32_t* req_slot,
 // stream variant. With the current single-thread-block launch,
 // regular adds would suffice — keeping atomic to make the
 // counters correct under any later expansion.
-__global__ void m3_wait_kernel_diag(volatile uint32_t* req_slot,
-                                    volatile uint32_t* done_slot,
-                                    int64_t* spin_iters_total,
-                                    int64_t* immediate_count,
-                                    int64_t* lagging_count) {
+__global__ void cots_wait_done_kernel_diag(volatile uint32_t* req_slot,
+                                           volatile uint32_t* done_slot,
+                                           int64_t* spin_iters_total,
+                                           int64_t* immediate_count,
+                                           int64_t* lagging_count) {
   uint32_t expected = *req_slot;
   uint32_t done = *done_slot;
   if (done >= expected) {
@@ -80,18 +80,18 @@ __global__ void m3_wait_kernel_diag(volatile uint32_t* req_slot,
 // `<<<>>>` syntax + kernel symbols behind plain functions so the
 // .cpp file doesn't need to be CUDA.
 
-extern "C" void launch_m3_wait_kernel_production(uint32_t* dev_req_slot,
-                                                 uint32_t* dev_done_slot,
-                                                 cudaStream_t stream) {
-  m3_wait_kernel<<<1, 1, 0, stream>>>(dev_req_slot, dev_done_slot);
+extern "C" void launch_cots_wait_done_kernel_production(uint32_t* dev_req_slot,
+                                                        uint32_t* dev_done_slot,
+                                                        cudaStream_t stream) {
+  cots_wait_done_kernel<<<1, 1, 0, stream>>>(dev_req_slot, dev_done_slot);
 }
 
-extern "C" void launch_m3_wait_kernel_diag(
+extern "C" void launch_cots_wait_done_kernel_diag(
     uint32_t* dev_req_slot, uint32_t* dev_done_slot, int64_t* spin_iters_total,
     int64_t* immediate_count, int64_t* lagging_count, cudaStream_t stream) {
-  m3_wait_kernel_diag<<<1, 1, 0, stream>>>(dev_req_slot, dev_done_slot,
-                                           spin_iters_total, immediate_count,
-                                           lagging_count);
+  cots_wait_done_kernel_diag<<<1, 1, 0, stream>>>(
+      dev_req_slot, dev_done_slot, spin_iters_total, immediate_count,
+      lagging_count);
 }
 
 }  // namespace cots

@@ -71,22 +71,22 @@ struct alignas(64) TaskSlab {
   std::atomic<int64_t> enqueue_time_ns{0};
 
   // §1c.29 M3 (sync host_fn replacement). One req/done slot pair
-  // per slab, allocated lazily by `install_m3_for_task` only when
+  // per slab, allocated lazily by `install_wait_kernel_sync_for_task` only when
   // the M3 feature flag is on. host_*_ptr is the CPU-visible
   // address (worker reads/writes); dev_*_ptr is the GPU-visible
-  // address (m3_wait_kernel reads via host-mapped pinned).
+  // address (cots_wait_done_kernel reads via host-mapped pinned).
   // `next_seq` is incremented per dispatch_cb fire from the
   // driver thread; `uint32_t` is documented as "wraps at 2^32"
   // — at 56 ops × billions of replays this is a non-issue for
   // any realistic workload, but a future robust version could
-  // promote to uint64_t. m3_installed is set by
-  // install_m3_for_task and gates the dispatch/wait paths.
+  // promote to uint64_t. wait_kernel_sync_installed is set by
+  // install_wait_kernel_sync_for_task and gates the dispatch/wait paths.
   void* host_req_slot{nullptr};
   void* dev_req_slot{nullptr};
   void* host_done_slot{nullptr};
   void* dev_done_slot{nullptr};
   std::atomic<uint32_t> next_seq{0};
-  std::atomic<bool> m3_installed{false};
+  std::atomic<bool> wait_kernel_sync_installed{false};
 
   // §1c.33: per-task fire counter. Incremented once per
   // DispatchCallback invocation (the captured graph's host_fn
@@ -236,13 +236,12 @@ class CotsCpuInfer {
   void sync_on_stream(uintptr_t cuda_stream);
 
   // §1c.29 commit 2 — unified sync/wait dispatch. Per-slab choice
-  // based on `slab.m3_installed`: when M3 is installed for this
-  // task (offloader called `install_m3_for_task` in post_init under
-  // `cots_m3_wait_kernel=True`), the captured graph node is the
-  // M3 wait kernel reading the worker-published `done_slot=seq`.
-  // Otherwise the captured node is the legacy
-  // `cudaLaunchHostFunc(SyncCallback)` blocking the driver thread
-  // on `TaskQueue::sync(0)`. The Python side
+  // based on `slab.wait_kernel_sync_installed`: when M3 is installed for this
+  // task (offloader called `install_wait_kernel_sync_for_task` in post_init
+  // under `cots_capture_sync_mode="wait_kernel"`), the captured graph node is
+  // the M3 wait kernel reading the worker-published `done_slot=seq`. Otherwise
+  // the captured node is the legacy `cudaLaunchHostFunc(SyncCallback)` blocking
+  // the driver thread on `TaskQueue::sync(0)`. The Python side
   // (`cots_sync_then_uva`) ALWAYS calls this entry; the A/B is
   // controlled exclusively by whether the offloader installed M3
   // for this task at startup.
@@ -276,8 +275,8 @@ class CotsCpuInfer {
   // cudaHostGetDevicePointer error (per §1c.29 safety gate (c)/(d)
   // — silent fallback under graph capture would put different
   // slabs on different mechanisms, refuse to install). After
-  // success, `slab.m3_installed = true`.
-  void install_m3_for_task(int64_t task_id);
+  // success, `slab.wait_kernel_sync_installed = true`.
+  void install_wait_kernel_sync_for_task(int64_t task_id);
 
   // Launch the captured-graph wait kernel for `task_id` on
   // `cuda_stream`. Selects production vs diag kernel based on
@@ -288,16 +287,16 @@ class CotsCpuInfer {
   // no-check launcher to avoid wedging the stream when a prior
   // worker task has set has_error_; see §1c.29 commit 2
   // review-fix).
-  void m3_wait_on_stream(int64_t task_id, uintptr_t cuda_stream);
+  void wait_kernel_sync_on_stream(int64_t task_id, uintptr_t cuda_stream);
 
   // §1c.29 test helpers. Direct slot access from CPU — used by
-  // the unit smoke (test_m3_wait_kernel_smoke.py) to drive the
+  // the unit smoke (test_cots_wait_done_kernel_smoke.py) to drive the
   // wait kernel in isolation. NOT used on the captured-graph
   // hot path.
-  // Test helper: query whether `install_m3_for_task` was called
+  // Test helper: query whether `install_wait_kernel_sync_for_task` was called
   // for `task_id`. Used by safety-gate tests to assert the
   // post_init wiring matches the config flag.
-  bool m3_installed_for_task(int64_t task_id) const;
+  bool wait_kernel_sync_installed_for_task(int64_t task_id) const;
 
   // §1c.33 diagnostic: per-task fire counts. Returns a vector of
   // `slab.fire_count` values indexed by task_id (size = slab_count_).
@@ -310,10 +309,10 @@ class CotsCpuInfer {
   // the measured window.
   std::vector<int64_t> get_task_fire_counts() const;
 
-  uint32_t m3_get_req_slot(int64_t task_id) const;
-  uint32_t m3_get_done_slot(int64_t task_id) const;
-  void m3_set_req_slot(int64_t task_id, uint32_t value);
-  void m3_set_done_slot(int64_t task_id, uint32_t value);
+  uint32_t wait_kernel_get_req_slot(int64_t task_id) const;
+  uint32_t wait_kernel_get_done_slot(int64_t task_id) const;
+  void wait_kernel_set_req_slot(int64_t task_id, uint32_t value);
+  void wait_kernel_set_done_slot(int64_t task_id, uint32_t value);
 
   // §1c.26 / §1c.27 diagnostic ablation flags. Probe-only —
   // meaningful ONLY under `dry_run=True` AND `VLLM_COTS_DIAG=1`.
@@ -454,14 +453,15 @@ class CotsCpuInfer {
   // wedged with no done_slot consumer). Errors are still surfaced
   // by check_error() at the next Python-side entry point that is
   // safe to short-circuit (submit_on_stream, sync_blocking, etc.).
-  void m3_wait_on_stream_no_check(int64_t task_id, uintptr_t cuda_stream);
+  void wait_kernel_sync_on_stream_no_check(int64_t task_id,
+                                           uintptr_t cuda_stream);
 
   // Worker-thread task body; runs whatever op_kind says. The `seq`
   // parameter (0 == no M3, > 0 == M3 enabled for this dispatch)
   // controls whether the worker publishes `done_slot = seq` after
   // the task completes — see §1c.29 commit 2. The publish is in a
   // finally-style block so a worker exception still releases the
-  // captured wait kernel (otherwise `m3_wait_kernel` would spin
+  // captured wait kernel (otherwise `cots_wait_done_kernel` would spin
   // forever on `done < req` and the GPU stream would deadlock,
   // hiding the error from Python).
   void RunSlabOnWorker(TaskSlab* slab, uint32_t seq);
@@ -624,9 +624,9 @@ class CotsCpuInfer {
   std::atomic<bool> ablate_sync_hostfn_{false};
 
   // §1c.29 M3 diag counters. Allocated once at first
-  // install_m3_for_task call (lazily — most instances don't
+  // install_wait_kernel_sync_for_task call (lazily — most instances don't
   // use M3) as host-mapped pinned int64_t cells so the GPU
-  // m3_wait_kernel_diag can atomicAdd directly. host_ptr is
+  // cots_wait_done_kernel_diag can atomicAdd directly. host_ptr is
   // CPU-readable for get_counters/reset_counters; dev_ptr is
   // GPU-visible for the kernel. Counters meaning:
   //   immediate_resume: wait fires that found done >= req on
@@ -637,12 +637,12 @@ class CotsCpuInfer {
   // Together they tell us how often the prototype's wait
   // actually serializes vs returns immediately — the §1c.29
   // canary for keeping SM occupancy small.
-  int64_t* m3_immediate_resume_host_{nullptr};
-  int64_t* m3_immediate_resume_dev_{nullptr};
-  int64_t* m3_lagging_wait_host_{nullptr};
-  int64_t* m3_lagging_wait_dev_{nullptr};
-  int64_t* m3_spin_iters_host_{nullptr};
-  int64_t* m3_spin_iters_dev_{nullptr};
+  int64_t* wait_kernel_immediate_resume_host_{nullptr};
+  int64_t* wait_kernel_immediate_resume_dev_{nullptr};
+  int64_t* wait_kernel_lagging_wait_host_{nullptr};
+  int64_t* wait_kernel_lagging_wait_dev_{nullptr};
+  int64_t* wait_kernel_spin_iters_host_{nullptr};
+  int64_t* wait_kernel_spin_iters_dev_{nullptr};
 };
 
 }  // namespace cots
