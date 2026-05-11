@@ -611,11 +611,16 @@ void CotsCpuInfer::DispatchCallback(void* user_data) {
     slab->enqueue_time_ns.store(now_ns(), std::memory_order_release);
     self->dispatch_cb_count_.fetch_add(1, std::memory_order_relaxed);
   }
-  // §1c.33 per-task fire counter. Always-on (single relaxed
-  // atomic add, ~1 ns); read out via get_task_fire_counts() to
-  // attribute the §1c.32 op-count delta to specific
-  // (layer, bucket, op_kind) tuples.
-  slab->fire_count.fetch_add(1, std::memory_order_relaxed);
+  // §1c.33 per-task fire counter. Gated by VLLM_COTS_DIAG=1
+  // (same env that gates the §1c.24 NVTX scopes + dispatch_cb_count
+  // attribution). Reviewer (§1c.33 review-fix): production path
+  // should not pay any extra cost in DispatchCallback — the
+  // counter is observational only, used by the
+  // VLLM_COTS_DUMP_TASK_FIRES=1 atexit dump which itself
+  // requires diag mode to be meaningful.
+  if (nvtx_internal::diag_enabled()) {
+    slab->fire_count.fetch_add(1, std::memory_order_relaxed);
+  }
   // §1c.29 commit 2 — M3 sequence publish. When M3 is installed
   // for this slab, increment the slab-local seq, capture it into
   // the worker lambda, ENQUEUE the lambda FIRST, THEN publish
