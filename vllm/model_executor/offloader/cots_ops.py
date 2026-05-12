@@ -206,6 +206,24 @@ def _resolve_task_for_dispatch(
     return int(task_id), int(bucket), int(live_num_tokens)
 
 
+def _bounded_transfer_rows(bucket: int, tensor_rows: int, op_name: str) -> int:
+    """Rows to copy for the active slab without reading past the tensor.
+
+    The active dispatch bucket selects the native slab/task. In FULL
+    graph replay, the CUDA tensor may be a larger persistent buffer, so
+    the bucket limits transfer work. In eager/profile dummy paths, the
+    slab can be the max-capacity fallback while the tensor is smaller,
+    so the concrete tensor rows limit transfer work.
+    """
+    rows = min(int(bucket), int(tensor_rows))
+    if rows <= 0:
+        raise AssertionError(
+            f"{op_name}: transfer row count must be > 0, got "
+            f"bucket={bucket}, tensor_rows={tensor_rows}"
+        )
+    return rows
+
+
 def _lookup_infer(runner_id: int, op_name: str) -> Any:
     """Resolve runner_id → `CotsCpuInfer` instance. Raises a clear
     error if the runner was already torn down."""
@@ -406,9 +424,10 @@ def _cots_submit_gemm_impl(
     Moving the D2H from Python `copy_(non_blocking=True)` to a raw
     `cudaMemcpyAsync` loses Python's automatic shape/stride/dtype
     handling, so we validate `x_gpu` here BEFORE handing the raw
-    pointer to C++. The slab's `in_dim` and the OOG dispatch bucket
-    together determine the byte count; mismatched shapes would
-    silently copy the wrong amount of data.
+    pointer to C++. The slab task is selected by the OOG dispatch
+    bucket. The transfer row count is bounded by the concrete tensor
+    rows as well, because eager/profile dummy runs can route through a
+    max-capacity slab while executing a smaller tensor.
     """
     assert x_gpu.is_cuda, f"cots_submit_gemm: x_gpu must be on CUDA, got {x_gpu.device}"
     assert x_gpu.dtype == torch.bfloat16, (
@@ -422,11 +441,8 @@ def _cots_submit_gemm_impl(
     task_id, bucket, _live_num_tokens = _resolve_task_for_dispatch(
         runner_id, layer_idx, op_kind_code, "cots_submit_gemm"
     )
-    assert int(x_gpu.shape[0]) >= bucket, (
-        f"cots_submit_gemm: active bucket={bucket} exceeds x_gpu.shape[0]="
-        f"{int(x_gpu.shape[0])}. The native custom op sizes D2H from the "
-        f"OOG BatchDescriptor bucket; the CUDA tensor must contain at least "
-        f"that many rows."
+    num_transfer_rows = _bounded_transfer_rows(
+        bucket, int(x_gpu.shape[0]), "cots_submit_gemm"
     )
     # `stride(1) == 1` is the production contract — feature-dim
     # contiguous, possibly row-strided. The C++ side handles the
@@ -454,7 +470,7 @@ def _cots_submit_gemm_impl(
         # the 1D-vs-2D branch.
         infer.submit_on_stream(
             task_id,
-            bucket,
+            num_transfer_rows,
             x_gpu.data_ptr(),
             x_gpu.shape[1],
             x_gpu.stride(0),
@@ -501,21 +517,18 @@ def _cots_sync_then_uva_impl(
     cloning into it (in the worst case via a GPU intermediate +
     blocking GPU→CPU copy that CUDA Graph capture rejects). The slab
     pointer the worker wrote to IS the source of truth; we reach it
-    directly via the C++-side `y_pinned_view(task_id, bucket)`
-    helper. The Python-visible custom-op signature contains only CUDA
-    tensors and scalar ids, so Inductor has nothing CPU-side to
-    materialize. The trust boundary is install-time: the slab pointer
-    came from `_y_pinned`, allocated `pin_memory=True` and validated
-    there.
+    directly via the C++-side `y_pinned_view(task_id,
+    num_transfer_rows)` helper. The Python-visible custom-op signature
+    contains only CUDA tensors and scalar ids, so Inductor has nothing
+    CPU-side to materialize. The trust boundary is install-time: the
+    slab pointer came from `_y_pinned`, allocated `pin_memory=True` and
+    validated there.
     """
     task_id, bucket, _live_num_tokens = _resolve_task_for_dispatch(
         runner_id, layer_idx, op_kind_code, "cots_sync_then_uva"
     )
-    assert int(y_gpu.shape[0]) >= bucket, (
-        f"cots_sync_then_uva: active bucket={bucket} exceeds y_gpu.shape[0]="
-        f"{int(y_gpu.shape[0])}. The native custom op sizes UVA from the "
-        f"OOG BatchDescriptor bucket; the CUDA destination must contain at "
-        f"least that many rows."
+    num_transfer_rows = _bounded_transfer_rows(
+        bucket, int(y_gpu.shape[0]), "cots_sync_then_uva"
     )
     infer = _lookup_infer(runner_id, "cots_sync_then_uva")
     stream = torch.cuda.current_stream().cuda_stream
@@ -535,8 +548,8 @@ def _cots_sync_then_uva_impl(
         infer.sync_or_wait_on_stream(task_id, stream)
         # Build the CPU view over the slab pointer locally — never escapes
         # back to Python in a way Inductor would see.
-        y_pinned = infer.y_pinned_view(task_id, bucket)
-        infer.note_uva_request(bucket, y_pinned.shape[1])
+        y_pinned = infer.y_pinned_view(task_id, num_transfer_rows)
+        infer.note_uva_request(num_transfer_rows, y_pinned.shape[1])
         # Lazy import to avoid a top-level circular import (cots.py imports
         # this module via cots_ops and we'd loop on `from .cots import ...`).
         from vllm.model_executor.offloader.cots import (
