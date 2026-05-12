@@ -39,7 +39,20 @@ If work is duplicate/trivial busywork, **do not proceed**. Return a short explan
 
 ## 2. Development Workflow
 
-- **Never use system `python3` or bare `pip`/`pip install`.** All Python commands must go through `uv` and `.venv/bin/python`.
+### TTC thesis fork workflow
+
+When this checkout is used as the `vllm/` fork inside the TTC thesis repository,
+use the parent repository's conda workflow for local thesis experiments:
+`conda activate thesis`, run Python from `FastTTS-thesis/` instead of the parent
+repo root, and use the parent `rebuild_vllm.sh` for C++/CUDA changes.
+
+Use the upstream `uv`/`.venv` workflow below when preparing work intended for
+`vllm-project/vllm`, running upstream-style validation, or when the task
+explicitly asks for upstream vLLM contribution behavior.
+
+- For upstream vLLM work, **never use system `python3` or bare
+  `pip`/`pip install`.** All Python commands must go through `uv` and
+  `.venv/bin/python`.
 
 ### Environment setup
 
