@@ -25,8 +25,8 @@ class ForwardDispatchInfo:
     Single boundary between vLLM's model runner and the offloader so
     future per-forward state can land here without another vLLM-side
     call site. Pushed by `GPUModelRunner._publish_offloader_dispatch`
-    BEFORE every scheduler, profile dummy, warmup, or CUDA Graph capture
-    forward.
+    on the active runner path, and by legacy cudagraph utilities when
+    they drive forwards directly.
 
     - `batch_descriptor.num_tokens` is the authoritative dispatched
       bucket (padded). Replaces the in-graph pre-hook's
@@ -120,11 +120,10 @@ class BaseOffloader(ABC):
     def on_dispatch(self, info: ForwardDispatchInfo) -> None:
         """Single OOG entry point for all per-forward dispatch state.
 
-        Called by `GPUModelRunner._publish_offloader_dispatch` BEFORE
-        every scheduler, profile dummy, warmup, or CUDA Graph capture
-        forward. Default impl delegates to the legacy per-piece methods
-        so existing offloaders (and the NEW path's cudagraph_utils.py
-        triplet) keep working unchanged.
+        Called before scheduler, profile dummy, warmup, CUDA Graph
+        capture, or CUDA Graph replay forwards. Default impl delegates
+        to the legacy per-piece methods so existing offloaders keep
+        working unchanged.
         """
         self.prepare_before_forward(info.batch_descriptor.num_tokens)
         self.sync_prev_onload()

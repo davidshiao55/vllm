@@ -429,15 +429,20 @@ def _cots_submit_gemm_impl(
     rows as well, because eager/profile dummy runs can route through a
     max-capacity slab while executing a smaller tensor.
     """
-    assert x_gpu.is_cuda, f"cots_submit_gemm: x_gpu must be on CUDA, got {x_gpu.device}"
-    assert x_gpu.dtype == torch.bfloat16, (
-        f"cots_submit_gemm: x_gpu must be bfloat16 (matches slab dtype), "
-        f"got {x_gpu.dtype}"
-    )
-    assert x_gpu.dim() == 2, (
-        f"cots_submit_gemm: x_gpu must be 2D (num_tokens, in_dim); "
-        f"got shape {tuple(x_gpu.shape)}"
-    )
+    if not x_gpu.is_cuda:
+        raise RuntimeError(
+            f"cots_submit_gemm: x_gpu must be on CUDA, got {x_gpu.device}"
+        )
+    if x_gpu.dtype != torch.bfloat16:
+        raise RuntimeError(
+            f"cots_submit_gemm: x_gpu must be bfloat16 (matches slab dtype), "
+            f"got {x_gpu.dtype}"
+        )
+    if x_gpu.dim() != 2:
+        raise RuntimeError(
+            f"cots_submit_gemm: x_gpu must be 2D (num_tokens, in_dim); "
+            f"got shape {tuple(x_gpu.shape)}"
+        )
     task_id, bucket, _live_num_tokens = _resolve_task_for_dispatch(
         runner_id, layer_idx, op_kind_code, "cots_submit_gemm"
     )
@@ -450,12 +455,13 @@ def _cots_submit_gemm_impl(
     # layouts (stride(1) != 1) would need a separate copy plan and
     # are rejected. Real Qwen2-style hidden_states tensors satisfy
     # this even when they come from padded / sliced bases.
-    assert x_gpu.stride(1) == 1, (
-        f"cots_submit_gemm: x_gpu.stride(1)={x_gpu.stride(1)} (must be 1; "
-        f"no transposed-stride layouts in production decode). For "
-        f"row-strided inputs (stride(0) > shape[1]) the C++ D2H uses "
-        f"cudaMemcpy2DAsync."
-    )
+    if x_gpu.stride(1) != 1:
+        raise RuntimeError(
+            f"cots_submit_gemm: x_gpu.stride(1)={x_gpu.stride(1)} (must be 1; "
+            f"no transposed-stride layouts in production decode). For "
+            f"row-strided inputs (stride(0) > shape[1]) the C++ D2H uses "
+            f"cudaMemcpy2DAsync."
+        )
     infer = _lookup_infer(runner_id, "cots_submit_gemm")
     stream = torch.cuda.current_stream().cuda_stream
     # §1c.24: NVTX scope so the nsys timeline can attribute the
@@ -658,11 +664,9 @@ def _dump_task_fire_counts_at_exit() -> None:
     a file via `VLLM_COTS_DUMP_TASK_FIRES_FILE=/path/to.json`;
     otherwise dump to stderr alongside the standard counters.
 
-    The file output is the auditable artifact for the §1c.32
-    op-count investigation: 35% more captured COTS ops/forward
-    than eager (76.7 vs 56.4), source unknown. Per-task fires
-    let us see which (layer, bucket, op_kind) tuples produce
-    the extras.
+    The file output is an auditable artifact for native COTS dispatch
+    accounting. Per-task fires let us see which
+    (layer, bucket, op_kind) tuples execute during capture/replay.
     """
     if os.environ.get("VLLM_COTS_DUMP_TASK_FIRES", "0") != "1":
         return

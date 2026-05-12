@@ -69,11 +69,10 @@
 // `bf16:bf16`: no src reorder, no ATen+oneDNN dispatch, no extra
 // DRAM pass for src (same wins the transposed sibling gets).
 //
-// Measured performance (i9-14900KF, Qwen2.5-7B QKV/MLP1 shapes):
-// 0.41× of oneDNN's at::linear wall at thr=4 across B ∈ {4, 32,
-// 256} — 2.4× faster than the production at::linear path.
-// Stage 7-D probe data lives in
-// `David/Tests/phase1c/results/stage7_natural_probe.json`.
+// Measured performance during Stage 7-D bring-up (i9-14900KF,
+// Qwen2.5-7B QKV/MLP1 shapes): 0.41× of oneDNN's at::linear wall
+// at thr=4 across B in {4, 32, 256} — 2.4× faster than the prior
+// production at::linear path.
 
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
@@ -222,7 +221,9 @@ void bf16_gemm_natural(const uint16_t* x, const uint16_t* w, uint16_t* y,
 
 #else  // !VLLM_COTS_HAS_AVX2_FMA
 
-// Scalar fallback for non-AVX2 builds. Correctness only.
+// Reference fallback for non-standard direct builds without AVX2/FMA.
+// The vLLM CMake target force-compiles this TU with `-mavx2 -mfma`,
+// so production COTS never takes this branch.
 void bf16_gemm_natural(const uint16_t* x, const uint16_t* w, uint16_t* y,
                        int64_t M, int64_t N, int64_t K) {
   auto bf16_to_f32 = [](uint16_t b) -> float {

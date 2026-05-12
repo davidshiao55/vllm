@@ -163,7 +163,8 @@ def _uva_copy_trusted_host_into_gpu(
     `is_pinned()`/storage-level checks aren't pointless work on the
     captured-graph hot path.
     """
-    assert dst_gpu.is_cuda, "dst must be on CUDA"
+    if not dst_gpu.is_cuda:
+        raise RuntimeError("dst must be on CUDA")
     # §1c.35 commit-2: src is the slab's pinned view, sized to the
     # bucket capacity (via C++ y_pinned_view's clamp at
     # slab.bucket_capacity_tokens). dst is the operator's view
@@ -172,18 +173,23 @@ def _uva_copy_trusted_host_into_gpu(
     # kernel writes `src.numel()` elements into the prefix of dst;
     # tail rows of dst stay stale, harmless because downstream
     # uses only the first `live_count <= bucket` rows.
-    assert src_pinned.shape[1:] == dst_gpu.shape[1:], (
-        f"tail-dim mismatch: src={tuple(src_pinned.shape)}, dst={tuple(dst_gpu.shape)}"
-    )
-    assert src_pinned.numel() <= dst_gpu.numel(), (
-        f"src.numel()={src_pinned.numel()} > dst.numel()={dst_gpu.numel()}"
-    )
-    assert src_pinned.dtype == dst_gpu.dtype, (
-        f"dtype mismatch: src={src_pinned.dtype}, dst={dst_gpu.dtype}"
-    )
-    assert src_pinned.is_contiguous() and dst_gpu.is_contiguous(), (
-        "_uva_copy_trusted_host_into_gpu requires contiguous tensors"
-    )
+    if src_pinned.shape[1:] != dst_gpu.shape[1:]:
+        raise RuntimeError(
+            f"tail-dim mismatch: src={tuple(src_pinned.shape)}, "
+            f"dst={tuple(dst_gpu.shape)}"
+        )
+    if src_pinned.numel() > dst_gpu.numel():
+        raise RuntimeError(
+            f"src.numel()={src_pinned.numel()} > dst.numel()={dst_gpu.numel()}"
+        )
+    if src_pinned.dtype != dst_gpu.dtype:
+        raise RuntimeError(
+            f"dtype mismatch: src={src_pinned.dtype}, dst={dst_gpu.dtype}"
+        )
+    if not (src_pinned.is_contiguous() and dst_gpu.is_contiguous()):
+        raise RuntimeError(
+            "_uva_copy_trusted_host_into_gpu requires contiguous tensors"
+        )
     if not HAS_TRITON:
         raise RuntimeError("cots requires Triton for the UVA activation-return kernel")
     n = src_pinned.numel()
@@ -209,22 +215,25 @@ def uva_copy_into_gpu(
     ensures the input arrives as a real pinned-storage view, not an
     Inductor-cloned pageable buffer.
     """
-    assert _has_pinned_host_storage(src_pinned), (
-        "src must be pinned host memory (storage-level check; see "
-        "phase1c_findings.md §1c.20). A pageable CPU tensor passed "
-        "to the UVA kernel reads garbage from device-mapped host "
-        "memory."
-    )
-    assert dst_gpu.is_cuda, "dst must be on CUDA"
-    assert src_pinned.shape == dst_gpu.shape, (
-        f"shape mismatch: src={tuple(src_pinned.shape)}, dst={tuple(dst_gpu.shape)}"
-    )
-    assert src_pinned.dtype == dst_gpu.dtype, (
-        f"dtype mismatch: src={src_pinned.dtype}, dst={dst_gpu.dtype}"
-    )
-    assert src_pinned.is_contiguous() and dst_gpu.is_contiguous(), (
-        "uva_copy_into_gpu requires contiguous tensors"
-    )
+    if not _has_pinned_host_storage(src_pinned):
+        raise RuntimeError(
+            "src must be pinned host memory (storage-level check; see "
+            "phase1c_findings.md §1c.20). A pageable CPU tensor passed "
+            "to the UVA kernel reads garbage from device-mapped host "
+            "memory."
+        )
+    if not dst_gpu.is_cuda:
+        raise RuntimeError("dst must be on CUDA")
+    if src_pinned.shape != dst_gpu.shape:
+        src_shape = tuple(src_pinned.shape)
+        dst_shape = tuple(dst_gpu.shape)
+        raise RuntimeError(f"shape mismatch: src={src_shape}, dst={dst_shape}")
+    if src_pinned.dtype != dst_gpu.dtype:
+        raise RuntimeError(
+            f"dtype mismatch: src={src_pinned.dtype}, dst={dst_gpu.dtype}"
+        )
+    if not (src_pinned.is_contiguous() and dst_gpu.is_contiguous()):
+        raise RuntimeError("uva_copy_into_gpu requires contiguous tensors")
     if not HAS_TRITON:
         raise RuntimeError("cots requires Triton for the UVA activation-return kernel")
     n = src_pinned.numel()
@@ -2521,11 +2530,11 @@ class CotsOffloader(BaseOffloader):
         # CUDA Graph capture). Under fullgraph trace it clobbered the
         # OOG bucket set by the model runner and saturated the
         # bucket key to the largest captured size. The replacement is
-        # `on_dispatch`, called OOG per-forward from
-        # `GPUModelRunner._publish_offloader_dispatch`. `prepare_before_forward`
-        # is kept as a callable method (still used by the NEW path's
-        # cudagraph_utils.py:224/291 triplet) — only the pre-hook
-        # registration is removed. See bucket-key-fix discussion.
+        # `on_dispatch`, called OOG per-forward from the active
+        # model-runner path and from the older cudagraph utility path.
+        # `prepare_before_forward` is kept as the offloader-local
+        # bucket/slot repair primitive — only the pre-hook registration
+        # is removed. See bucket-key-fix discussion.
         # self._install_bucket_prehook()  # DISABLED — see comment above
 
         logger.info_once(
@@ -3115,9 +3124,9 @@ class CotsOffloader(BaseOffloader):
         always sets `_current_bucket` (plan §design-decision 11). Under
         `f_prefetch=0` (no streamer) this is the only path that sets
         `_current_bucket` under eager mode — without it, the operator's
-        slab lookup would see `bucket=None`. Under graph capture
-        `cudagraph_utils.py:267` calls `prepare_before_forward` outside
-        the captured graph independently.
+        slab lookup would see `bucket=None`. Kept only as historical
+        kill-switch scaffolding; production dispatch uses `on_dispatch`
+        outside the captured graph.
         """
         if not self._layer_modules:
             return
@@ -3221,8 +3230,7 @@ class CotsOffloader(BaseOffloader):
         `_first_decoder_pre_hook` is registered on the model and gets
         traced into the captured graph. The C++-side runtime token
         row cap is pushed via the separate `set_live_num_tokens`
-        method, called OUT OF GRAPH by
-        `GPUModelRunner._publish_offloader_dispatch`.
+        method, called OUT OF GRAPH by `on_dispatch`.
         """
         self._current_bucket = self._bucket_for(num_tokens)
         if self._streamer is None:

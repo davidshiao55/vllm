@@ -385,12 +385,12 @@ class CotsCpuInfer {
   void run_bf16_gemm_transposed_inline(at::Tensor x, at::Tensor w,
                                        at::Tensor y_out);
 
-  // Stage 7-D PROBE — natural (N, K) row-major BF16 GEMM kernel.
+  // Stage 7-D — natural (N, K) row-major BF16 GEMM kernel.
   // Sibling to run_bf16_gemm_transposed_inline; same casting
   // and parallelism strategy but with loop nest swapped for the
-  // natural-layout fast access direction. Used by the Stage 7-D
-  // perf probe in David/Tests/phase1c. Caller-managed tensors;
-  // no TaskQueue involvement.
+  // natural-layout fast access direction. Used by the production
+  // worker paths for QKV/gate/up after Stage 7-C storage
+  // unification. Caller-managed tensors; no TaskQueue involvement.
   void run_bf16_gemm_natural_inline(at::Tensor x, at::Tensor w,
                                     at::Tensor y_out);
 

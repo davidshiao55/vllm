@@ -978,9 +978,8 @@ void CotsCpuInfer::set_runtime_num_tokens(int32_t n) {
               " < 0; pass 0 to clear the override.");
   // Release store: the worker's acquire load in RunSlabOnWorker pairs
   // with this. The caller's responsibility is to set this BEFORE the
-  // captured graph replay begins (i.e., from
-  // CotsOffloader.prepare_before_forward, called by
-  // cudagraph_utils.py:267 outside the captured region). This store
+  // captured graph replay begins (i.e., from CotsOffloader.on_dispatch
+  // outside the captured region). This store
   // is FUNCTIONAL (drives the worker's effective_n) and must stay
   // always-on; the runtime_set_calls / runtime_last_value counters
   // alongside are diagnostic only and diag-gated (§1c.34 cleanup C).

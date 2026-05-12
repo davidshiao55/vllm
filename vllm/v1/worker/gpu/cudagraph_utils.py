@@ -18,7 +18,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
-from vllm.model_executor.offloader.base import get_offloader
+from vllm.model_executor.offloader.base import ForwardDispatchInfo, get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.cots_diag import ENABLED as _COTS_DIAG_ENABLED
@@ -42,6 +42,30 @@ class BatchExecutionDescriptor:
     num_tokens: int
     num_reqs: int | None  # None means no request padding is needed (PIECEWISE graphs)
     uniform_token_count: int | None = None
+
+
+def _batch_descriptor_from_execution(
+    desc: BatchExecutionDescriptor,
+) -> BatchDescriptor:
+    return BatchDescriptor(
+        num_tokens=desc.num_tokens,
+        num_reqs=desc.num_reqs,
+        uniform=desc.uniform_token_count is not None,
+    )
+
+
+def _publish_offloader_dispatch(
+    desc: BatchExecutionDescriptor,
+    actual_num_tokens: int | None = None,
+) -> None:
+    get_offloader().on_dispatch(
+        ForwardDispatchInfo(
+            batch_descriptor=_batch_descriptor_from_execution(desc),
+            num_tokens_unpadded=(
+                desc.num_tokens if actual_num_tokens is None else actual_num_tokens
+            ),
+        )
+    )
 
 
 def _is_compatible(
@@ -203,7 +227,10 @@ class CudaGraphManager:
                     # Prepare inputs and get forward function
                     forward_fn = create_forward_fn(desc)
 
-                    # Warmup
+                    # Warmup. This utility path bypasses the active
+                    # GPUModelRunner dispatch boundary, so publish offloader
+                    # state before every forward it drives directly.
+                    _publish_offloader_dispatch(desc)
                     forward_fn(CUDAGraphMode.NONE)
 
                     # Capture
@@ -211,6 +238,7 @@ class CudaGraphManager:
                         "CG Capture: mode=%s, batch_desc=%s", desc.cg_mode.name, desc
                     )
                     if desc.cg_mode == CUDAGraphMode.PIECEWISE:
+                        _publish_offloader_dispatch(desc)
                         forward_fn(CUDAGraphMode.PIECEWISE)
                     else:
                         assert desc not in self.graphs, (
@@ -218,11 +246,11 @@ class CudaGraphManager:
                         )
                         graph = torch.cuda.CUDAGraph()
                         offloader = get_offloader()
-                        # Repair any bucket-dependent state, then sync the
-                        # copy stream once. Stream ordering makes this drain
-                        # both previously queued copies and any repair H2Ds.
-                        offloader.prepare_before_forward(desc.num_tokens)
-                        offloader.sync_prev_onload()
+                        # FULL capture bypasses the model-runner dispatch
+                        # boundary on this older utility path, so publish the
+                        # same unified offloader state here before native COTS
+                        # ops execute or capture.
+                        _publish_offloader_dispatch(desc)
                         with torch.cuda.graph(graph, self.pool):
                             forward_fn(CUDAGraphMode.NONE)
                             # Join offloader's copy stream after forward to avoid
@@ -283,28 +311,17 @@ class CudaGraphManager:
         # spec-decode / older runner that calls
         # `cudagraph_manager.run_fullgraph`). Env-gated by
         # VLLM_COTS_DIAG=1; production default skips the wrapper.
-        offloader = get_offloader()
         if not _COTS_DIAG_ENABLED:
-            if actual_num_tokens is not None:
-                offloader.set_live_num_tokens(actual_num_tokens)
-            offloader.prepare_before_forward(desc.num_tokens)
-            offloader.sync_prev_onload()
+            _publish_offloader_dispatch(desc, actual_num_tokens)
             self.graphs[desc].replay()
             return
         torch.cuda.nvtx.range_push("cots:replay_prep_full")
         try:
-            # Push the live unpadded token count to the offloader's
-            # worker BEFORE prepare_before_forward. No-op for
-            # offloaders that do not need live-row caps.
-            if actual_num_tokens is not None:
-                offloader.set_live_num_tokens(actual_num_tokens)
-            # FULL graph replay bypasses Python model hooks, so repair
-            # any active-bucket state that normally lives in forward
-            # pre-hooks. A single sync after repair drains both prior
-            # copy-stream work and any repair H2Ds before graph
-            # execution begins.
-            offloader.prepare_before_forward(desc.num_tokens)
-            offloader.sync_prev_onload()
+            # FULL graph replay bypasses the model-runner dispatch boundary
+            # on this older utility path. Publish the unified state here so
+            # native COTS resolves task slabs from the active dispatch rather
+            # than stale globals or tensor-shape inference.
+            _publish_offloader_dispatch(desc, actual_num_tokens)
         finally:
             torch.cuda.nvtx.range_pop()
         torch.cuda.nvtx.range_push("cots:cudagraph_replay_full")

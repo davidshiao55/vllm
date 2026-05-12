@@ -1030,12 +1030,12 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     # Plain C++ host code with AVX2/FMA intrinsics; nvcc compiles
     # transparently when LANGUAGE=CUDA.
     "csrc/cots/bf16_gemm_transposed.cpp"
-    # Stage 7-D PROBE — sibling kernel for the natural (N, K)
+    # Stage 7-D — sibling kernel for the natural (N, K)
     # row-major weight layout. Same casting/parallelism strategy
     # as Path H (pipelined upcast in inner loop, at::parallel_for
     # on N) but with the loop nest swapped to keep w access
-    # sequential in natural layout. Goal: measure perf parity
-    # with Path H before committing to the full Stage 7-D.
+    # sequential in natural layout. Used by production worker paths
+    # for QKV/gate/up after Stage 7-C storage unification.
     "csrc/cots/bf16_gemm_natural.cpp"
     # §1c.29 wait kernel — compiled as CUDA so nvcc handles
     # the __global__ kernel and PTX inline asm. The other
@@ -1053,8 +1053,21 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     SRCS "csrc/cots/cots_wait_done_kernel.cu"
     CUDA_ARCHS "${CUDA_ARCHS}")
 
+  include(CheckCXXCompilerFlag)
+  check_cxx_compiler_flag("-mavx2" VLLM_COTS_COMPILER_HAS_MAVX2)
+  check_cxx_compiler_flag("-mfma" VLLM_COTS_COMPILER_HAS_MFMA)
+  if(NOT VLLM_COTS_COMPILER_HAS_MAVX2 OR NOT VLLM_COTS_COMPILER_HAS_MFMA)
+    message(FATAL_ERROR
+      "COTS Stage 7 BF16 kernels require compiler support for -mavx2 and -mfma")
+  endif()
+
   # Stage 7 — the row-major-weight BF16 GEMM kernel uses AVX2 +
   # FMA intrinsics + `at::parallel_for` for intra-op parallelism.
+  # This thesis extension is built for the target RTX 4090 host class
+  # and requires an AVX2/FMA-capable x86 CPU at runtime. The kernel
+  # sources still contain scalar reference branches for non-standard
+  # direct compilation without these flags, but the vLLM CMake target
+  # intentionally force-compiles the production TUs with AVX2/FMA.
   #
   # `-fopenmp` here is **required for correctness of
   # `at::parallel_for` performance**, not for any `#pragma omp` in
@@ -1078,7 +1091,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   set_source_files_properties(
     "csrc/cots/bf16_gemm_transposed.cpp"
     PROPERTIES COMPILE_FLAGS "-mavx2 -mfma -fopenmp")
-  # Stage 7-D probe — same compile flags as Path H (AVX2/FMA +
+  # Stage 7-D natural-layout kernel — same compile flags as Path H (AVX2/FMA +
   # OpenMP for at::parallel_for routing into INTRA_OP_PARALLEL).
   set_source_files_properties(
     "csrc/cots/bf16_gemm_natural.cpp"

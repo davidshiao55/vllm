@@ -51,9 +51,10 @@
 // ~1 GiB pinned at `f_prefetch=0.30`).
 //
 // Limitations / scope:
-//   * AVX2 + FMA only — gated by `__AVX2__ && __FMA__`. Builds
-//     without these get a scalar fallback (correct, slow, suitable
-//     for CI on hosts that don't run the real workload).
+//   * AVX2 + FMA only in the vLLM CMake target, which
+//     force-compiles this TU with `-mavx2 -mfma`. The scalar branch
+//     below is a source-local reference path for non-standard direct
+//     compilation; it is not used by the production thesis extension.
 //   * Output dtype is BF16. FP32 → BF16 conversion uses **RNE**
 //     (round-to-nearest-even) matching the semantics of the
 //     AVX-512 instruction `vcvtneps2bf16` — emulated in AVX2 via
@@ -470,9 +471,9 @@ void bf16_gemm_transposed(const uint16_t* x, const uint16_t* w, uint16_t* y,
 
 #else  // !VLLM_COTS_HAS_AVX2_FMA
 
-// Reference fallback for non-AVX2 builds. Plain triple loop with
-// scalar BF16↔FP32 conversion. NOT performance-tuned; used only
-// when the build target lacks AVX2+FMA.
+// Reference fallback for non-standard direct builds without AVX2/FMA.
+// The vLLM CMake target force-compiles this TU with `-mavx2 -mfma`,
+// so production COTS never takes this branch.
 void bf16_gemm_transposed(const uint16_t* x, const uint16_t* w, uint16_t* y,
                           int64_t M, int64_t N, int64_t K) {
   auto bf16_to_f32 = [](uint16_t b) -> float {
