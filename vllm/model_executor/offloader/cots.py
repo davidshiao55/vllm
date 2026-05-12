@@ -1529,13 +1529,14 @@ class NativeCotsRunner:
     `vllm._cots_C` extension; dispatches CPU work through
     `cudaLaunchHostFunc` so the forward pass is graph-capturable.
 
-    Operator-facing API mirrors PythonCotsRunner: `submit_with_d2h(x,
-    x_pinned, y_pinned, op_descriptor)` + `wait_and_uva(y_pinned, y_gpu,
-    gpu_anchor_a, gpu_anchor_b)`. The runner translates op_descriptors
-    to slab task_ids and routes the host callback through the
-    `vllm.cots_submit_gemm` / `vllm.cots_sync_then_uva` custom ops so
-    torch.compile and CUDA Graph capture honor the barrier-installing
-    `mutates_args` declarations on `x_gpu` and `gpu_anchor_a/_b`.
+    Operator-facing API carries only stable call-site identity:
+    `(layer_idx, op_kind)`. Active bucket and live-token state are
+    published out of graph by `CotsOffloader.on_dispatch`, then resolved
+    inside the `vllm.cots_submit_gemm` / `vllm.cots_sync_then_uva`
+    custom-op impls at eager execution / CUDA Graph capture time. This
+    keeps native task selection out of compile-visible scalar arguments
+    while preserving the barrier-installing `mutates_args` declarations
+    on `x_gpu` and `gpu_anchor_a/_b`.
 
     Multi-engine safety: each instance allocates a `runner_id` and
     the underlying `CotsCpuInfer` pybind handle is owned by the
@@ -1546,18 +1547,16 @@ class NativeCotsRunner:
     coexist with independent slab pools. `close()` drains the worker
     then unregisters.
 
-    §1c.21 — TWO ROW COUNTS. After the live-token plumb-through fix,
-    COTS distinguishes between:
+    Two row counts are first-class in native COTS:
 
-      * `slab.num_tokens` — the **graph bucket capacity** (e.g., 256
-        for a captured `BatchExecutionDescriptor` at bucket=256).
-        Frozen at capture time; sizes the captured cudaMemcpyAsync
-        byte count, the slab's pinned x/y buffers, and the worker's
-        upper-bound bound check.
-      * `runtime_num_tokens` — the **live rows to compute**, set OUT
-        OF GRAPH by `gpu_model_runner.execute_model` from
-        `scheduler_output.total_num_scheduled_tokens` BEFORE every
-        forward. Always `runtime_num_tokens <= slab.num_tokens`. The
+      * `slab.num_tokens` — the **dispatched graph bucket** selected by
+        vLLM's `BatchDescriptor.num_tokens`. It is pushed out of graph
+        before the forward and resolved by the custom-op impl during
+        capture/execution; it is not derived from `int(x.shape[0])`.
+      * `live_num_tokens` — the **live rows to compute**, set OUT
+        OF GRAPH by `GPUModelRunner._publish_offloader_dispatch`
+        BEFORE every scheduler, dummy/profile, warmup, and CUDA Graph
+        capture forward. Always `live_num_tokens <= slab.num_tokens`. The
         worker's `at::linear` shapes, scratch slicing, and y_pinned
         write region all key off this.
 
@@ -1629,11 +1628,10 @@ class NativeCotsRunner:
         skips real GEMM (mirrors Phase 1a/1b's PythonCotsRunner dry_run
         diagnostic, see phase1a_findings.md §1.14).
 
-        §1c.19: this method intentionally does NOT take a
-        `bucket_for_fallback` callable. Operators are required to
-        resolve `op_descriptor[1]` to a non-None int before calling
-        `submit_with_d2h` — passing a bound method here would drag
-        the offloader into Dynamo's guard graph and break pickling.
+        §1c.35: native operators do not pass descriptor buckets at
+        runtime. They pass stable call-site identity, and cots_ops
+        resolves the bucket/task from OOG dispatch state plus this
+        install-time map.
         """
         from vllm.model_executor.offloader import cots_ops
 
@@ -1684,12 +1682,23 @@ class NativeCotsRunner:
             )
         cots_ops.install_wait_kernel_sync_for_all_tasks(self._runner_id, self._n_slabs)
 
+    def set_active_dispatch(self, bucket: int, live_num_tokens: int) -> None:
+        """Publish OOG dispatch state for native custom-op resolution."""
+        from vllm.model_executor.offloader import cots_ops
+
+        cots_ops.set_active_dispatch_state(
+            self._runner_id,
+            bucket=int(bucket),
+            live_num_tokens=int(live_num_tokens),
+        )
+
     def submit_with_d2h(
         self,
         x_gpu: torch.Tensor,
-        op_descriptor: tuple[int, int, str],
+        layer_idx: int,
+        op_kind: str,
     ) -> None:
-        """Phase 1c uniform facade. Routes through
+        """Phase 1c native facade. Routes through
         `torch.ops.vllm.cots_submit_gemm` whose impl bundles a
         `cudaMemcpyAsync(D2H)` from `x_gpu` to `slab.x_pinned_ptr`
         with the host-callback enqueue — both on the current CUDA
@@ -1705,20 +1714,20 @@ class NativeCotsRunner:
         capture rejects. The slab pointers (populated at install
         time) are the source of truth for both directions.
 
-        §1c.19: `op_descriptor[1]` MUST be a resolved int. Operators
-        call `offloader._bucket_for(num_tokens)` themselves before
-        invoking the runner.
+        §1c.35: bucket/task selection is intentionally absent from
+        this signature. `CotsOffloader.on_dispatch` publishes the
+        active `BatchDescriptor.num_tokens` OOG; the custom-op impl
+        resolves `(layer_idx, active_bucket, op_kind)` to the C++
+        slab task_id at execution/capture time.
         """
-        layer_idx, bucket, op_kind = op_descriptor
-        assert isinstance(bucket, int), (
-            "NativeCotsRunner.submit_with_d2h: op_descriptor[1] must be "
-            "a resolved int bucket. Operators are responsible for "
-            "running offloader._bucket_for(num_tokens) BEFORE calling "
-            "the runner. See phase1c_findings.md §1c.19."
+        from vllm.model_executor.offloader import cots_ops
+
+        torch.ops.vllm.cots_submit_gemm(
+            x_gpu,
+            self._runner_id,
+            int(layer_idx),
+            cots_ops.op_kind_code(op_kind),
         )
-        task_id = self._task_id_for[(layer_idx, bucket, op_kind)]
-        num_tokens = int(x_gpu.shape[0])
-        torch.ops.vllm.cots_submit_gemm(x_gpu, self._runner_id, task_id, num_tokens)
 
     def wait_and_uva(
         self,
@@ -1726,7 +1735,8 @@ class NativeCotsRunner:
         gpu_anchor_a: torch.Tensor,
         gpu_anchor_b: torch.Tensor,
         submit_anchor: torch.Tensor,
-        op_descriptor: tuple[int, int, str],
+        layer_idx: int,
+        op_kind: str,
     ) -> None:
         """Routes through `torch.ops.vllm.cots_sync_then_uva` so the
         cudaLaunchHostFunc-based stream sync + the Triton UVA copy
@@ -1747,25 +1757,20 @@ class NativeCotsRunner:
         slice/view chain into the captured graph and materialize it
         via a GPU intermediate + blocking GPU→CPU copy that CUDA
         Graph capture rejects. The impl reaches the worker's pinned
-        output via `CotsCpuInfer.y_pinned_view(task_id, num_tokens)`.
-        `op_descriptor` resolves to the (layer, bucket, op_kind)
-        slab id.
+        output via `CotsCpuInfer.y_pinned_view(task_id, bucket)`.
+        Task id and bucket are resolved from OOG dispatch state inside
+        the custom-op impl, not passed as compile-visible scalars.
         """
-        layer_idx, bucket, op_kind = op_descriptor
-        assert isinstance(bucket, int), (
-            "NativeCotsRunner.wait_and_uva: op_descriptor[1] must be "
-            "a resolved int bucket (§1c.19 contract)."
-        )
-        task_id = self._task_id_for[(layer_idx, bucket, op_kind)]
-        num_tokens = int(y_gpu.shape[0])
+        from vllm.model_executor.offloader import cots_ops
+
         torch.ops.vllm.cots_sync_then_uva(
             y_gpu,
             gpu_anchor_a,
             gpu_anchor_b,
             submit_anchor,
             self._runner_id,
-            task_id,
-            num_tokens,
+            int(layer_idx),
+            cots_ops.op_kind_code(op_kind),
         )
 
     def __getstate__(self) -> dict:
@@ -1949,8 +1954,10 @@ class CotsQKVOp:
         # number of live tokens. Used only for buffer-view shape
         # alignment with x (y_dst / x_in / y_out / scatter `out` all
         # carry the same row dim as x for index_copy_ consistency).
-        # Bucket selection uses `b`; CPU GEMM row count uses the
-        # §1c.21 `runtime_num_tokens` override on the C++ side.
+        # Python-side routing geometry uses `b`; native slab/task
+        # selection uses the active dispatch state published OOG.
+        # Worker row count uses the live-token cap inside the active
+        # dispatch bucket.
         num_tokens = x.shape[0]
         # Phase 1c Stage 3: bucket lives on the offloader (set
         # unconditionally by `on_dispatch`), NOT on the streamer. The
@@ -1959,19 +1966,15 @@ class CotsQKVOp:
         # agrees with the runner's install closure / slab (also keyed
         # on `b`). If prefetch is inactive (`max_n_prefetch == 0`)
         # every bucket has n_pref=0 and n_cpu_compute=h.n_cpu, so we
-        # can use h.n_cpu directly. If prefetch IS active but
-        # _current_bucket hasn't been set (e.g., test that bypasses
-        # on_dispatch), fall back to `_bucket_for(x_rows)` here. The
-        # runner's lazy descriptor rebuild is still a defense-in-depth
-        # backup.
+        # can use h.n_cpu directly. Python-runner tests that bypass
+        # on_dispatch may still fall back to `_bucket_for(x_rows)`;
+        # native forwards require the explicit OOG dispatch boundary.
         # §1c.19: resolve bucket to a non-None int up-front. The runner
         # facade does NOT carry a `bucket_for_fallback` callable anymore
         # (that bound method dragged the offloader into Dynamo's guard
         # graph); operators are responsible for handing the runner a
         # fully-resolved descriptor.
-        b = offloader._current_bucket
-        if b is None:
-            b = offloader._bucket_for(num_tokens)
+        b = offloader._operator_bucket(num_tokens)
         if h.max_n_prefetch == 0:
             n_pref = 0
             n_cpu = h.n_cpu
@@ -2004,12 +2007,12 @@ class CotsQKVOp:
             # built unconditionally; native reads its pinned input
             # via `cudaMemcpyAsync` from x_gpu.data_ptr() inside the
             # C++ side and reaches the pinned output via
-            # `y_pinned_view(task_id, num_tokens)` on the slab
+            # `y_pinned_view(task_id, bucket)` on the slab
             # pointer. Python (eager kill-switch) keeps the original
             # x_in/y_out flow because it isn't traced by Inductor.
             y_dst = offloader._y_gpu[: num_tokens * n_cpu].view(num_tokens, n_cpu)
             if isinstance(self._runner, NativeCotsRunner):
-                self._runner.submit_with_d2h(x, desc)
+                self._runner.submit_with_d2h(x, h.layer_idx, "qkv")
             else:
                 x_in = offloader._x_pinned[: num_tokens * h.in_dim].view(
                     num_tokens, h.in_dim
@@ -2051,7 +2054,10 @@ class CotsQKVOp:
             # y_pinned_view; python stashes it on submit. The
             # captured-graph custom op sees only CUDA tensors +
             # scalars.
-            self._runner.wait_and_uva(y_dst, gpu_a, gpu_b, x, desc)
+            if isinstance(self._runner, NativeCotsRunner):
+                self._runner.wait_and_uva(y_dst, gpu_a, gpu_b, x, h.layer_idx, "qkv")
+            else:
+                self._runner.wait_and_uva(y_dst, gpu_a, gpu_b, x, desc)
 
         out = _scatter_col_outputs_three_way(
             out_perm, out_pref, y_dst, pref_idx, cpu_idx, h, num_tokens
@@ -2124,9 +2130,7 @@ class CotsSwiGLUMLPOp:
         # share the active bucket by construction. §1c.19: resolve to
         # a non-None int up-front; the runner facade no longer carries
         # a fallback callable.
-        b = offloader._current_bucket
-        if b is None:
-            b = offloader._bucket_for(num_tokens)
+        b = offloader._operator_bucket(num_tokens)
         if gu_h.max_n_prefetch == 0:
             gu_n_pref = 0
             dn_n_pref = 0
@@ -2163,8 +2167,9 @@ class CotsSwiGLUMLPOp:
         # (pure-prefetch case). Without this fast-path the runner / D2H /
         # UVA overhead leaks into the prefetch-only regime. Phase 1c
         # Stage 3: weight slicing (n_pref_per_half / n_cpu_per_half_total)
-        # is now done at install time inside the runner; the operator
-        # only sees the descriptor (gu_h.layer_idx, b, "mlp_block").
+        # is now done at install time inside the runner. Native sees
+        # only stable call-site identity; Python runner still uses the
+        # full descriptor to select its eager callback.
         y2_gpu: torch.Tensor | None = None
         if dn_n_cpu > 0:
             desc = (gu_h.layer_idx, b, "mlp_block")
@@ -2175,7 +2180,7 @@ class CotsSwiGLUMLPOp:
                 num_tokens, self._out_dim
             )
             if isinstance(self._runner, NativeCotsRunner):
-                self._runner.submit_with_d2h(x, desc)
+                self._runner.submit_with_d2h(x, gu_h.layer_idx, "mlp_block")
             else:
                 x_pinned = offloader._x_pinned[: num_tokens * self._in_dim].view(
                     num_tokens, self._in_dim
@@ -2237,7 +2242,12 @@ class CotsSwiGLUMLPOp:
             # §1c.20: y_pinned (y2_pinned) is intentionally not
             # passed; native uses y_pinned_view via the slab pointer
             # and python stashes y_pinned at submit time.
-            self._runner.wait_and_uva(y2_gpu, gpu_a, gpu_b, x, desc)
+            if isinstance(self._runner, NativeCotsRunner):
+                self._runner.wait_and_uva(
+                    y2_gpu, gpu_a, gpu_b, x, gu_h.layer_idx, "mlp_block"
+                )
+            else:
+                self._runner.wait_and_uva(y2_gpu, gpu_a, gpu_b, x, desc)
             # When CPU is the sole contributor, clone — y2_gpu is a shared
             # activation buffer and would be clobbered by the next layer.
             out_gpu = y2_gpu.clone() if out_gpu is None else out_gpu.add_(y2_gpu)
@@ -2509,10 +2519,10 @@ class CotsOffloader(BaseOffloader):
         # NOTE: the in-graph pre-hook used to set `_current_bucket` via
         # `anchor.shape[0]` (the persistent input buffer under FULL
         # CUDA Graph capture). Under fullgraph trace it clobbered the
-        # OOG bucket set by cudagraph_utils.py and saturated the
+        # OOG bucket set by the model runner and saturated the
         # bucket key to the largest captured size. The replacement is
         # `on_dispatch`, called OOG per-forward from
-        # `gpu_model_runner.execute_model`. `prepare_before_forward`
+        # `GPUModelRunner._publish_offloader_dispatch`. `prepare_before_forward`
         # is kept as a callable method (still used by the NEW path's
         # cudagraph_utils.py:224/291 triplet) — only the pre-hook
         # registration is removed. See bucket-key-fix discussion.
@@ -2908,6 +2918,31 @@ class CotsOffloader(BaseOffloader):
                     f"cots: cpu_num_threads_by_bucket[{b}] = {n}, must be >= 1"
                 )
 
+    def _native_routing_uniform_across_buckets(self) -> bool:
+        """Whether compile-visible operator geometry is bucket-invariant.
+
+        Native custom ops now resolve task_id from OOG dispatch state, but
+        Python-side routing geometry (`n_prefetch`, `n_cpu_compute`, scatter
+        indices, GPU branch shape) is still selected in the compiled forward.
+        FULL CUDA Graph mode is therefore only structurally sound for
+        uniform routing until that geometry is also moved behind an OOG or
+        per-capture boundary.
+        """
+        if not self._capture_buckets:
+            return True
+        for h in self._handles:
+            pref_values = {
+                int(h.n_prefetch_by_bucket.get(bucket, 0))
+                for bucket in self._capture_buckets
+            }
+            cpu_values = {
+                int(h.n_cpu_compute_by_bucket.get(bucket, h.n_cpu))
+                for bucket in self._capture_buckets
+            }
+            if len(pref_values) > 1 or len(cpu_values) > 1:
+                return False
+        return True
+
     def _build_native_slab_specs(self) -> list[NativeSlabSpec]:
         """Build the per-(layer, bucket, op_kind) slab specs that
         NativeCotsRunner.install populates into the C++ slab pool. All
@@ -3185,9 +3220,9 @@ class CotsOffloader(BaseOffloader):
         Kept Dynamo-clean (no pybind calls) because vLLM's
         `_first_decoder_pre_hook` is registered on the model and gets
         traced into the captured graph. The C++-side runtime token
-        override (§1c.21) is pushed via the separate
-        `set_runtime_num_tokens` method, called OUT OF GRAPH by
-        cudagraph_utils.py before each replay.
+        row cap is pushed via the separate `set_live_num_tokens`
+        method, called OUT OF GRAPH by
+        `GPUModelRunner._publish_offloader_dispatch`.
         """
         self._current_bucket = self._bucket_for(num_tokens)
         if self._streamer is None:
@@ -3196,64 +3231,85 @@ class CotsOffloader(BaseOffloader):
         if self._layer_handles:
             self._streamer.prepare_for_forward_bucket(0, self._layer_handles[0])
 
-    def set_runtime_num_tokens(self, actual_num_tokens: int) -> None:
-        """§1c.21 fix: push the live unpadded token count to the C++
-        worker so it sizes CPU GEMM work correctly even when vLLM
-        replays a captured graph for a larger bucket. Called OUT OF
-        GRAPH by `gpu_model_runner.execute_model` BEFORE the
-        FULL/PIECEWISE/eager dispatch (see vllm@5fecc800b) — that
-        site has access to `scheduler_output.total_num_scheduled_tokens`
-        which is the live unpadded count. `cudagraph_utils.run_fullgraph`
-        also accepts an explicit `actual_num_tokens` kwarg as a
-        secondary entry point.
+    def _operator_bucket(self, x_rows: int) -> int:
+        """Return the operator routing bucket for the active forward.
+
+        Native COTS must see the explicit OOG dispatch boundary before
+        any operator runs; falling back to `x.shape[0]` is the bug this
+        path exists to remove. The fallback remains only for Python-runner
+        direct tests and eager kill-switch use.
+        """
+        if self._current_bucket is not None:
+            return int(self._current_bucket)
+        if isinstance(self._runner, NativeCotsRunner):
+            raise RuntimeError(
+                "CotsOffloader operator ran before dispatch state was "
+                "published. GPUModelRunner._publish_offloader_dispatch "
+                "must call CotsOffloader.on_dispatch before native COTS "
+                "operators execute or capture."
+            )
+        return self._bucket_for(x_rows)
+
+    def set_live_num_tokens(self, live_num_tokens: int) -> None:
+        """Push the live unpadded token count to the C++ worker.
+
+        CUDA graph buckets and native slabs are capacity-sized. This
+        live-row cap lets the CPU worker skip padded rows inside the
+        selected bucket.
 
         No-op when not using the native runner (PythonCotsRunner is
         eager-only and reads the live count directly off
         `slab.num_tokens.store` at submit time). Also no-op for
-        `actual_num_tokens <= 0` (sentinel).
+        `live_num_tokens <= 0` (sentinel).
         """
         if not isinstance(self._runner, NativeCotsRunner):
             return
-        if int(actual_num_tokens) <= 0:
+        if int(live_num_tokens) <= 0:
             return
         from vllm.model_executor.offloader import cots_ops
 
-        cots_ops.set_runtime_num_tokens(self._runner._runner_id, int(actual_num_tokens))
+        cots_ops.set_live_num_tokens(self._runner._runner_id, int(live_num_tokens))
+
+    def set_runtime_num_tokens(self, actual_num_tokens: int) -> None:
+        """Legacy alias for `set_live_num_tokens`."""
+        self.set_live_num_tokens(actual_num_tokens)
 
     def on_dispatch(self, info: ForwardDispatchInfo) -> None:
         """OOG per-forward entry. Owns ALL pre-forward state setup that
         was previously split between the in-graph pre-hook (bucket +
-        slot repair) and the existing OOG `set_runtime_num_tokens`
-        call. Single boundary for both eager and FULL CUDA Graph paths
-        (replay-time too, not just capture-time).
+        slot repair) and the OOG live-token update. Single boundary for
+        both eager and FULL CUDA Graph paths (replay-time too, not just
+        capture-time).
 
         Order matters:
         1. `prepare_before_forward(num_tokens_padded)` — sets
             `_current_bucket`, mirrors streamer's bucket, runs layer-0
             slot repair (issues H2D on copy_stream). H2D is OOG so it
             isn't captured; each replay gets fresh repair.
-        2. `sync_prev_onload()` — drains copy_stream into compute
+        2. `set_active_dispatch(bucket, live)` — publishes the
+            authoritative vLLM dispatch bucket to native custom ops.
+            They resolve `(layer_idx, bucket, op_kind) -> task_id`
+            during eager execution / CUDA Graph capture; task_id is
+            not a compile-visible scalar anymore.
+        3. `sync_prev_onload()` — drains copy_stream into compute
             stream so the forward sees the filled slot.
-        3. `set_runtime_num_tokens(num_tokens_unpadded)` — §1c.21
-            override pushed to the C++ worker. Env-gated by
-            `VLLM_COTS_DISABLE_RUNTIME_OVERRIDE=1` for the bucket-key
-            A/B: with the bucket-key fix in place, the captured graph
-            references the correct slab (`slab.num_tokens` matches the
-            live count for a B=1 decode), so the §1c.21 row-count
-            override should be redundant.
+        4. `set_live_num_tokens(num_tokens_unpadded)` — live-row cap
+            pushed to the C++ worker. This is independent from task
+            selection.
         """
         num_tokens_padded = int(info.batch_descriptor.num_tokens)
         num_tokens_unpadded = int(info.num_tokens_unpadded)
         self.prepare_before_forward(num_tokens_padded)
+        active_bucket = self._current_bucket
+        if active_bucket is None:
+            active_bucket = self._bucket_for(num_tokens_padded)
+        if isinstance(self._runner, NativeCotsRunner):
+            self._runner.set_active_dispatch(active_bucket, num_tokens_unpadded)
         self.sync_prev_onload()
-        # `VLLM_COTS_DISABLE_RUNTIME_OVERRIDE=1` skips the §1c.21 push;
-        # used by the bucket-key A/B harness. Default keeps the override
-        # active because empirically Inductor specializes
-        # `int(x.shape[0])` to a single large constant across captured
-        # graphs (§1c.35 findings), so worker CPU GEMM rows would
-        # default to that value without the override.
-        if os.environ.get("VLLM_COTS_DISABLE_RUNTIME_OVERRIDE", "0") != "1":
-            self.set_runtime_num_tokens(num_tokens_unpadded)
+        # CPU work scales with the semantic batch size, not bucket
+        # capacity. Task selection is handled by the active dispatch
+        # state above.
+        self.set_live_num_tokens(num_tokens_unpadded)
 
     def post_cudagraph_capture(self) -> None:
         """§1c.22: env-gated counter reset after all bucket graphs are
@@ -3387,25 +3443,25 @@ class CotsOffloader(BaseOffloader):
 
         # §1c.21 review-fix: native runner is incompatible with vLLM
         # microbatching/ubatching (DBO or ubatch_size > 1). The
-        # live-token override
-        # (`gpu_model_runner.execute_model → BaseOffloader.set_runtime_num_tokens`)
+        # live-token cap
+        # (`GPUModelRunner._publish_offloader_dispatch` →
+        # `BaseOffloader.set_live_num_tokens`)
         # currently sets ONE global value per scheduler batch. Under
         # ubatching, a COTS operator runs on a per-ubatch slice but
-        # sees the override as the FULL batch token count, which can
+        # sees the cap as the FULL batch token count, which can
         # over-compute (the worker would read past the per-ubatch
-        # x_pinned slice into stale data) or trip the
-        # `runtime_num_tokens > slab.num_tokens` hard-fail. Hard-fail
-        # at construction with a clear message until §1c.23 plumbs
-        # per-ubatch live counts.
+        # x_pinned slice into stale data). Hard-fail at construction
+        # with a clear message until §1c.23 plumbs per-ubatch live
+        # counts.
         cpu_runner = getattr(self.config, "cpu_runner", "python")
         if cpu_runner == "native" and vllm_config.parallel_config.use_ubatching:
             raise RuntimeError(
                 "CotsOffloader: cpu_runner='native' is currently "
                 "incompatible with vLLM microbatching/ubatching "
                 "(`enable_dbo` or `ubatch_size > 1`). The live-token "
-                "override sets one global runtime_num_tokens per "
-                "scheduler batch; under ubatching a per-ubatch slice "
-                "would over-compute against the full-batch override. "
+                "cap sets one global live_num_tokens value per scheduler "
+                "batch; under ubatching a per-ubatch slice would "
+                "over-compute against the full-batch cap. "
                 "Either disable ubatching or use cpu_runner='python' "
                 "with enforce_eager=True. Tracking under "
                 "phase1c_findings.md §1c.23."
@@ -3469,6 +3525,27 @@ class CotsOffloader(BaseOffloader):
                     "with CUDA support (./rebuild_vllm.sh). Underlying "
                     f"ImportError: {e}"
                 ) from e
+
+        cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
+        has_full_cudagraphs = (
+            cudagraph_mode is not None and cudagraph_mode.has_full_cudagraphs()
+        )
+        if (
+            cpu_runner == "native"
+            and not vllm_config.model_config.enforce_eager
+            and has_full_cudagraphs
+            and not self._native_routing_uniform_across_buckets()
+        ):
+            raise RuntimeError(
+                "CotsOffloader: native FULL CUDA Graph mode requires uniform "
+                "COTS routing geometry across capture buckets. The native "
+                "custom ops now resolve slab task_id from OOG dispatch state, "
+                "but Python-side routing geometry (n_prefetch/n_cpu_compute "
+                "and scatter shape) is still compile-visible. Use "
+                "enforce_eager=True, disable FULL cudagraphs, or use a "
+                "uniform dispatch table until routing geometry is moved "
+                "behind the same structural dispatch boundary."
+            )
 
         self._eager_fallback_entry = self._dispatch_table[self._capture_buckets[-1]]
 

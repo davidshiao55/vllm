@@ -24,16 +24,18 @@ class ForwardDispatchInfo:
 
     Single boundary between vLLM's model runner and the offloader so
     future per-forward state can land here without another vLLM-side
-    call site. Pushed by `gpu_model_runner.execute_model` BEFORE every
-    forward (FULL/PIECEWISE/eager dispatch).
+    call site. Pushed by `GPUModelRunner._publish_offloader_dispatch`
+    BEFORE every scheduler, profile dummy, warmup, or CUDA Graph capture
+    forward.
 
     - `batch_descriptor.num_tokens` is the authoritative dispatched
       bucket (padded). Replaces the in-graph pre-hook's
       `anchor.shape[0]` inference, which saturated to the persistent
       input-buffer size under FULL CUDA Graph capture and made
       per-bucket Planner outputs ineffective at runtime.
-    - `num_tokens_unpadded` is the live row count, consumed by the
-      §1c.21 worker override.
+    - `num_tokens_unpadded` is the live row count. Graph/slab sizes
+      remain bucket-capacity sized; offloaders may use this value to
+      avoid doing CPU work for padded rows.
     """
 
     batch_descriptor: "BatchDescriptor"
@@ -97,30 +99,36 @@ class BaseOffloader(ABC):
         """
         pass
 
-    def set_runtime_num_tokens(self, actual_num_tokens: int) -> None:  # noqa: B027
+    def set_live_num_tokens(self, live_num_tokens: int) -> None:  # noqa: B027
         """Push the live (unpadded) token count to the offloader.
 
-        Called OUT OF GRAPH by `cudagraph_utils.py` before each
-        captured replay so offloaders can reconcile graph-bucket-sized
-        capture with live decode token counts. Default is no-op;
-        offloaders that need this (e.g., COTS native runner — see
-        `phase1c_findings.md §1c.21`) override.
+        A CUDA graph bucket is a capacity, not a guarantee that every
+        row in the bucket is semantically live. Offloaders that execute
+        CPU work may use this value as a live-row cap while keeping
+        graph capture, slab allocation, and buffer sizing bucket-based.
         """
         pass
+
+    def set_runtime_num_tokens(self, actual_num_tokens: int) -> None:  # noqa: B027
+        """Legacy alias for `set_live_num_tokens`.
+
+        Kept for older cudagraph/offloader call sites and direct tests
+        that still use the original §1c.21 name.
+        """
+        self.set_live_num_tokens(actual_num_tokens)
 
     def on_dispatch(self, info: ForwardDispatchInfo) -> None:
         """Single OOG entry point for all per-forward dispatch state.
 
-        Called by `gpu_model_runner.execute_model` BEFORE every forward
-        (FULL/PIECEWISE/eager). Default impl delegates to the legacy
-        per-piece methods so existing offloaders (and the NEW path's
-        cudagraph_utils.py triplet) keep working unchanged. The COTS
-        offloader overrides this to add an env-var gate for the §1c.21
-        runtime-tokens override (used by the bucket-key-fix A/B).
+        Called by `GPUModelRunner._publish_offloader_dispatch` BEFORE
+        every scheduler, profile dummy, warmup, or CUDA Graph capture
+        forward. Default impl delegates to the legacy per-piece methods
+        so existing offloaders (and the NEW path's cudagraph_utils.py
+        triplet) keep working unchanged.
         """
         self.prepare_before_forward(info.batch_descriptor.num_tokens)
         self.sync_prev_onload()
-        self.set_runtime_num_tokens(info.num_tokens_unpadded)
+        self.set_live_num_tokens(info.num_tokens_unpadded)
 
     def post_cudagraph_capture(self) -> None:  # noqa: B027
         """One-shot hook fired by `cudagraph_utils.CudaGraphManager.capture`

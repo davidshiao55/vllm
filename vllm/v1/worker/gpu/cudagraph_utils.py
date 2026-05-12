@@ -261,13 +261,12 @@ class CudaGraphManager:
     ):
         """Replay a captured FULL cudagraph.
 
-        §1c.21: `actual_num_tokens` is the live unpadded token count
-        (from `scheduler_output.total_num_scheduled_tokens`). vLLM
-        captures the graph at `desc.num_tokens` (a padded bucket size)
-        and replays it for any live count up to that bucket. The
-        native COTS runner uses `actual_num_tokens` to size CPU GEMM
-        work; without it the worker would do bucket-sized GEMMs at
-        every replay.
+        `actual_num_tokens` is the live unpadded token count (from
+        `scheduler_output.total_num_scheduled_tokens`). vLLM captures
+        the graph at `desc.num_tokens` (a padded bucket capacity) and
+        replays it for any live count up to that bucket. The native
+        COTS runner uses `actual_num_tokens` to avoid CPU GEMM work for
+        padded rows.
         """
         assert desc.cg_mode == CUDAGraphMode.FULL, (
             f"Expected FULL mode, got {desc.cg_mode}"
@@ -287,20 +286,18 @@ class CudaGraphManager:
         offloader = get_offloader()
         if not _COTS_DIAG_ENABLED:
             if actual_num_tokens is not None:
-                offloader.set_runtime_num_tokens(actual_num_tokens)
+                offloader.set_live_num_tokens(actual_num_tokens)
             offloader.prepare_before_forward(desc.num_tokens)
             offloader.sync_prev_onload()
             self.graphs[desc].replay()
             return
         torch.cuda.nvtx.range_push("cots:replay_prep_full")
         try:
-            # §1c.21: push the live unpadded token count to the
-            # offloader's C++ worker BEFORE prepare_before_forward
-            # (which stays Dynamo-clean for the captured pre-hook
-            # path). No-op for offloaders that don't override the
-            # default.
+            # Push the live unpadded token count to the offloader's
+            # worker BEFORE prepare_before_forward. No-op for
+            # offloaders that do not need live-row caps.
             if actual_num_tokens is not None:
-                offloader.set_runtime_num_tokens(actual_num_tokens)
+                offloader.set_live_num_tokens(actual_num_tokens)
             # FULL graph replay bypasses Python model hooks, so repair
             # any active-bucket state that normally lives in forward
             # pre-hooks. A single sync after repair drains both prior

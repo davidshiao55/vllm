@@ -8,25 +8,27 @@ each with a `mutates_args` list that declares barrier-installing
 dependencies so torch.compile / CUDA graph capture preserve the overlap
 ordering between submit, GPU GEMMs, sync, and UVA copy.
 
-Final schemas after the §1c.20 simplification (see
-`phase1c_findings.md §1c.20`):
+Final schemas after the §1c.20 simplification and §1c.35 dispatch-state
+fix (see `phase1c_findings.md §1c.20` / §1c.35):
 
-  * vllm.cots_submit_gemm(x_gpu, runner_id, task_id, num_tokens)
+  * vllm.cots_submit_gemm(x_gpu, runner_id, layer_idx, op_kind_code)
       mutates_args=["x_gpu"]
       x_gpu mutated → pins submit BEFORE every GPU GEMM that reads
       x_gpu, AND provides the (submit → sync) edge consumed by
       cots_sync_then_uva's `submit_anchor` read. The C++ impl
-      bundles `cudaMemcpyAsync(D2H)` from x_gpu to slab.x_pinned_ptr
-      with the host-callback enqueue.
+      resolves the current dispatch bucket from OOG runner state,
+      resolves the slab task_id from (layer_idx, bucket, op_kind),
+      then bundles `cudaMemcpyAsync(D2H)` from x_gpu to
+      slab.x_pinned_ptr with the host-callback enqueue.
 
   * vllm.cots_sync_then_uva(y_gpu, gpu_anchor_a, gpu_anchor_b,
-                            submit_anchor, runner_id, task_id,
-                            num_tokens)
+                            submit_anchor, runner_id, layer_idx,
+                            op_kind_code)
       mutates_args=["y_gpu", "gpu_anchor_a", "gpu_anchor_b"]
       `gpu_anchor_a/_b` pin sync AFTER each independent GPU GEMM.
       `submit_anchor` (read-only, == x_gpu) pins sync AFTER submit.
       The impl reaches the slab's pinned output via
-      `CotsCpuInfer.y_pinned_view(task_id, num_tokens)`.
+      `CotsCpuInfer.y_pinned_view(task_id, bucket)`.
 
 Both ops accept ONLY CUDA tensors and scalar ids — no CPU tensor
 arguments. Inductor's functionalization on captured graphs
@@ -92,7 +94,22 @@ _COTS_INFER: dict[int, Any] = {}
 # cross-referenced with their COTS-op descriptors without the
 # runner needing to live in EngineCore as a strong reference.
 _COTS_TASK_ID_FOR: dict[int, dict[tuple[int, int, str], int]] = {}
+_COTS_ACTIVE_DISPATCH: dict[int, tuple[int, int]] = {}
 _NEXT_RUNNER_ID = itertools.count(1)
+
+_OP_KIND_TO_CODE: dict[str, int] = {
+    "qkv": 1,
+    "mlp_block": 2,
+}
+_OP_KIND_BY_CODE: dict[int, str] = {v: k for k, v in _OP_KIND_TO_CODE.items()}
+
+
+def op_kind_code(op_kind: str) -> int:
+    """Encode a stable op kind for the native custom-op boundary."""
+    try:
+        return _OP_KIND_TO_CODE[op_kind]
+    except KeyError as e:
+        raise ValueError(f"unknown COTS op_kind {op_kind!r}") from e
 
 
 def _register_infer(infer: Any) -> int:
@@ -108,6 +125,7 @@ def _unregister_infer(runner_id: int) -> None:
     """Drop the registry entry for a runner. Idempotent."""
     _COTS_INFER.pop(runner_id, None)
     _COTS_TASK_ID_FOR.pop(runner_id, None)
+    _COTS_ACTIVE_DISPATCH.pop(runner_id, None)
 
 
 def _register_task_id_for(
@@ -118,6 +136,74 @@ def _register_task_id_for(
     can cross-reference per-task fire counts with their
     (layer_idx, bucket, op_kind) descriptors."""
     _COTS_TASK_ID_FOR[runner_id] = dict(task_id_for)
+
+
+def set_active_dispatch_state(
+    runner_id: int,
+    *,
+    bucket: int,
+    live_num_tokens: int,
+) -> None:
+    """Publish the authoritative per-forward COTS dispatch state.
+
+    Called outside the compiled forward by `CotsOffloader.on_dispatch`.
+    Native custom ops read this state at eager execution / CUDA Graph
+    capture time and resolve slab task_ids from it. This keeps bucket
+    and task selection out of compile-visible scalar arguments.
+    """
+    bucket = int(bucket)
+    live_num_tokens = int(live_num_tokens)
+    if bucket <= 0:
+        raise ValueError(f"active COTS dispatch bucket must be > 0, got {bucket}")
+    if live_num_tokens < 0:
+        raise ValueError(
+            f"active COTS dispatch live_num_tokens must be >= 0, got {live_num_tokens}"
+        )
+    _COTS_ACTIVE_DISPATCH[int(runner_id)] = (bucket, live_num_tokens)
+
+
+def _resolve_task_for_dispatch(
+    runner_id: int,
+    layer_idx: int,
+    op_kind_code: int,
+    op_name: str,
+) -> tuple[int, int, int]:
+    """Resolve active dispatch state to a concrete C++ slab task."""
+    runner_id = int(runner_id)
+    state = _COTS_ACTIVE_DISPATCH.get(runner_id)
+    if state is None:
+        raise RuntimeError(
+            f"{op_name}: no active COTS dispatch state for runner_id={runner_id}. "
+            "CotsOffloader.on_dispatch must publish the BatchDescriptor bucket "
+            "before native custom ops execute or capture."
+        )
+    bucket, live_num_tokens = state
+    try:
+        op_kind = _OP_KIND_BY_CODE[int(op_kind_code)]
+    except KeyError as e:
+        raise RuntimeError(
+            f"{op_name}: unknown op_kind_code={op_kind_code} for runner_id={runner_id}"
+        ) from e
+    task_id_for = _COTS_TASK_ID_FOR.get(runner_id)
+    if task_id_for is None:
+        raise RuntimeError(
+            f"{op_name}: runner_id={runner_id} has no task_id map; "
+            "NativeCotsRunner.install() must complete before dispatch."
+        )
+    key = (int(layer_idx), int(bucket), op_kind)
+    task_id = task_id_for.get(key)
+    if task_id is None:
+        available = sorted(
+            b
+            for layer, b, kind in task_id_for
+            if layer == int(layer_idx) and kind == op_kind
+        )
+        raise RuntimeError(
+            f"{op_name}: no native COTS slab for key={key}; available buckets "
+            f"for layer={int(layer_idx)}, op_kind={op_kind!r}: {available}. "
+            "The resolved task bucket must come from the OOG dispatch state."
+        )
+    return int(task_id), int(bucket), int(live_num_tokens)
 
 
 def _lookup_infer(runner_id: int, op_name: str) -> Any:
@@ -248,16 +334,14 @@ def reset_all_counters() -> None:
             infer.reset_counters()
 
 
-def set_runtime_num_tokens(runner_id: int, n: int) -> None:
-    """§1c.21 live-token plumb-through. Called by
-    `CotsOffloader.set_runtime_num_tokens` (a thin override on the
-    `BaseOffloader` lifecycle hook) which is invoked by
-    `gpu_model_runner.execute_model` BEFORE the
-    FULL/PIECEWISE/eager dispatch with the live unpadded token
-    count from `scheduler_output.total_num_scheduled_tokens`. The
-    worker reads the value on the next host-callback fire and uses
-    it for row-count arithmetic instead of the captured bucket
-    size."""
+def set_live_num_tokens(runner_id: int, n: int) -> None:
+    """Publish the live-token row cap to the native COTS worker.
+
+    `n` is the number of semantically live rows in the active bucket.
+    Slab capacity, graph capture, and buffer sizing stay bucket-based;
+    the worker reads this value on the next host-callback fire and
+    avoids CPU GEMM work for padded rows.
+    """
     infer = _COTS_INFER.get(runner_id)
     if infer is None:
         # Best-effort: a stale runner_id call here shouldn't crash —
@@ -265,6 +349,11 @@ def set_runtime_num_tokens(runner_id: int, n: int) -> None:
         # registry entry with a clearer error.
         return
     infer.set_runtime_num_tokens(int(n))
+
+
+def set_runtime_num_tokens(runner_id: int, n: int) -> None:
+    """Legacy alias for `set_live_num_tokens`."""
+    set_live_num_tokens(runner_id, n)
 
 
 def sync_blocking(runner_id: int) -> None:
@@ -299,8 +388,8 @@ def sync_blocking(runner_id: int) -> None:
 def _cots_submit_gemm_impl(
     x_gpu: torch.Tensor,
     runner_id: int,
-    task_id: int,
-    num_tokens: int,
+    layer_idx: int,
+    op_kind_code: int,
 ) -> None:
     """Real impl: dispatched to the per-runner pybind handle.
 
@@ -317,9 +406,9 @@ def _cots_submit_gemm_impl(
     Moving the D2H from Python `copy_(non_blocking=True)` to a raw
     `cudaMemcpyAsync` loses Python's automatic shape/stride/dtype
     handling, so we validate `x_gpu` here BEFORE handing the raw
-    pointer to C++. The slab's `in_dim` and `num_tokens` together
-    determine the byte count; mismatched shapes would silently copy
-    the wrong amount of data.
+    pointer to C++. The slab's `in_dim` and the OOG dispatch bucket
+    together determine the byte count; mismatched shapes would
+    silently copy the wrong amount of data.
     """
     assert x_gpu.is_cuda, f"cots_submit_gemm: x_gpu must be on CUDA, got {x_gpu.device}"
     assert x_gpu.dtype == torch.bfloat16, (
@@ -330,9 +419,14 @@ def _cots_submit_gemm_impl(
         f"cots_submit_gemm: x_gpu must be 2D (num_tokens, in_dim); "
         f"got shape {tuple(x_gpu.shape)}"
     )
-    assert x_gpu.shape[0] == num_tokens, (
-        f"cots_submit_gemm: num_tokens mismatch — x_gpu.shape[0]="
-        f"{x_gpu.shape[0]}, num_tokens arg={num_tokens}"
+    task_id, bucket, _live_num_tokens = _resolve_task_for_dispatch(
+        runner_id, layer_idx, op_kind_code, "cots_submit_gemm"
+    )
+    assert int(x_gpu.shape[0]) >= bucket, (
+        f"cots_submit_gemm: active bucket={bucket} exceeds x_gpu.shape[0]="
+        f"{int(x_gpu.shape[0])}. The native custom op sizes D2H from the "
+        f"OOG BatchDescriptor bucket; the CUDA tensor must contain at least "
+        f"that many rows."
     )
     # `stride(1) == 1` is the production contract — feature-dim
     # contiguous, possibly row-strided. The C++ side handles the
@@ -360,7 +454,7 @@ def _cots_submit_gemm_impl(
         # the 1D-vs-2D branch.
         infer.submit_on_stream(
             task_id,
-            num_tokens,
+            bucket,
             x_gpu.data_ptr(),
             x_gpu.shape[1],
             x_gpu.stride(0),
@@ -375,8 +469,8 @@ def _cots_submit_gemm_impl(
 def _cots_submit_gemm_fake(
     x_gpu: torch.Tensor,
     runner_id: int,
-    task_id: int,
-    num_tokens: int,
+    layer_idx: int,
+    op_kind_code: int,
 ) -> None:
     """torch.compile tracing: no side effects, just a barrier."""
     return
@@ -391,8 +485,8 @@ def _cots_sync_then_uva_impl(
     gpu_anchor_b: torch.Tensor,
     submit_anchor: torch.Tensor,
     runner_id: int,
-    task_id: int,
-    num_tokens: int,
+    layer_idx: int,
+    op_kind_code: int,
 ) -> None:
     """Real impl: schedule the sync host callback then run the UVA copy.
 
@@ -407,13 +501,22 @@ def _cots_sync_then_uva_impl(
     cloning into it (in the worst case via a GPU intermediate +
     blocking GPU→CPU copy that CUDA Graph capture rejects). The slab
     pointer the worker wrote to IS the source of truth; we reach it
-    directly via the C++-side `y_pinned_view(task_id, num_tokens)`
+    directly via the C++-side `y_pinned_view(task_id, bucket)`
     helper. The Python-visible custom-op signature contains only CUDA
     tensors and scalar ids, so Inductor has nothing CPU-side to
     materialize. The trust boundary is install-time: the slab pointer
     came from `_y_pinned`, allocated `pin_memory=True` and validated
     there.
     """
+    task_id, bucket, _live_num_tokens = _resolve_task_for_dispatch(
+        runner_id, layer_idx, op_kind_code, "cots_sync_then_uva"
+    )
+    assert int(y_gpu.shape[0]) >= bucket, (
+        f"cots_sync_then_uva: active bucket={bucket} exceeds y_gpu.shape[0]="
+        f"{int(y_gpu.shape[0])}. The native custom op sizes UVA from the "
+        f"OOG BatchDescriptor bucket; the CUDA destination must contain at "
+        f"least that many rows."
+    )
     infer = _lookup_infer(runner_id, "cots_sync_then_uva")
     stream = torch.cuda.current_stream().cuda_stream
     if _COTS_DIAG_ENABLED:
@@ -432,8 +535,8 @@ def _cots_sync_then_uva_impl(
         infer.sync_or_wait_on_stream(task_id, stream)
         # Build the CPU view over the slab pointer locally — never escapes
         # back to Python in a way Inductor would see.
-        y_pinned = infer.y_pinned_view(task_id, num_tokens)
-        infer.note_uva_request(num_tokens, y_pinned.shape[1])
+        y_pinned = infer.y_pinned_view(task_id, bucket)
+        infer.note_uva_request(bucket, y_pinned.shape[1])
         # Lazy import to avoid a top-level circular import (cots.py imports
         # this module via cots_ops and we'd loop on `from .cots import ...`).
         from vllm.model_executor.offloader.cots import (
@@ -463,8 +566,8 @@ def _cots_sync_then_uva_fake(
     gpu_anchor_b: torch.Tensor,
     submit_anchor: torch.Tensor,
     runner_id: int,
-    task_id: int,
-    num_tokens: int,
+    layer_idx: int,
+    op_kind_code: int,
 ) -> None:
     return
 

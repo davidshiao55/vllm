@@ -3768,6 +3768,26 @@ class GPUModelRunner(
 
         return slot_mappings_by_gid, slot_mappings_by_layer
 
+    def _publish_offloader_dispatch(
+        self,
+        batch_descriptor: BatchDescriptor,
+        num_tokens_unpadded: int,
+    ) -> None:
+        """Push per-forward dispatch state before any model forward.
+
+        This is the single vLLM/offloader boundary for bucket-sized
+        state. It covers scheduler forwards, profile dummy forwards,
+        and CUDA Graph warmup/capture forwards so native offloader ops
+        never need to infer their task bucket from compile-visible
+        tensor shapes or scalar constants.
+        """
+        get_offloader().on_dispatch(
+            ForwardDispatchInfo(
+                batch_descriptor=batch_descriptor,
+                num_tokens_unpadded=num_tokens_unpadded,
+            )
+        )
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -4027,23 +4047,7 @@ class GPUModelRunner(
         )
 
         # Run the model.
-        # Bucket-key fix + §1c.21: single OOG entry that pushes the
-        # dispatched padded bucket (`batch_desc.num_tokens`) AND the
-        # live unpadded count to the offloader BEFORE the
-        # FULL/PIECEWISE/eager dispatch. Replaces the standalone
-        # `set_runtime_num_tokens` call that lived here pre-fix.
-        # `on_dispatch` default impl is a thin wrapper around the
-        # legacy `prepare_before_forward + sync_prev_onload +
-        # set_runtime_num_tokens` triplet, so non-COTS offloaders keep
-        # working unchanged. CotsOffloader overrides to add an
-        # env-var gate (`VLLM_COTS_DISABLE_RUNTIME_OVERRIDE=1`) for
-        # the bucket-key A/B experiment. No-op for NoopOffloader.
-        get_offloader().on_dispatch(
-            ForwardDispatchInfo(
-                batch_descriptor=batch_desc,
-                num_tokens_unpadded=num_tokens_unpadded,
-            )
-        )
+        self._publish_offloader_dispatch(batch_desc, num_tokens_unpadded)
 
         # Use persistent buffers for CUDA graphs.
         # When spec decode is enabled, defer connector finalization
@@ -5516,6 +5520,8 @@ class GPUModelRunner(
                 num_tokens_padded = ubatch_slices_padded[0].num_tokens
                 if num_tokens_across_dp is not None:
                     num_tokens_across_dp[:] = num_tokens_padded
+
+            self._publish_offloader_dispatch(batch_desc, num_tokens_unpadded)
 
             with (
                 self.maybe_randomize_inputs(input_ids, inputs_embeds),
