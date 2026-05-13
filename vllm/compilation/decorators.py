@@ -47,6 +47,23 @@ IGNORE_COMPILE_KEY = "_ignore_compile_vllm"
 _T = TypeVar("_T", bound=nn.Module)
 
 
+def _uses_fast_cots_piecewise_split(vllm_config: VllmConfig) -> bool:
+    compilation_config = vllm_config.compilation_config
+    splitting_ops = {str(op) for op in compilation_config.splitting_ops}
+    has_cots_boundary = bool(
+        {
+            "vllm::cots_submit_gemm",
+            "vllm::cots_sync_then_uva",
+        }
+        & splitting_ops
+    )
+    return (
+        has_cots_boundary
+        and getattr(compilation_config.cudagraph_mode, "name", "") == "PIECEWISE"
+        and compilation_config.use_inductor_graph_partition is False
+    )
+
+
 def should_torch_compile_mm_encoder(vllm_config: VllmConfig) -> bool:
     """Callable to be passed to `@support_torch_compile`'s `enable_if` argument."""
     return vllm_config.compilation_config.compile_mm_encoder
@@ -467,7 +484,8 @@ def _support_torch_compile(
         ds_type = self.compilation_config.dynamic_shapes_config.type
         cache_dir = None
         aot_compilation_path = None
-        if envs.VLLM_USE_AOT_COMPILE:
+        disable_aot_for_fast_cots = _uses_fast_cots_piecewise_split(self.vllm_config)
+        if envs.VLLM_USE_AOT_COMPILE and not disable_aot_for_fast_cots:
             """
             When using torch.compile in AOT mode, we store the cache artifacts
             under VLLM_CACHE_ROOT/torch_compile_cache/torch_aot_compile/{hash}
@@ -511,6 +529,7 @@ def _support_torch_compile(
         if self.compiled:
             assert (
                 not envs.VLLM_USE_AOT_COMPILE
+                or disable_aot_for_fast_cots
                 or self.vllm_config.compilation_config.backend == "eager"
             )
             return TorchCompileWithNoGuardsWrapper.__call__(self, *args, **kwargs)  # type: ignore[arg-type]
@@ -587,6 +606,13 @@ def _support_torch_compile(
             use_aot_compile = envs.VLLM_USE_AOT_COMPILE
             if self.vllm_config.compilation_config.backend == "eager":
                 logger.warning("Detected eager backend, disabling AOT compile.")
+                use_aot_compile = False
+            if use_aot_compile and disable_aot_for_fast_cots:
+                logger.warning_once(
+                    "Disabling AOT compile for COTS fast piecewise split because "
+                    "PyTorch cannot serialize all nested standalone subgraphs.",
+                    scope="local",
+                )
                 use_aot_compile = False
             if use_aot_compile:
                 # store the path for saving after warmup

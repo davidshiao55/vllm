@@ -55,7 +55,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from vllm.utils.cots_diag import ENABLED as _COTS_DIAG_ENABLED
+from vllm.utils.cots_diag import NVTX_ENABLED as _COTS_NVTX_ENABLED
 from vllm.utils.torch_utils import direct_register_custom_op
 
 # §1c.26 / §1c.27: UVA-side ablation flag. The C++ side has its
@@ -271,7 +271,12 @@ def populate_slab_via_spec(
     spec.populate(infer, task_id, dry_run=dry_run)
 
 
-def install_wait_kernel_sync_for_all_tasks(runner_id: int, n_slabs: int) -> None:
+def install_wait_kernel_sync_for_all_tasks(
+    runner_id: int,
+    n_slabs: int,
+    *,
+    fuse_uva_copy: bool = False,
+) -> None:
     """§1c.29 commit 2: install wait-kernel sync (host-mapped pinned req/done
     slots, lazy diag-counter alloc when VLLM_COTS_DIAG=1) for
     every slab in the pool. Called from `CotsOffloader.post_init`
@@ -285,7 +290,9 @@ def install_wait_kernel_sync_for_all_tasks(runner_id: int, n_slabs: int) -> None
     """
     infer = _lookup_infer(runner_id, "install_wait_kernel_sync_for_all_tasks")
     for tid in range(int(n_slabs)):
-        infer.install_wait_kernel_sync_for_task(int(tid))
+        infer.install_wait_kernel_sync_for_task(
+            int(tid), fuse_uva_copy=bool(fuse_uva_copy)
+        )
 
 
 def set_worker_affinity(runner_id: int, mask: int) -> None:
@@ -468,7 +475,7 @@ def _cots_submit_gemm_impl(
     # Python-side dispatch boundary separately from the C++ submit
     # body's d2h_record / launch_dispatch_cb sub-ranges. Env-gated
     # (VLLM_COTS_DIAG=1) — diagnostic only, off by default.
-    if _COTS_DIAG_ENABLED:
+    if _COTS_NVTX_ENABLED:
         torch.cuda.nvtx.range_push("cots:py_submit_gemm")
     try:
         # Pass shape/stride so the C++ D2H can dispatch the right
@@ -484,7 +491,7 @@ def _cots_submit_gemm_impl(
             stream,
         )
     finally:
-        if _COTS_DIAG_ENABLED:
+        if _COTS_NVTX_ENABLED:
             torch.cuda.nvtx.range_pop()
 
 
@@ -538,7 +545,7 @@ def _cots_sync_then_uva_impl(
     )
     infer = _lookup_infer(runner_id, "cots_sync_then_uva")
     stream = torch.cuda.current_stream().cuda_stream
-    if _COTS_DIAG_ENABLED:
+    if _COTS_NVTX_ENABLED:
         torch.cuda.nvtx.range_push("cots:py_sync_then_uva")
     try:
         # §1c.29 commit 2: unified entry. C++ side branches per-slab
@@ -551,7 +558,23 @@ def _cots_sync_then_uva_impl(
         # on TaskQueue::sync(0). Python ALWAYS calls this entry —
         # the A/B is controlled exclusively by whether the
         # offloader installed wait-kernel sync for this task at startup.
-        infer.sync_or_wait_on_stream(task_id, stream)
+        fused_uva = False
+        if not _COTS_ABLATE_UVA and hasattr(
+            infer, "sync_or_wait_and_maybe_uva_on_stream"
+        ):
+            fused_uva = bool(
+                infer.sync_or_wait_and_maybe_uva_on_stream(
+                    task_id,
+                    y_gpu.data_ptr(),
+                    num_transfer_rows,
+                    y_gpu.shape[1],
+                    stream,
+                )
+            )
+        else:
+            infer.sync_or_wait_on_stream(task_id, stream)
+        if fused_uva:
+            return
         # Build the CPU view over the slab pointer locally — never escapes
         # back to Python in a way Inductor would see.
         y_pinned = infer.y_pinned_view(task_id, num_transfer_rows)
@@ -562,7 +585,7 @@ def _cots_sync_then_uva_impl(
             _uva_copy_trusted_host_into_gpu,
         )
 
-        if _COTS_DIAG_ENABLED:
+        if _COTS_NVTX_ENABLED:
             torch.cuda.nvtx.range_push("cots:py_uva_copy")
         try:
             # §1c.26 ablation: skip the captured Triton UVA kernel
@@ -572,10 +595,10 @@ def _cots_sync_then_uva_impl(
             if not _COTS_ABLATE_UVA:
                 _uva_copy_trusted_host_into_gpu(y_pinned, y_gpu)
         finally:
-            if _COTS_DIAG_ENABLED:
+            if _COTS_NVTX_ENABLED:
                 torch.cuda.nvtx.range_pop()
     finally:
-        if _COTS_DIAG_ENABLED:
+        if _COTS_NVTX_ENABLED:
             torch.cuda.nvtx.range_pop()
 
 

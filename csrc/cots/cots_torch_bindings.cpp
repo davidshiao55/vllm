@@ -53,6 +53,10 @@ PYBIND11_MODULE(_cots_C, m) {
       // task uses.
       .def("sync_or_wait_on_stream", &CotsCpuInfer::sync_or_wait_on_stream,
            py::arg("task_id"), py::arg("cuda_stream"))
+      .def("sync_or_wait_and_maybe_uva_on_stream",
+           &CotsCpuInfer::sync_or_wait_and_maybe_uva_on_stream,
+           py::arg("task_id"), py::arg("y_gpu_ptr"), py::arg("num_tokens"),
+           py::arg("y_cols"), py::arg("cuda_stream"))
       .def("wait_kernel_sync_installed_for_task",
            &CotsCpuInfer::wait_kernel_sync_installed_for_task,
            py::arg("task_id"))
@@ -69,7 +73,8 @@ PYBIND11_MODULE(_cots_C, m) {
            py::arg("ablate_sync_hostfn") = false)
       // §1c.29 wait-kernel sync — install + wait launcher + test helpers.
       .def("install_wait_kernel_sync_for_task",
-           &CotsCpuInfer::install_wait_kernel_sync_for_task, py::arg("task_id"))
+           &CotsCpuInfer::install_wait_kernel_sync_for_task, py::arg("task_id"),
+           py::arg("fuse_uva_copy") = false)
       .def("wait_kernel_sync_on_stream",
            &CotsCpuInfer::wait_kernel_sync_on_stream, py::arg("task_id"),
            py::arg("cuda_stream"))

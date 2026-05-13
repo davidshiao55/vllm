@@ -1670,7 +1670,7 @@ class NativeCotsRunner:
         # the cache empty.
         self._n_slabs: int = n_slabs
 
-    def install_wait_kernel_sync(self) -> None:
+    def install_wait_kernel_sync(self, *, fuse_uva_copy: bool = False) -> None:
         """§1c.29 commit 2: install host-mapped pinned req/done
         slots for every slab in the pool. Must be called AFTER
         `install()` and only when the offloader's feature flag
@@ -1689,7 +1689,11 @@ class NativeCotsRunner:
                 "NativeCotsRunner.install_wait_kernel_sync() called before install(); "
                 "wait-kernel sync needs the slab pool to exist first"
             )
-        cots_ops.install_wait_kernel_sync_for_all_tasks(self._runner_id, self._n_slabs)
+        cots_ops.install_wait_kernel_sync_for_all_tasks(
+            self._runner_id,
+            self._n_slabs,
+            fuse_uva_copy=bool(fuse_uva_copy),
+        )
 
     def set_active_dispatch(self, bucket: int, live_num_tokens: int) -> None:
         """Publish OOG dispatch state for native custom-op resolution."""
@@ -3477,7 +3481,7 @@ class CotsOffloader(BaseOffloader):
 
         # §1c.29 commit 2 / §1c.34 cleanup A — wait-kernel-sync safety
         # gates. Hard-fail at post_init when the captured-sync mode is
-        # set to "wait_kernel" but a precondition is missing. We check
+        # set to a wait-kernel family mode but a precondition is missing. We check
         # BEFORE _install_runner so misconfigurations surface before
         # any C++ slab allocation. The legacy host_callback path
         # (cots_capture_sync_mode="host_callback", the default) is
@@ -3486,13 +3490,13 @@ class CotsOffloader(BaseOffloader):
         capture_sync_mode = getattr(
             self.config, "cots_capture_sync_mode", "host_callback"
         )
-        wait_kernel_enabled = capture_sync_mode == "wait_kernel"
+        wait_kernel_enabled = capture_sync_mode in ("wait_kernel", "wait_uva_kernel")
         if wait_kernel_enabled:
             # Gate 1: native runner only. Python runner has no slabs /
             # no host-mapped done_slot / no worker thread to publish.
             if cpu_runner != "native":
                 raise RuntimeError(
-                    "CotsOffloader: cots_capture_sync_mode='wait_kernel' "
+                    f"CotsOffloader: cots_capture_sync_mode={capture_sync_mode!r} "
                     f"requires cpu_runner='native' (got {cpu_runner!r}). "
                     "The Python runner has no host-mapped done_slot "
                     "mechanism; the wait kernel is meaningful only on the "
@@ -3505,7 +3509,7 @@ class CotsOffloader(BaseOffloader):
             # node — net negative.
             if vllm_config.model_config.enforce_eager:
                 raise RuntimeError(
-                    "CotsOffloader: cots_capture_sync_mode='wait_kernel' "
+                    f"CotsOffloader: cots_capture_sync_mode={capture_sync_mode!r} "
                     "requires enforce_eager=False (graph-capture mode). "
                     "The wait kernel replaces the captured sync_cb host_fn "
                     "node; under enforce_eager=True there is no captured "
@@ -3517,7 +3521,7 @@ class CotsOffloader(BaseOffloader):
             # wait-kernel sync as the configuration that needs the GPU).
             if not torch.cuda.is_available():
                 raise RuntimeError(
-                    "CotsOffloader: cots_capture_sync_mode='wait_kernel' "
+                    f"CotsOffloader: cots_capture_sync_mode={capture_sync_mode!r} "
                     "requires CUDA to be available; the wait kernel runs "
                     "on the GPU."
                 )
@@ -3528,7 +3532,7 @@ class CotsOffloader(BaseOffloader):
                 from vllm import _cots_C  # noqa: F401
             except ImportError as e:
                 raise RuntimeError(
-                    "CotsOffloader: cots_capture_sync_mode='wait_kernel' "
+                    f"CotsOffloader: cots_capture_sync_mode={capture_sync_mode!r} "
                     "requires the `vllm._cots_C` extension. Rebuild vLLM "
                     "with CUDA support (./rebuild_vllm.sh). Underlying "
                     f"ImportError: {e}"
@@ -3573,7 +3577,9 @@ class CotsOffloader(BaseOffloader):
         # graph's sync_cb host_fn nodes are replaced with wait kernel
         # launches at every cots_sync_then_uva call site.
         if wait_kernel_enabled and isinstance(self._runner, NativeCotsRunner):
-            self._runner.install_wait_kernel_sync()
+            self._runner.install_wait_kernel_sync(
+                fuse_uva_copy=(capture_sync_mode == "wait_uva_kernel")
+            )
 
         # §1c.26 / §1c.27 ablation install. Probe-only: read five env
         # vars (VLLM_COTS_ABLATE_HOSTFN / SUBMIT_HOSTFN / SYNC_HOSTFN /

@@ -21,7 +21,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.offloader.base import ForwardDispatchInfo, get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.utils.cots_diag import ENABLED as _COTS_DIAG_ENABLED
+from vllm.utils.cots_diag import NVTX_ENABLED as _COTS_NVTX_ENABLED
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
@@ -311,7 +311,7 @@ class CudaGraphManager:
         # spec-decode / older runner that calls
         # `cudagraph_manager.run_fullgraph`). Env-gated by
         # VLLM_COTS_DIAG=1; production default skips the wrapper.
-        if not _COTS_DIAG_ENABLED:
+        if not _COTS_NVTX_ENABLED:
             _publish_offloader_dispatch(desc, actual_num_tokens)
             self.graphs[desc].replay()
             return

@@ -86,6 +86,7 @@ struct alignas(64) TaskSlab {
   void* dev_done_slot{nullptr};
   std::atomic<uint32_t> next_seq{0};
   std::atomic<bool> wait_kernel_sync_installed{false};
+  std::atomic<bool> wait_uva_kernel_installed{false};
 
   // §1c.33: per-task fire counter. Diagnostic only — the
   // DispatchCallback increment is gated behind
@@ -249,6 +250,16 @@ class CotsCpuInfer {
   // for this task at startup.
   void sync_or_wait_on_stream(int64_t task_id, uintptr_t cuda_stream);
 
+  // Experimental capture-mode fused path. If wait-UVA sync is installed for
+  // this task, launch one captured CUDA kernel that waits on done_slot and
+  // copies the slab's pinned BF16 output into `y_gpu`; returns true so Python
+  // skips the separate Triton UVA copy. Otherwise falls back to
+  // sync_or_wait_on_stream and returns false.
+  bool sync_or_wait_and_maybe_uva_on_stream(int64_t task_id,
+                                            uintptr_t y_gpu_ptr,
+                                            int32_t num_tokens, int32_t y_cols,
+                                            uintptr_t cuda_stream);
+
   // Test-only / Python-side helpers (not in the captured-graph hot path).
   // Submit N dryrun_noop tasks directly via TaskQueue::enqueue (no CUDA
   // stream / host callback involved). Used by test_taskqueue_stress.
@@ -278,7 +289,8 @@ class CotsCpuInfer {
   // — silent fallback under graph capture would put different
   // slabs on different mechanisms, refuse to install). After
   // success, `slab.wait_kernel_sync_installed = true`.
-  void install_wait_kernel_sync_for_task(int64_t task_id);
+  void install_wait_kernel_sync_for_task(int64_t task_id,
+                                         bool fuse_uva_copy = false);
 
   // Launch the captured-graph wait kernel for `task_id` on
   // `cuda_stream`. Selects production vs diag kernel based on
@@ -476,6 +488,9 @@ class CotsCpuInfer {
   // safe to short-circuit (submit_on_stream, sync_blocking, etc.).
   void wait_kernel_sync_on_stream_no_check(int64_t task_id,
                                            uintptr_t cuda_stream);
+  void wait_uva_kernel_on_stream_no_check(int64_t task_id, uintptr_t y_gpu_ptr,
+                                          int32_t num_tokens, int32_t y_cols,
+                                          uintptr_t cuda_stream);
 
   // Worker-thread task body; runs whatever op_kind says. The `seq`
   // parameter (0 == no wait-kernel sync, > 0 == wait-kernel sync enabled for

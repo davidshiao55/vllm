@@ -478,9 +478,10 @@ class EngineArgs:
     cots_cpu_runner: Literal["native", "python"] = CotsOffloadConfig.cpu_runner
     cots_cpu_worker_affinity: list[int] | None = CotsOffloadConfig.cpu_worker_affinity
     cots_dry_run: bool = CotsOffloadConfig.dry_run
-    cots_capture_sync_mode: Literal["host_callback", "wait_kernel"] = (
-        CotsOffloadConfig.cots_capture_sync_mode
-    )
+    cots_auto_graph_split: bool = CotsOffloadConfig.auto_graph_split
+    cots_capture_sync_mode: Literal[
+        "host_callback", "wait_kernel", "wait_uva_kernel"
+    ] = CotsOffloadConfig.cots_capture_sync_mode
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
     max_num_batched_tokens: int | None = None
@@ -1095,6 +1096,10 @@ class EngineArgs:
             **cots_kwargs["cpu_worker_affinity"],
         )
         offload_group.add_argument("--cots-dry-run", **cots_kwargs["dry_run"])
+        offload_group.add_argument(
+            "--cots-auto-graph-split",
+            **cots_kwargs["auto_graph_split"],
+        )
         offload_group.add_argument(
             "--cots-capture-sync-mode",
             **cots_kwargs["cots_capture_sync_mode"],
@@ -2008,6 +2013,7 @@ class EngineArgs:
             cpu_runner=self.cots_cpu_runner,
             cpu_worker_affinity=self.cots_cpu_worker_affinity,
             dry_run=self.cots_dry_run,
+            auto_graph_split=self.cots_auto_graph_split,
             cots_capture_sync_mode=self.cots_capture_sync_mode,
         )
         offload_config = config_replace(

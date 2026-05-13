@@ -162,13 +162,11 @@ class CotsOffloadConfig:
 
     * `"native"` (default): CPU work runs on a C++ `TaskQueue`
       worker; submit/sync go through `cudaLaunchHostFunc` host
-      callbacks. Supports both eager mode (the
-      production-recommended path for Phase 2 per §1c.32 / §1c.33
-      / §1c.34 — native eager beats native+capture+wait-kernel
-      on the measured Qwen2.5-7B workload grid) AND graph capture
-      (`enforce_eager=False`, opt-in research path; see
-      `cots_capture_sync_mode` for the sync mechanism options
-      under capture).
+      callbacks. Supports both eager mode and graph capture
+      (`enforce_eager=False`). With `auto_graph_split=True`, graph
+      mode defaults to the measured fast split path; legacy full
+      capture remains available for A/B diagnostics via
+      `--no-cots-auto-graph-split`.
     * `"python"` (kill-switch): keeps the Phase 1a/1b
       `ThreadPoolExecutor` substrate for A/B diagnostics. NOT
       graph-capturable; `cpu_runner='python'` requires
@@ -176,8 +174,8 @@ class CotsOffloadConfig:
       otherwise. Slated for deprecation after Phase 2.
 
     See `David/Docs/implementation_roadmap.md` Phase 1c and
-    `phase1c_findings.md` §1c.29 / §1c.32 / §1c.33 for the
-    measurements that motivate the native-eager recommendation."""
+    `phase1c_capture_gap_findings.md` for the capture-gap
+    measurements that motivate the split-graph default."""
 
     dry_run: bool = Field(default=False)
     """Diagnostic: install all wrappers but skip the CPU GEMM in the worker.
@@ -187,39 +185,57 @@ class CotsOffloadConfig:
     diagnostic — useful for verifying Phase 1c collapsed the orchestration
     column and for catching future regressions in the COTS host path."""
 
-    cots_capture_sync_mode: Literal["host_callback", "wait_kernel"] = "host_callback"
+    auto_graph_split: bool = Field(default=True)
+    """When COTS runs with CUDA graphs (`enforce_eager=False`) on the native
+    runner, default to the measured fast graph policy: piecewise CUDA graphs,
+    COTS submit/sync split points, and `wait_kernel` sync. Disable this with
+    `--no-cots-auto-graph-split` to reproduce legacy full-capture or
+    host-callback capture experiments explicitly."""
+
+    cots_capture_sync_mode: Literal[
+        "host_callback", "wait_kernel", "wait_uva_kernel"
+    ] = "host_callback"
     """Phase 1c sync-side mechanism for the captured-replay path
     (formerly "M3" — pre-§1c.34 boolean
     `cots_m3_wait_kernel=True` was removed in favor of this
     enum; no backward-compat alias).
 
-    * `"host_callback"` (default, production-recommended): the
+    * `"host_callback"` (field default / eager fallback): the
       captured graph node is `cudaLaunchHostFunc(SyncCallback)`
       which blocks the CUDA driver thread on
       `TaskQueue::sync(0)`. This is the legacy / measured-baseline
-      mechanism.
+      mechanism. With `auto_graph_split=True`, native COTS graph
+      mode upgrades this to `"wait_kernel"` unless explicitly
+      opting out of the auto graph policy.
     * `"wait_kernel"` (opt-in research path): the captured node
       is a custom GPU wait kernel that spins on a host-mapped
       pinned `done_slot` written by the CPU worker. Replaces the
       captured `cudaLaunchHostFunc(sync_cb)` only. Submit side
       (dispatch_cb host_fn) is unchanged in both modes so CPU
-      GEMM still overlaps with GPU GEMM. See §1c.29 design +
-      §1c.32/§1c.33 evaluation: capture mode with this kernel
-      did NOT beat native eager on Qwen2.5-7B at B=1/4 across the
-      workload grid, so this stays opt-in.
+      GEMM still overlaps with GPU GEMM. By itself on the legacy
+      full-capture path, this did not beat native eager; paired
+      with the COTS split-graph default it is the fastest measured
+      capture path on the focused Qwen2.5-7B grid.
+    * `"wait_uva_kernel"` (experimental): one captured CUDA kernel
+      waits on `done_slot` and copies the CPU pinned output into
+      the GPU output buffer, replacing both the sync host callback
+      and the separate Triton UVA-copy node. This is an optimization
+      prototype for the Phase 1c capture-gap investigation; it is
+      not the default unless the benchmark gate beats native eager.
 
     Hard-fail safety gates (in `CotsOffloader.post_init`) for
-    `wait_kernel` mode:
+    `wait_kernel` / `wait_uva_kernel` mode:
     * Requires `cpu_runner='native'` — Python runner has no
       slabs / worker thread / host-mapped `done_slot`.
     * Requires `enforce_eager=False` — kernel only makes sense
       as a captured node.
     * Requires CUDA + `_cots_C` extension built.
 
-    Phase 2 production guidance: **native eager + legacy
-    host_callback is faster on the measured workloads.** The
-    `wait_kernel` mode is preserved for research /
-    captured-graph experimentation only.
+    Phase 2 production guidance after the capture-gap grid: native
+    COTS graph mode defaults to the split-graph + wait-kernel path
+    because it beat native eager and legacy full capture on the
+    focused Qwen2.5-7B workload grid. The legacy full-capture modes
+    remain available by disabling `auto_graph_split`.
     """
 
 

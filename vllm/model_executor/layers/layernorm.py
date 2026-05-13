@@ -276,7 +276,7 @@ class RMSNorm(CustomOp):
             self.variance_epsilon,
             self.hidden_size,
             x.dtype,
-            self.weight.data if self.has_weight else None,
+            self.weight if self.has_weight else None,
             residual,
             self.variance_size_override,
         )

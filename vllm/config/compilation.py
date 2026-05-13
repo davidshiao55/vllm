@@ -6,7 +6,7 @@ from collections import Counter
 from collections.abc import Callable
 from dataclasses import field, fields
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 from pydantic import Field, TypeAdapter, field_validator
 
@@ -282,7 +282,7 @@ class PassConfig:
         """
         enabled_fusions = [
             f.name[len("fuse_") :]
-            for f in fields(self)
+            for f in fields(cast(Any, self))
             if getattr(self, f.name) and f.name.startswith("fuse_")
         ]
 
@@ -717,6 +717,16 @@ class CompilationConfig:
         "vllm::rocm_aiter_sparse_attn_indexer",
     ]
 
+    # COTS graph-boundary ops; used by the thesis COTS fast split default.
+    _cots_ops: ClassVar[list[str]] = [
+        "vllm::cots_submit_gemm",
+        "vllm::cots_sync_then_uva",
+    ]
+
+    @classmethod
+    def cots_splitting_ops(cls) -> list[str]:
+        return list(cls._cots_ops)
+
     def compute_hash(self) -> str:
         """
         Provide a hash that uniquely identifies all the configs
@@ -1033,7 +1043,10 @@ class CompilationConfig:
             assert self.cudagraph_capture_sizes[-1] == self.max_cudagraph_capture_size
 
     def set_splitting_ops_for_v1(
-        self, all2all_backend: str, data_parallel_size: int = 1
+        self,
+        all2all_backend: str,
+        data_parallel_size: int = 1,
+        extra_splitting_ops: list[str] | None = None,
     ):
         # To compatible with OOT hardware plugin platform (for example vllm-ascend)
         # which currently only supports sequence parallelism in eager mode.
@@ -1074,6 +1087,11 @@ class CompilationConfig:
                         self.pass_config.fuse_rope_kvcache = False
                     self.splitting_ops.append("vllm::unified_kv_cache_update")
                     self.splitting_ops.append("vllm::unified_mla_kv_cache_update")
+
+                if extra_splitting_ops:
+                    for op in extra_splitting_ops:
+                        if op not in self.splitting_ops:
+                            self.splitting_ops.append(op)
 
             elif len(self.splitting_ops) == 0:
                 if (

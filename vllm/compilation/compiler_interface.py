@@ -411,21 +411,25 @@ class InductorStandaloneAdaptor(CompilerInterface):
             _, cache_info = compiled_artifact._artifacts
             return len(cache_info.aot_autograd_artifacts) == 1
 
+        def runtime_only(compiled_artifact):
+            def compiled_graph_wrapper(*args: Any) -> Any:
+                return compiled_artifact(*args)
+
+            return compiled_graph_wrapper
+
         if is_compile_cache_enabled(compiler_config):
             if not is_saveable_2_10(compiled_graph):
-                raise RuntimeError(
-                    "The compiled artifact is not serializable. This usually means "
-                    "that the model code has something that is not serializable "
-                    "by torch.compile in it. You can fix this by either "
-                    "figuring out what is not serializable and rewriting it, "
-                    "filing a bug report, "
-                    "or suppressing this error by "
-                    "disabling vLLM's compilation cache via "
-                    "VLLM_DISABLE_COMPILE_CACHE=1 "
-                    "(this will greatly increase vLLM server warm start times)."
+                logger.warning_once(
+                    "Compiled artifact for range %s is not serializable; "
+                    "using an in-memory callable for this subgraph and "
+                    "continuing to cache serializable subgraphs.",
+                    compile_range,
+                    scope="local",
                 )
-            compiled_graph.save(path=path, format=self.save_format)
-            compilation_counter.num_compiled_artifacts_saved += 1
+                return runtime_only(compiled_graph), None
+            else:
+                compiled_graph.save(path=path, format=self.save_format)
+                compilation_counter.num_compiled_artifacts_saved += 1
         return compiled_graph, (key, path)
 
     def load(

@@ -14,7 +14,9 @@ from vllm.compilation.passes.utility.fix_functionalization import (
 )
 from vllm.config import (
     CompilationConfig,
+    CotsOffloadConfig,
     CUDAGraphMode,
+    OffloadConfig,
     ParallelConfig,
     SchedulerConfig,
     VllmConfig,
@@ -267,6 +269,42 @@ def test_splitting_ops_dynamic():
     # use_inductor_graph_partition=True, and cudagraph_mode
     # is unchanged.
     assert config.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
+
+
+def test_cots_auto_graph_split_defaults():
+    config = VllmConfig(
+        offload_config=OffloadConfig(
+            offload_backend="cots",
+            cots=CotsOffloadConfig(f_cpu_store=0.05),
+        ),
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE,
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        ),
+    )
+
+    assert config.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
+    assert config.offload_config.cots.cots_capture_sync_mode == "wait_kernel"
+    for op in CompilationConfig.cots_splitting_ops():
+        assert op in config.compilation_config.splitting_ops
+
+
+def test_cots_auto_graph_split_can_be_disabled():
+    config = VllmConfig(
+        offload_config=OffloadConfig(
+            offload_backend="cots",
+            cots=CotsOffloadConfig(f_cpu_store=0.05, auto_graph_split=False),
+        ),
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE,
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        ),
+    )
+
+    assert config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
+    assert config.offload_config.cots.cots_capture_sync_mode == "host_callback"
+    for op in CompilationConfig.cots_splitting_ops():
+        assert op not in config.compilation_config.splitting_ops
 
 
 def test_moe_splitting_ops_deepep_ht_inductor_partition():

@@ -104,7 +104,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.tracing import instrument
 from vllm.utils import length_from_prompt_token_ids_or_embeds
-from vllm.utils.cots_diag import ENABLED as _COTS_DIAG_ENABLED
+from vllm.utils.cots_diag import NVTX_ENABLED as _COTS_NVTX_ENABLED
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.nvtx_pytorch_hooks import PytHooks
@@ -3797,7 +3797,7 @@ class GPUModelRunner(
         # §1c.25: fast path skips the NVTX wrapper entirely when
         # VLLM_COTS_DIAG=0 — single attr load + branch, no
         # range_push/pop call cost on the per-forward hot path.
-        if not _COTS_DIAG_ENABLED:
+        if not _COTS_NVTX_ENABLED:
             return self._execute_model_impl(scheduler_output, intermediate_tensors)
         torch.cuda.nvtx.range_push("cots:execute_model")
         try:
@@ -4074,7 +4074,7 @@ class GPUModelRunner(
             # §1c.25: NVTX around the model call tagged with dispatch
             # mode. Fast path skips both the mode-name string build
             # AND the NVTX call when VLLM_COTS_DIAG=0.
-            if not _COTS_DIAG_ENABLED:
+            if not _COTS_NVTX_ENABLED:
                 model_output = self._model_forward(
                     input_ids=input_ids,
                     positions=positions,

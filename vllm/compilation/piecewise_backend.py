@@ -4,6 +4,7 @@
 import dataclasses
 import io
 import json
+import os
 import pickle
 from collections.abc import Callable
 from pickle import Pickler
@@ -20,6 +21,24 @@ from vllm.config.utils import Range
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def _format_graph_ops(graph: fx.GraphModule) -> str:
+    """Compact op list for compile/cache diagnostics."""
+
+    ops = []
+    for node in graph.graph.nodes:
+        if node.op in ("placeholder", "output"):
+            continue
+        target = node.target
+        if hasattr(target, "_qualified_op_name"):
+            name = target._qualified_op_name
+        elif hasattr(target, "name"):
+            name = target.name()
+        else:
+            name = str(target)
+        ops.append(f"{node.op}:{name}")
+    return ", ".join(ops)
 
 
 def get_fake_args_from_graph(graph: fx.GraphModule) -> list[Any]:
@@ -262,15 +281,28 @@ class PiecewiseBackend:
             else:
                 args_list = get_fake_args_from_graph(self.graph)
 
-            range_entry.runnable = self.vllm_backend.compiler_manager.compile(
-                self.graph,
-                args_list,
-                self.vllm_backend.inductor_config,
-                self.compilation_config,
-                compile_range=range_entry.compile_range,
-                graph_index=self.piecewise_compile_index,
-                num_graphs=self.total_piecewise_compiles,
-            )
+            try:
+                range_entry.runnable = self.vllm_backend.compiler_manager.compile(
+                    self.graph,
+                    args_list,
+                    self.vllm_backend.inductor_config,
+                    self.compilation_config,
+                    compile_range=range_entry.compile_range,
+                    graph_index=self.piecewise_compile_index,
+                    num_graphs=self.total_piecewise_compiles,
+                )
+            except Exception:
+                if os.getenv("VLLM_COTS_COMPILE_CACHE_DEBUG", "0") == "1":
+                    logger.exception(
+                        "Piecewise compile/cache failure: submod=%s index=%d/%d "
+                        "range=%s ops=[%s]",
+                        self.submod_name,
+                        self.piecewise_compile_index,
+                        self.total_piecewise_compiles,
+                        range_entry.compile_range,
+                        _format_graph_ops(self.graph),
+                    )
+                raise
 
             range_entry.compiled = True
 

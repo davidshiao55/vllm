@@ -39,28 +39,48 @@ namespace {
 
 constexpr int kMaxCpus = 64;
 
-// §1c.24 instrumentation. NVTX ranges around the hot paths so nsys
-// timeline can attribute time to the specific COTS phase. Gated by
-// `VLLM_COTS_DIAG=1` (read once at first call) — when no profiler is
-// attached `nvtxRangePush*` is a near-no-op but it still costs ~10ns
-// in dispatch, which adds up across 7k+ hot-path calls per generate.
-// Diagnostic-only; the production hot path stays clean.
-namespace nvtx_internal {
-inline bool diag_enabled() {
+// §1c.24 instrumentation gates. `VLLM_COTS_DIAG=1` remains a legacy
+// alias for all diagnostics; the split flags let benchmark runs enable
+// NVTX, counters, or the diagnostic wait kernel independently.
+namespace cots_diag {
+inline bool env_flag(const char* name) {
+  const char* v = std::getenv(name);
+  return v != nullptr && v[0] == '1' && v[1] == '\0';
+}
+
+inline bool legacy_enabled() {
+  static const bool enabled = []() { return env_flag("VLLM_COTS_DIAG"); }();
+  return enabled;
+}
+
+inline bool nvtx_enabled() {
   static const bool enabled = []() {
-    const char* v = std::getenv("VLLM_COTS_DIAG");
-    return v != nullptr && v[0] == '1' && v[1] == '\0';
+    return legacy_enabled() || env_flag("VLLM_COTS_NVTX");
   }();
   return enabled;
 }
-}  // namespace nvtx_internal
+
+inline bool counters_enabled() {
+  static const bool enabled = []() {
+    return legacy_enabled() || env_flag("VLLM_COTS_COUNTERS");
+  }();
+  return enabled;
+}
+
+inline bool wait_kernel_diag_enabled() {
+  static const bool enabled = []() {
+    return legacy_enabled() || env_flag("VLLM_COTS_WAIT_KERNEL_DIAG");
+  }();
+  return enabled;
+}
+}  // namespace cots_diag
 
 struct NvtxScope {
   explicit NvtxScope(const char* name) {
-    if (nvtx_internal::diag_enabled()) nvtxRangePushA(name);
+    if (cots_diag::nvtx_enabled()) nvtxRangePushA(name);
   }
   ~NvtxScope() {
-    if (nvtx_internal::diag_enabled()) nvtxRangePop();
+    if (cots_diag::nvtx_enabled()) nvtxRangePop();
   }
   NvtxScope(const NvtxScope&) = delete;
   NvtxScope& operator=(const NvtxScope&) = delete;
@@ -113,6 +133,7 @@ CotsCpuInfer::~CotsCpuInfer() {
           cudaFreeHost(s.host_done_slot);
           s.host_done_slot = nullptr;
         }
+        s.wait_uva_kernel_installed.store(false, std::memory_order_release);
         s.wait_kernel_sync_installed.store(false, std::memory_order_release);
       }
     }
@@ -290,7 +311,7 @@ void CotsCpuInfer::submit_on_stream(int64_t task_id, int32_t num_tokens,
   // §1c.21 counters: bump submit_count + num_tokens histogram for
   // this op kind. Diag-gated (§1c.34 cleanup C) — production-default
   // path skips the atomic adds entirely.
-  if (nvtx_internal::diag_enabled()) {
+  if (cots_diag::counters_enabled()) {
     int hist_bin;
     if (num_tokens <= 1)
       hist_bin = 0;
@@ -356,7 +377,7 @@ void CotsCpuInfer::submit_on_stream(int64_t task_id, int32_t num_tokens,
     NvtxScope d2h_scope("cots:d2h_record");
     // §1c.34 cleanup C: D2H byte/count counters are diagnostic only;
     // diag-gate them so the hot path skips the atomic adds.
-    const bool d2h_diag = nvtx_internal::diag_enabled();
+    const bool d2h_diag = cots_diag::counters_enabled();
     if (x_stride0 == x_cols) {
       // Contiguous row layout — single 1D copy is fastest.
       const size_t bytes = static_cast<size_t>(num_tokens) * width_bytes;
@@ -465,6 +486,24 @@ void CotsCpuInfer::sync_or_wait_on_stream(int64_t task_id,
     // worker still completes; the next call surfaces the error.
     sync_on_stream(cuda_stream);
   }
+}
+
+bool CotsCpuInfer::sync_or_wait_and_maybe_uva_on_stream(int64_t task_id,
+                                                        uintptr_t y_gpu_ptr,
+                                                        int32_t num_tokens,
+                                                        int32_t y_cols,
+                                                        uintptr_t cuda_stream) {
+  TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
+              "sync_or_wait_and_maybe_uva_on_stream: task_id ", task_id,
+              " out of range");
+  TaskSlab& s = slabs_[task_id];
+  if (s.wait_uva_kernel_installed.load(std::memory_order_acquire)) {
+    wait_uva_kernel_on_stream_no_check(task_id, y_gpu_ptr, num_tokens, y_cols,
+                                       cuda_stream);
+    return true;
+  }
+  sync_or_wait_on_stream(task_id, cuda_stream);
+  return false;
 }
 
 bool CotsCpuInfer::wait_kernel_sync_installed_for_task(int64_t task_id) const {
@@ -655,7 +694,7 @@ void CotsCpuInfer::DispatchCallback(void* user_data) {
   // mode neither now_ns() nor the atomic write fires. Worker reads
   // enqueue_time_ns conditionally on the same flag, so a
   // diag-disabled run leaves it at its initial value (0).
-  if (nvtx_internal::diag_enabled()) {
+  if (cots_diag::counters_enabled()) {
     slab->enqueue_time_ns.store(now_ns(), std::memory_order_release);
     self->dispatch_cb_count_.fetch_add(1, std::memory_order_relaxed);
   }
@@ -666,7 +705,7 @@ void CotsCpuInfer::DispatchCallback(void* user_data) {
   // counter is observational only, used by the
   // VLLM_COTS_DUMP_TASK_FIRES=1 atexit dump which itself
   // requires diag mode to be meaningful.
-  if (nvtx_internal::diag_enabled()) {
+  if (cots_diag::counters_enabled()) {
     slab->fire_count.fetch_add(1, std::memory_order_relaxed);
   }
   // §1c.29 commit 2 — wait-kernel sync sequence publish. When wait-kernel sync
@@ -714,7 +753,7 @@ void CotsCpuInfer::SyncCallback(void* user_data) {
   // then unblocking immediately". Same VLLM_COTS_DIAG gate as the
   // dispatch counter; in production-default mode the timestamps
   // and atomic adds are skipped.
-  if (nvtx_internal::diag_enabled()) {
+  if (cots_diag::counters_enabled()) {
     const int64_t t0 = now_ns();
     self->task_queue_->sync(args->allow_n_pending);
     const int64_t t1 = now_ns();
@@ -732,7 +771,7 @@ void CotsCpuInfer::RunSlabOnWorker(TaskSlab* slab, uint32_t seq) {
   // VLLM_COTS_DIAG. Production-default leaves worker_t0 at 0 (the
   // worker_busy_total_ns add at the end is also gated). NVTX scope
   // is independently gated inside NvtxScope's ctor.
-  const bool diag = nvtx_internal::diag_enabled();
+  const bool diag = cots_diag::counters_enabled();
   const int64_t worker_t0 = diag ? now_ns() : 0;
   if (diag) {
     const int64_t enq = slab->enqueue_time_ns.load(std::memory_order_acquire);
@@ -965,7 +1004,7 @@ void CotsCpuInfer::note_uva_request(int32_t num_tokens, int32_t cpu_out_dim) {
   // §1c.22 bookkeeping. Diag-gated (§1c.34 cleanup C) —
   // measurement-only path; no functional dependency.
   if (num_tokens <= 0 || cpu_out_dim <= 0) return;
-  if (!nvtx_internal::diag_enabled()) return;
+  if (!cots_diag::counters_enabled()) return;
   const int64_t bytes = static_cast<int64_t>(num_tokens) *
                         static_cast<int64_t>(cpu_out_dim) *
                         static_cast<int64_t>(sizeof(at::BFloat16));
@@ -984,7 +1023,7 @@ void CotsCpuInfer::set_runtime_num_tokens(int32_t n) {
   // always-on; the runtime_set_calls / runtime_last_value counters
   // alongside are diagnostic only and diag-gated (§1c.34 cleanup C).
   runtime_num_tokens_.store(n, std::memory_order_release);
-  if (nvtx_internal::diag_enabled()) {
+  if (cots_diag::counters_enabled()) {
     runtime_set_calls_.fetch_add(1, std::memory_order_relaxed);
     runtime_last_value_.store(n, std::memory_order_relaxed);
   }
@@ -1123,6 +1162,13 @@ extern "C" void launch_cots_wait_done_kernel_production(uint32_t*, uint32_t*,
 extern "C" void launch_cots_wait_done_kernel_diag(uint32_t*, uint32_t*,
                                                   int64_t*, int64_t*, int64_t*,
                                                   cudaStream_t);
+extern "C" void launch_cots_wait_uva_copy_kernel_production(
+    uint32_t*, uint32_t*, const void*, void*, int64_t, cudaStream_t);
+extern "C" void launch_cots_wait_uva_copy_kernel_diag(uint32_t*, uint32_t*,
+                                                      const void*, void*,
+                                                      int64_t, int64_t*,
+                                                      int64_t*, int64_t*,
+                                                      cudaStream_t);
 
 // §1c.29 helper: lazily allocate the diag counter cells the
 // first time install_wait_kernel_sync_for_task is called. Host-mapped pinned
@@ -1149,7 +1195,8 @@ static void ensure_wait_kernel_diag_cell(int64_t** host_ptr, int64_t** dev_ptr,
   *dev_ptr = static_cast<int64_t*>(dp);
 }
 
-void CotsCpuInfer::install_wait_kernel_sync_for_task(int64_t task_id) {
+void CotsCpuInfer::install_wait_kernel_sync_for_task(int64_t task_id,
+                                                     bool fuse_uva_copy) {
   check_error();
   TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
               "install_wait_kernel_sync_for_task: task_id ", task_id,
@@ -1169,7 +1216,7 @@ void CotsCpuInfer::install_wait_kernel_sync_for_task(int64_t task_id) {
   // cells are allocated; in production these cells stay nullptr
   // and the production launcher (which doesn't take counter ptrs)
   // is used instead.
-  if (nvtx_internal::diag_enabled()) {
+  if (cots_diag::wait_kernel_diag_enabled()) {
     ensure_wait_kernel_diag_cell(&wait_kernel_immediate_resume_host_,
                                  &wait_kernel_immediate_resume_dev_,
                                  "m3_immediate_resume");
@@ -1221,6 +1268,7 @@ void CotsCpuInfer::install_wait_kernel_sync_for_task(int64_t task_id) {
   s.host_done_slot = host_done;
   s.dev_done_slot = dev_done;
   s.next_seq.store(0, std::memory_order_relaxed);
+  s.wait_uva_kernel_installed.store(fuse_uva_copy, std::memory_order_release);
   s.wait_kernel_sync_installed.store(true, std::memory_order_release);
 }
 
@@ -1248,7 +1296,7 @@ void CotsCpuInfer::wait_kernel_sync_on_stream_no_check(int64_t task_id,
       "wait_kernel_sync_on_stream: wait-kernel sync not installed for task_id=",
       task_id, "; call install_wait_kernel_sync_for_task first");
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
-  if (nvtx_internal::diag_enabled()) {
+  if (cots_diag::wait_kernel_diag_enabled()) {
     // Diag counter cells are lazy-allocated by
     // install_wait_kernel_sync_for_task, so they must exist by now (we already
     // passed the wait_kernel_sync_installed gate above).
@@ -1277,6 +1325,70 @@ void CotsCpuInfer::wait_kernel_sync_on_stream_no_check(int64_t task_id,
   cudaError_t le = cudaGetLastError();
   TORCH_CHECK(le == cudaSuccess,
               "wait_kernel_sync_on_stream: kernel launch failed: ",
+              cudaGetErrorString(le));
+}
+
+void CotsCpuInfer::wait_uva_kernel_on_stream_no_check(int64_t task_id,
+                                                      uintptr_t y_gpu_ptr,
+                                                      int32_t num_tokens,
+                                                      int32_t y_cols,
+                                                      uintptr_t cuda_stream) {
+  TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
+              "wait_uva_kernel_on_stream: task_id ", task_id, " out of range");
+  TaskSlab& s = slabs_[task_id];
+  TORCH_CHECK(
+      s.wait_uva_kernel_installed.load(std::memory_order_acquire),
+      "wait_uva_kernel_on_stream: wait-UVA kernel not installed for task_id=",
+      task_id, "; use cots_capture_sync_mode='wait_uva_kernel'");
+  TORCH_CHECK(y_gpu_ptr != 0,
+              "wait_uva_kernel_on_stream: y_gpu_ptr must be nonzero");
+  TORCH_CHECK(num_tokens >= 0,
+              "wait_uva_kernel_on_stream: num_tokens=", num_tokens, " < 0");
+  TORCH_CHECK(y_cols > 0, "wait_uva_kernel_on_stream: y_cols=", y_cols,
+              " must be > 0");
+  TORCH_CHECK(
+      s.y_pinned_ptr != nullptr,
+      "wait_uva_kernel_on_stream: slab.y_pinned_ptr is null at task_id=",
+      task_id, " (slab not populated?)");
+  TORCH_CHECK(s.cpu_out_dim == y_cols,
+              "wait_uva_kernel_on_stream: y_cols=", y_cols,
+              " disagrees with slab.cpu_out_dim=", s.cpu_out_dim,
+              " at task_id=", task_id);
+  num_tokens = std::min(num_tokens, s.bucket_capacity_tokens);
+  const int64_t n_elements =
+      static_cast<int64_t>(num_tokens) * static_cast<int64_t>(y_cols);
+  if (n_elements <= 0) {
+    return;
+  }
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  if (cots_diag::counters_enabled()) {
+    const int64_t bytes =
+        n_elements * static_cast<int64_t>(sizeof(at::BFloat16));
+    uva_record_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+    uva_record_count_.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (cots_diag::wait_kernel_diag_enabled()) {
+    TORCH_CHECK(
+        wait_kernel_immediate_resume_dev_ != nullptr &&
+            wait_kernel_lagging_wait_dev_ != nullptr &&
+            wait_kernel_spin_iters_dev_ != nullptr,
+        "wait_uva_kernel_on_stream: wait-kernel diag mode active but diag "
+        "counter cells are not allocated");
+    launch_cots_wait_uva_copy_kernel_diag(
+        static_cast<uint32_t*>(s.dev_req_slot),
+        static_cast<uint32_t*>(s.dev_done_slot), s.y_pinned_ptr,
+        reinterpret_cast<void*>(y_gpu_ptr), n_elements,
+        wait_kernel_spin_iters_dev_, wait_kernel_immediate_resume_dev_,
+        wait_kernel_lagging_wait_dev_, stream);
+  } else {
+    launch_cots_wait_uva_copy_kernel_production(
+        static_cast<uint32_t*>(s.dev_req_slot),
+        static_cast<uint32_t*>(s.dev_done_slot), s.y_pinned_ptr,
+        reinterpret_cast<void*>(y_gpu_ptr), n_elements, stream);
+  }
+  cudaError_t le = cudaGetLastError();
+  TORCH_CHECK(le == cudaSuccess,
+              "wait_uva_kernel_on_stream: kernel launch failed: ",
               cudaGetErrorString(le));
 }
 
