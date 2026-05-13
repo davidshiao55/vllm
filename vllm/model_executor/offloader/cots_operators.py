@@ -20,6 +20,31 @@ if TYPE_CHECKING:
     from vllm.model_executor.offloader.cots_offloader import CotsOffloader
 
 
+def _assert_prefetch_slot_ready(
+    h: CotsLinearHandle,
+    required_rows: int,
+    *,
+    underfilled_name: str,
+) -> None:
+    """Validate eager/runtime prefetch slot metadata.
+
+    During Dynamo tracing, ``start_prefetch``/``wait_prefetch`` use their
+    fake implementations and therefore do not update Python owner metadata.
+    The real custom ops still run when the compiled/captured graph executes,
+    so trace-time metadata assertions would reject a valid graph before the
+    actual prefetch path has a chance to run.
+    """
+    if torch.compiler.is_compiling():
+        return
+    assert h.prefetch_owner_in_slot[h.slot_idx] is h, (
+        f"slot owner mismatch on {h.qualified_name} slot {h.slot_idx}"
+    )
+    assert h.prefetch_available_rows_in_slot[h.slot_idx] >= required_rows, (
+        f"{underfilled_name} underfilled on {h.qualified_name}: have "
+        f"{h.prefetch_available_rows_in_slot[h.slot_idx]}, need {required_rows}"
+    )
+
+
 class CotsQKVOp:
     """Patched `quant_method.apply` for QKVParallelLinear.
 
@@ -97,13 +122,10 @@ class CotsQKVOp:
             pref_idx = h.prefetch_indices_cuda_by_bucket[b]
             cpu_idx = h.cpu_compute_indices_cuda_by_bucket[b]
             if n_pref > 0:
-                assert h.prefetch_owner_in_slot[h.slot_idx] is h, (
-                    f"slot owner mismatch on {h.qualified_name} slot {h.slot_idx}"
-                )
-                assert h.prefetch_available_rows_in_slot[h.slot_idx] >= n_pref, (
-                    f"slot underfilled on {h.qualified_name}: have "
-                    f"{h.prefetch_available_rows_in_slot[h.slot_idx]}, "
-                    f"need {n_pref}"
+                _assert_prefetch_slot_ready(
+                    h,
+                    n_pref,
+                    underfilled_name="slot",
                 )
 
         # CPU compute path skipped when n_cpu_compute == 0 (pure-prefetch).
@@ -252,26 +274,16 @@ class CotsSwiGLUMLPOp:
             dn_n_cpu = dn_h.n_cpu_compute_by_bucket[b]
             if gu_n_pref > 0:
                 gu_n_per_half = gu_n_pref // 2
-                assert gu_h.prefetch_owner_in_slot[gu_h.slot_idx] is gu_h, (
-                    f"slot owner mismatch on {gu_h.qualified_name} slot {gu_h.slot_idx}"
-                )
-                assert (
-                    gu_h.prefetch_available_rows_in_slot[gu_h.slot_idx] >= gu_n_per_half
-                ), (
-                    f"col slot underfilled on {gu_h.qualified_name}: have "
-                    f"{gu_h.prefetch_available_rows_in_slot[gu_h.slot_idx]}, "
-                    f"need {gu_n_per_half}"
+                _assert_prefetch_slot_ready(
+                    gu_h,
+                    gu_n_per_half,
+                    underfilled_name="col slot",
                 )
             if dn_n_pref > 0:
-                assert dn_h.prefetch_owner_in_slot[dn_h.slot_idx] is dn_h, (
-                    f"slot owner mismatch on {dn_h.qualified_name} slot {dn_h.slot_idx}"
-                )
-                assert (
-                    dn_h.prefetch_available_rows_in_slot[dn_h.slot_idx] >= dn_n_pref
-                ), (
-                    f"row slot underfilled on {dn_h.qualified_name}: have "
-                    f"{dn_h.prefetch_available_rows_in_slot[dn_h.slot_idx]}, "
-                    f"need {dn_n_pref}"
+                _assert_prefetch_slot_ready(
+                    dn_h,
+                    dn_n_pref,
+                    underfilled_name="row slot",
                 )
 
         # CPU compute path — skipped entirely when n_cpu_compute == 0
