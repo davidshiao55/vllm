@@ -53,28 +53,15 @@ PYBIND11_MODULE(_cots_C, m) {
       // task uses.
       .def("sync_or_wait_on_stream", &CotsCpuInfer::sync_or_wait_on_stream,
            py::arg("task_id"), py::arg("cuda_stream"))
-      .def("sync_or_wait_and_maybe_uva_on_stream",
-           &CotsCpuInfer::sync_or_wait_and_maybe_uva_on_stream,
-           py::arg("task_id"), py::arg("y_gpu_ptr"), py::arg("num_tokens"),
-           py::arg("y_cols"), py::arg("cuda_stream"))
       .def("wait_kernel_sync_installed_for_task",
            &CotsCpuInfer::wait_kernel_sync_installed_for_task,
            py::arg("task_id"))
-      // §1c.33 per-task fire counter — returns
-      // List[int] indexed by task_id (size = slab_count_).
-      .def("get_task_fire_counts", &CotsCpuInfer::get_task_fire_counts)
-      .def("submit_dryrun_burst", &CotsCpuInfer::submit_dryrun_burst,
-           py::arg("n"))
       .def("sync_blocking", &CotsCpuInfer::sync_blocking)
       .def("set_worker_affinity", &CotsCpuInfer::set_worker_affinity,
            py::arg("cpu_set"))
-      .def("set_ablations", &CotsCpuInfer::set_ablations, py::arg("ablate_d2h"),
-           py::arg("ablate_hostfn"), py::arg("ablate_submit_hostfn") = false,
-           py::arg("ablate_sync_hostfn") = false)
       // §1c.29 wait-kernel sync — install + wait launcher + test helpers.
       .def("install_wait_kernel_sync_for_task",
-           &CotsCpuInfer::install_wait_kernel_sync_for_task, py::arg("task_id"),
-           py::arg("fuse_uva_copy") = false)
+           &CotsCpuInfer::install_wait_kernel_sync_for_task, py::arg("task_id"))
       .def("wait_kernel_sync_on_stream",
            &CotsCpuInfer::wait_kernel_sync_on_stream, py::arg("task_id"),
            py::arg("cuda_stream"))
@@ -94,15 +81,14 @@ PYBIND11_MODULE(_cots_C, m) {
       .def("check_error", &CotsCpuInfer::check_error)
       .def("run_at_linear_inline", &CotsCpuInfer::run_at_linear_inline,
            py::arg("x"), py::arg("w"), py::arg("y_out"))
-      // Stage 7 — custom AVX2 BF16 GEMM kernel inline (Path H in
-      // test_stage7_layout_microbench). Same signature shape as
+      // Custom AVX2 BF16 GEMM kernel inline. Same signature shape as
       // run_at_linear_inline; w must be (K, N) row-major BF16 (the
       // transposed-storage layout that oneDNN doesn't fast-path on
       // AVX2).
       .def("run_bf16_gemm_transposed_inline",
            &CotsCpuInfer::run_bf16_gemm_transposed_inline, py::arg("x"),
            py::arg("w"), py::arg("y_out"))
-      // Stage 7-D probe — natural (N, K) BF16 GEMM kernel.
+      // Natural (N, K) BF16 GEMM kernel.
       .def("run_bf16_gemm_natural_inline",
            &CotsCpuInfer::run_bf16_gemm_natural_inline, py::arg("x"),
            py::arg("w"), py::arg("y_out"))

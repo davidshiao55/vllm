@@ -479,9 +479,9 @@ class EngineArgs:
     cots_cpu_worker_affinity: list[int] | None = CotsOffloadConfig.cpu_worker_affinity
     cots_dry_run: bool = CotsOffloadConfig.dry_run
     cots_auto_graph_split: bool = CotsOffloadConfig.auto_graph_split
-    cots_capture_sync_mode: Literal[
-        "host_callback", "wait_kernel", "wait_uva_kernel"
-    ] = CotsOffloadConfig.cots_capture_sync_mode
+    cots_capture_sync_mode: Literal["host_callback", "wait_kernel"] = (
+        CotsOffloadConfig.cots_capture_sync_mode
+    )
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
     max_num_batched_tokens: int | None = None

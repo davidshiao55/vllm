@@ -86,18 +86,6 @@ struct alignas(64) TaskSlab {
   void* dev_done_slot{nullptr};
   std::atomic<uint32_t> next_seq{0};
   std::atomic<bool> wait_kernel_sync_installed{false};
-  std::atomic<bool> wait_uva_kernel_installed{false};
-
-  // §1c.33: per-task fire counter. Diagnostic only — the
-  // DispatchCallback increment is gated behind
-  // `nvtx_internal::diag_enabled()` (VLLM_COTS_DIAG=1), so the
-  // production-default hot path pays zero overhead. Read out via
-  // `CotsCpuInfer::get_task_fire_counts()` and cross-referenced
-  // Python-side with each task_id's (layer_idx, bucket, op_kind)
-  // descriptor to attribute fires per slab (used in §1c.33's
-  // reset-isolated rerun that retracted the §1c.32 op-count
-  // hypothesis).
-  std::atomic<int64_t> fire_count{0};
 
   // §1c.22 review-fix: immutable bucket capacity, populated once at
   // install time from the (layer, bucket, op_kind) descriptor and
@@ -250,20 +238,7 @@ class CotsCpuInfer {
   // for this task at startup.
   void sync_or_wait_on_stream(int64_t task_id, uintptr_t cuda_stream);
 
-  // Experimental capture-mode fused path. If wait-UVA sync is installed for
-  // this task, launch one captured CUDA kernel that waits on done_slot and
-  // copies the slab's pinned BF16 output into `y_gpu`; returns true so Python
-  // skips the separate Triton UVA copy. Otherwise falls back to
-  // sync_or_wait_on_stream and returns false.
-  bool sync_or_wait_and_maybe_uva_on_stream(int64_t task_id,
-                                            uintptr_t y_gpu_ptr,
-                                            int32_t num_tokens, int32_t y_cols,
-                                            uintptr_t cuda_stream);
-
-  // Test-only / Python-side helpers (not in the captured-graph hot path).
-  // Submit N dryrun_noop tasks directly via TaskQueue::enqueue (no CUDA
-  // stream / host callback involved). Used by test_taskqueue_stress.
-  void submit_dryrun_burst(int64_t n);
+  // Python-side helper (not in the captured-graph hot path).
   // Block calling thread until TaskQueue drains. Same as sync_on_stream but
   // without the cudaLaunchHostFunc indirection.
   void sync_blocking();
@@ -289,8 +264,7 @@ class CotsCpuInfer {
   // — silent fallback under graph capture would put different
   // slabs on different mechanisms, refuse to install). After
   // success, `slab.wait_kernel_sync_installed = true`.
-  void install_wait_kernel_sync_for_task(int64_t task_id,
-                                         bool fuse_uva_copy = false);
+  void install_wait_kernel_sync_for_task(int64_t task_id);
 
   // Launch the captured-graph wait kernel for `task_id` on
   // `cuda_stream`. Selects production vs diag kernel based on
@@ -312,48 +286,10 @@ class CotsCpuInfer {
   // post_init wiring matches the config flag.
   bool wait_kernel_sync_installed_for_task(int64_t task_id) const;
 
-  // §1c.33 diagnostic: per-task fire counts. Returns a vector of
-  // `slab.fire_count` values indexed by task_id (size = slab_count_).
-  // The Python side cross-references each index with the runner's
-  // `_task_id_for: dict[(layer_idx, bucket, op_kind), int]` to
-  // attribute fires to specific (layer, bucket, op_kind) tuples
-  // — used to identify which slabs produce the captured-vs-eager
-  // op-count delta documented in §1c.32. Read at any time;
-  // typically zeroed via `reset_counters()` between warmup and
-  // the measured window.
-  std::vector<int64_t> get_task_fire_counts() const;
-
   uint32_t wait_kernel_get_req_slot(int64_t task_id) const;
   uint32_t wait_kernel_get_done_slot(int64_t task_id) const;
   void wait_kernel_set_req_slot(int64_t task_id, uint32_t value);
   void wait_kernel_set_done_slot(int64_t task_id, uint32_t value);
-
-  // §1c.26 / §1c.27 diagnostic ablation flags. Probe-only —
-  // meaningful ONLY under `dry_run=True` AND `VLLM_COTS_DIAG=1`.
-  // The Python-side installer is the gatekeeper: it reads the env
-  // vars + checks dry_run, and only then calls set_ablations(...).
-  // In real (non-dryrun) mode, setting these would silently
-  // corrupt outputs (worker never enqueued, or worker reads stale
-  // x_pinned, or sync never drains). Used to attribute the
-  // +0.571 s/gen dryrun − none gap to specific captured-graph
-  // node classes by omitting one class at a time and re-measuring
-  // cudaGraphLaunch_v10000 delta. See §1c.26 / §1c.27 in
-  // David/Docs/phase1c_findings.md.
-  //
-  // Flag semantics:
-  //   ablate_d2h           — skip captured cudaMemcpyAsync.
-  //   ablate_hostfn        — skip BOTH submit/dispatch AND sync
-  //                          cudaLaunchHostFunc. §1c.26 macro
-  //                          ("submit+sync host_fns combined").
-  //   ablate_submit_hostfn — §1c.27: skip ONLY the submit/dispatch
-  //                          cudaLaunchHostFunc; keep sync host_fn.
-  //   ablate_sync_hostfn   — §1c.27: skip ONLY the sync
-  //                          cudaLaunchHostFunc; keep dispatch.
-  // The narrow flags compose with `ablate_hostfn` (a true on either
-  // skips the corresponding host_fn). Default false for all four.
-  void set_ablations(bool ablate_d2h, bool ablate_hostfn,
-                     bool ablate_submit_hostfn = false,
-                     bool ablate_sync_hostfn = false);
 
   // §1c.22 review-fix test helpers: read the immutable
   // `bucket_capacity_tokens` and the mutable `num_tokens` for a
@@ -369,7 +305,7 @@ class CotsCpuInfer {
   // re-raise semantics.
   //
   // The guard is invoked at the START of every entry point (submit*, sync*,
-  // submit_dryrun_burst, populate_slab*) so a previously-failed task
+  // populate_slab*) so a previously-failed task
   // surfaces as a Python RuntimeError on the next call rather than getting
   // silently swallowed. The first call after a worker error consumes the
   // error (clears has_error_); subsequent calls succeed as normal.
@@ -380,20 +316,15 @@ class CotsCpuInfer {
   // direct C++ caller (e.g., a future C++ binding) can opt in.
   void check_error();
 
-  // Stage-1 microbench helper: run `at::linear(x, w)` on the calling
-  // thread (NOT through TaskQueue) and write into `y`. Used by
-  // test_at_linear_microbench to compare C++ at::linear vs Python F.linear
-  // perf BEFORE wiring through host callbacks. Argument tensors are
-  // user-managed; this just calls into ATen.
+  // Lightweight load/correctness helper: run `at::linear(x, w)` on the
+  // calling thread (NOT through TaskQueue) and write into `y`. Retained for
+  // native-extension sanity tests; argument tensors are user-managed.
   void run_at_linear_inline(at::Tensor x, at::Tensor w, at::Tensor y_out);
 
-  // Stage 7 — inline call to the custom BF16 row-major-weight GEMM
-  // kernel (csrc/cots/bf16_gemm_transposed.cpp). All tensors
-  // BF16 row-major contiguous. Used by the Stage 7 microbench to
-  // compare against `run_at_linear_inline` on the layouts oneDNN's
-  // BF16 path doesn't dispatch on. Caller-managed tensors; no
-  // TaskQueue involvement (single-thread, inline like the at::linear
-  // helper above).
+  // Inline call to the custom BF16 row-major-weight GEMM kernel
+  // (csrc/cots/bf16_gemm_transposed.cpp). All tensors BF16 row-major
+  // contiguous. Retained for correctness tests of the production kernel
+  // layout; caller-managed tensors, no TaskQueue involvement.
   void run_bf16_gemm_transposed_inline(at::Tensor x, at::Tensor w,
                                        at::Tensor y_out);
 
@@ -488,9 +419,6 @@ class CotsCpuInfer {
   // safe to short-circuit (submit_on_stream, sync_blocking, etc.).
   void wait_kernel_sync_on_stream_no_check(int64_t task_id,
                                            uintptr_t cuda_stream);
-  void wait_uva_kernel_on_stream_no_check(int64_t task_id, uintptr_t y_gpu_ptr,
-                                          int32_t num_tokens, int32_t y_cols,
-                                          uintptr_t cuda_stream);
 
   // Worker-thread task body; runs whatever op_kind says. The `seq`
   // parameter (0 == no wait-kernel sync, > 0 == wait-kernel sync enabled for
@@ -653,14 +581,6 @@ class CotsCpuInfer {
   // Surfaced via get_counters(); non-zero means at least one
   // submit/replay was clamped (informational, not an error).
   std::atomic<int64_t> worker_clamp_override_count_{0};
-
-  // §1c.26 / §1c.27 ablation flags. Probe-only; gated by Python
-  // install checking dry_run + VLLM_COTS_DIAG. See set_ablations()
-  // above for semantics.
-  std::atomic<bool> ablate_d2h_{false};
-  std::atomic<bool> ablate_hostfn_{false};
-  std::atomic<bool> ablate_submit_hostfn_{false};
-  std::atomic<bool> ablate_sync_hostfn_{false};
 
   // §1c.29 wait-kernel sync diag counters. Allocated once at first
   // install_wait_kernel_sync_for_task call (lazily — most instances don't

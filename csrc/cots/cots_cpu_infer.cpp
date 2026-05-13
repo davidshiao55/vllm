@@ -133,7 +133,6 @@ CotsCpuInfer::~CotsCpuInfer() {
           cudaFreeHost(s.host_done_slot);
           s.host_done_slot = nullptr;
         }
-        s.wait_uva_kernel_installed.store(false, std::memory_order_release);
         s.wait_kernel_sync_installed.store(false, std::memory_order_release);
       }
     }
@@ -346,16 +345,11 @@ void CotsCpuInfer::submit_on_stream(int64_t task_id, int32_t num_tokens,
     }
   }
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
-  // §1c.26 ablation: skip the captured cudaMemcpyAsync entirely when
-  // ablate_d2h_ is set. Probe-only — gated upstream to dryrun + DIAG;
-  // worker reads stale x_pinned, output is garbage, but in dryrun
-  // worker doesn't compute so this is safe for the diagnostic.
-  const bool skip_d2h = ablate_d2h_.load(std::memory_order_relaxed);
   // §1c.20: D2H from x_gpu to slab's pinned input buffer.
   // Stride-aware: contiguous → 1D cudaMemcpyAsync, row-strided →
   // 2D cudaMemcpy2DAsync. Both graph-capturable. Skipped when
   // `x_gpu_ptr == 0` (test fixtures that exercise dispatch only).
-  if (x_gpu_ptr != 0 && !skip_d2h) {
+  if (x_gpu_ptr != 0) {
     TORCH_CHECK(slab->x_pinned_ptr != nullptr,
                 "submit_on_stream: slab.x_pinned_ptr is null at task_id=",
                 task_id, " (slab not populated?)");
@@ -412,35 +406,17 @@ void CotsCpuInfer::submit_on_stream(int64_t task_id, int32_t num_tokens,
                 (x_stride0 == x_cols ? "1D" : "2D"),
                 "): ", cudaGetErrorString(copy_err));
   }
-  // §1c.26/§1c.27 ablation: skip the captured submit/dispatch
-  // cudaLaunchHostFunc when either the broad `ablate_hostfn_` or
-  // the narrow `ablate_submit_hostfn_` flag is set. Worker is
-  // never enqueued; in dryrun there's nothing to enqueue anyway.
-  const bool skip_submit_hostfn =
-      ablate_hostfn_.load(std::memory_order_relaxed) ||
-      ablate_submit_hostfn_.load(std::memory_order_relaxed);
-  if (!skip_submit_hostfn) {
-    NvtxScope launch_scope("cots:launch_dispatch_cb");
-    cudaError_t err = cudaLaunchHostFunc(
-        stream, &CotsCpuInfer::DispatchCallback, static_cast<void*>(slab));
-    TORCH_CHECK(err == cudaSuccess,
-                "cudaLaunchHostFunc(DispatchCallback) failed: ",
-                cudaGetErrorString(err));
-  }
+  NvtxScope launch_scope("cots:launch_dispatch_cb");
+  cudaError_t err = cudaLaunchHostFunc(stream, &CotsCpuInfer::DispatchCallback,
+                                       static_cast<void*>(slab));
+  TORCH_CHECK(
+      err == cudaSuccess,
+      "cudaLaunchHostFunc(DispatchCallback) failed: ", cudaGetErrorString(err));
 }
 
 void CotsCpuInfer::sync_on_stream(uintptr_t cuda_stream) {
   NvtxScope nvtx_scope("cots:sync_on_stream");
   check_error();
-  // §1c.26/§1c.27 ablation: skip captured sync host_fn when either
-  // the broad `ablate_hostfn_` or the narrow `ablate_sync_hostfn_`
-  // flag is set. In dryrun there is nothing to drain.
-  const bool skip_sync_hostfn =
-      ablate_hostfn_.load(std::memory_order_relaxed) ||
-      ablate_sync_hostfn_.load(std::memory_order_relaxed);
-  if (skip_sync_hostfn) {
-    return;
-  }
   // sync_args_ is a stable member of *this; safe to take its address as
   // userData for cudaLaunchHostFunc, including across CUDA graph replays.
   cudaError_t err = cudaLaunchHostFunc(
@@ -488,24 +464,6 @@ void CotsCpuInfer::sync_or_wait_on_stream(int64_t task_id,
   }
 }
 
-bool CotsCpuInfer::sync_or_wait_and_maybe_uva_on_stream(int64_t task_id,
-                                                        uintptr_t y_gpu_ptr,
-                                                        int32_t num_tokens,
-                                                        int32_t y_cols,
-                                                        uintptr_t cuda_stream) {
-  TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
-              "sync_or_wait_and_maybe_uva_on_stream: task_id ", task_id,
-              " out of range");
-  TaskSlab& s = slabs_[task_id];
-  if (s.wait_uva_kernel_installed.load(std::memory_order_acquire)) {
-    wait_uva_kernel_on_stream_no_check(task_id, y_gpu_ptr, num_tokens, y_cols,
-                                       cuda_stream);
-    return true;
-  }
-  sync_or_wait_on_stream(task_id, cuda_stream);
-  return false;
-}
-
 bool CotsCpuInfer::wait_kernel_sync_installed_for_task(int64_t task_id) const {
   TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
               "wait_kernel_sync_installed_for_task: task_id ", task_id,
@@ -514,42 +472,10 @@ bool CotsCpuInfer::wait_kernel_sync_installed_for_task(int64_t task_id) const {
       std::memory_order_acquire);
 }
 
-std::vector<int64_t> CotsCpuInfer::get_task_fire_counts() const {
-  // §1c.33 diagnostic: dump per-slab fire counts in task_id order.
-  // The caller (cots_ops.py) cross-references the index with the
-  // runner's task_id_for map to attribute fires to specific
-  // (layer_idx, bucket, op_kind) tuples.
-  std::vector<int64_t> out;
-  out.reserve(static_cast<size_t>(slab_count_));
-  for (int64_t i = 0; i < slab_count_; ++i) {
-    out.push_back(slabs_[i].fire_count.load(std::memory_order_relaxed));
-  }
-  return out;
-}
-
-void CotsCpuInfer::submit_dryrun_burst(int64_t n) {
-  check_error();
-  for (int64_t i = 0; i < n; ++i) {
-    task_queue_->enqueue([] {
-      // Pure no-op: no slab read, no scratch use. Used by
-      // test_taskqueue_stress to validate FIFO + drain semantics.
-    });
-  }
-}
-
 void CotsCpuInfer::sync_blocking() {
   task_queue_->sync(0);
   // Surface any worker error that fired while we were waiting.
   check_error();
-}
-
-void CotsCpuInfer::set_ablations(bool ablate_d2h, bool ablate_hostfn,
-                                 bool ablate_submit_hostfn,
-                                 bool ablate_sync_hostfn) {
-  ablate_d2h_.store(ablate_d2h, std::memory_order_relaxed);
-  ablate_hostfn_.store(ablate_hostfn, std::memory_order_relaxed);
-  ablate_submit_hostfn_.store(ablate_submit_hostfn, std::memory_order_relaxed);
-  ablate_sync_hostfn_.store(ablate_sync_hostfn, std::memory_order_relaxed);
 }
 
 void CotsCpuInfer::set_worker_affinity(uint64_t cpu_set) {
@@ -610,14 +536,12 @@ void CotsCpuInfer::run_at_linear_inline(at::Tensor x, at::Tensor w,
 
 void CotsCpuInfer::run_bf16_gemm_transposed_inline(at::Tensor x, at::Tensor w,
                                                    at::Tensor y_out) {
-  // Stage 7 microbench helper: drive the custom BF16 row-major-weight
-  // GEMM kernel (csrc/cots/bf16_gemm_transposed.cpp) inline. No
-  // TaskQueue, no host callback — used by
-  // test_stage7_layout_microbench's Path H comparison against the
-  // at::linear baseline (Path A). The wrapped function does its own
-  // dtype/contiguity validation and TORCH_CHECK calls on shape; we just
-  // hold InferenceMode so the dispatcher does not record autograd
-  // metadata.
+  // Correctness/diagnostic helper: drive the custom BF16
+  // row-major-weight GEMM kernel (csrc/cots/bf16_gemm_transposed.cpp)
+  // inline. No TaskQueue, no host callback. The wrapped function does
+  // its own dtype/contiguity validation and TORCH_CHECK calls on shape;
+  // we just hold InferenceMode so the dispatcher does not record
+  // autograd metadata.
   c10::InferenceMode g;
   bf16_gemm_transposed_at(x, w, y_out);
 }
@@ -697,16 +621,6 @@ void CotsCpuInfer::DispatchCallback(void* user_data) {
   if (cots_diag::counters_enabled()) {
     slab->enqueue_time_ns.store(now_ns(), std::memory_order_release);
     self->dispatch_cb_count_.fetch_add(1, std::memory_order_relaxed);
-  }
-  // §1c.33 per-task fire counter. Gated by VLLM_COTS_DIAG=1
-  // (same env that gates the §1c.24 NVTX scopes + dispatch_cb_count
-  // attribution). Reviewer (§1c.33 review-fix): production path
-  // should not pay any extra cost in DispatchCallback — the
-  // counter is observational only, used by the
-  // VLLM_COTS_DUMP_TASK_FIRES=1 atexit dump which itself
-  // requires diag mode to be meaningful.
-  if (cots_diag::counters_enabled()) {
-    slab->fire_count.fetch_add(1, std::memory_order_relaxed);
   }
   // §1c.29 commit 2 — wait-kernel sync sequence publish. When wait-kernel sync
   // is installed for this slab, increment the slab-local seq, capture it into
@@ -1139,12 +1053,6 @@ void CotsCpuInfer::reset_counters() {
   worker_busy_total_ns_.store(0, std::memory_order_relaxed);
   worker_queue_wait_total_ns_.store(0, std::memory_order_relaxed);
   worker_clamp_override_count_.store(0, std::memory_order_relaxed);
-  // §1c.33 per-task fire counters.
-  if (slabs_) {
-    for (int64_t i = 0; i < slab_count_; ++i) {
-      slabs_[i].fire_count.store(0, std::memory_order_relaxed);
-    }
-  }
   // §1c.29 wait-kernel sync diag counters. Lazy-allocated; only zero them
   // if they exist (i.e., wait-kernel sync was installed at least once).
   if (wait_kernel_immediate_resume_host_)
@@ -1162,13 +1070,6 @@ extern "C" void launch_cots_wait_done_kernel_production(uint32_t*, uint32_t*,
 extern "C" void launch_cots_wait_done_kernel_diag(uint32_t*, uint32_t*,
                                                   int64_t*, int64_t*, int64_t*,
                                                   cudaStream_t);
-extern "C" void launch_cots_wait_uva_copy_kernel_production(
-    uint32_t*, uint32_t*, const void*, void*, int64_t, cudaStream_t);
-extern "C" void launch_cots_wait_uva_copy_kernel_diag(uint32_t*, uint32_t*,
-                                                      const void*, void*,
-                                                      int64_t, int64_t*,
-                                                      int64_t*, int64_t*,
-                                                      cudaStream_t);
 
 // §1c.29 helper: lazily allocate the diag counter cells the
 // first time install_wait_kernel_sync_for_task is called. Host-mapped pinned
@@ -1195,8 +1096,7 @@ static void ensure_wait_kernel_diag_cell(int64_t** host_ptr, int64_t** dev_ptr,
   *dev_ptr = static_cast<int64_t*>(dp);
 }
 
-void CotsCpuInfer::install_wait_kernel_sync_for_task(int64_t task_id,
-                                                     bool fuse_uva_copy) {
+void CotsCpuInfer::install_wait_kernel_sync_for_task(int64_t task_id) {
   check_error();
   TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
               "install_wait_kernel_sync_for_task: task_id ", task_id,
@@ -1268,7 +1168,6 @@ void CotsCpuInfer::install_wait_kernel_sync_for_task(int64_t task_id,
   s.host_done_slot = host_done;
   s.dev_done_slot = dev_done;
   s.next_seq.store(0, std::memory_order_relaxed);
-  s.wait_uva_kernel_installed.store(fuse_uva_copy, std::memory_order_release);
   s.wait_kernel_sync_installed.store(true, std::memory_order_release);
 }
 
@@ -1325,70 +1224,6 @@ void CotsCpuInfer::wait_kernel_sync_on_stream_no_check(int64_t task_id,
   cudaError_t le = cudaGetLastError();
   TORCH_CHECK(le == cudaSuccess,
               "wait_kernel_sync_on_stream: kernel launch failed: ",
-              cudaGetErrorString(le));
-}
-
-void CotsCpuInfer::wait_uva_kernel_on_stream_no_check(int64_t task_id,
-                                                      uintptr_t y_gpu_ptr,
-                                                      int32_t num_tokens,
-                                                      int32_t y_cols,
-                                                      uintptr_t cuda_stream) {
-  TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
-              "wait_uva_kernel_on_stream: task_id ", task_id, " out of range");
-  TaskSlab& s = slabs_[task_id];
-  TORCH_CHECK(
-      s.wait_uva_kernel_installed.load(std::memory_order_acquire),
-      "wait_uva_kernel_on_stream: wait-UVA kernel not installed for task_id=",
-      task_id, "; use cots_capture_sync_mode='wait_uva_kernel'");
-  TORCH_CHECK(y_gpu_ptr != 0,
-              "wait_uva_kernel_on_stream: y_gpu_ptr must be nonzero");
-  TORCH_CHECK(num_tokens >= 0,
-              "wait_uva_kernel_on_stream: num_tokens=", num_tokens, " < 0");
-  TORCH_CHECK(y_cols > 0, "wait_uva_kernel_on_stream: y_cols=", y_cols,
-              " must be > 0");
-  TORCH_CHECK(
-      s.y_pinned_ptr != nullptr,
-      "wait_uva_kernel_on_stream: slab.y_pinned_ptr is null at task_id=",
-      task_id, " (slab not populated?)");
-  TORCH_CHECK(s.cpu_out_dim == y_cols,
-              "wait_uva_kernel_on_stream: y_cols=", y_cols,
-              " disagrees with slab.cpu_out_dim=", s.cpu_out_dim,
-              " at task_id=", task_id);
-  num_tokens = std::min(num_tokens, s.bucket_capacity_tokens);
-  const int64_t n_elements =
-      static_cast<int64_t>(num_tokens) * static_cast<int64_t>(y_cols);
-  if (n_elements <= 0) {
-    return;
-  }
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
-  if (cots_diag::counters_enabled()) {
-    const int64_t bytes =
-        n_elements * static_cast<int64_t>(sizeof(at::BFloat16));
-    uva_record_bytes_.fetch_add(bytes, std::memory_order_relaxed);
-    uva_record_count_.fetch_add(1, std::memory_order_relaxed);
-  }
-  if (cots_diag::wait_kernel_diag_enabled()) {
-    TORCH_CHECK(
-        wait_kernel_immediate_resume_dev_ != nullptr &&
-            wait_kernel_lagging_wait_dev_ != nullptr &&
-            wait_kernel_spin_iters_dev_ != nullptr,
-        "wait_uva_kernel_on_stream: wait-kernel diag mode active but diag "
-        "counter cells are not allocated");
-    launch_cots_wait_uva_copy_kernel_diag(
-        static_cast<uint32_t*>(s.dev_req_slot),
-        static_cast<uint32_t*>(s.dev_done_slot), s.y_pinned_ptr,
-        reinterpret_cast<void*>(y_gpu_ptr), n_elements,
-        wait_kernel_spin_iters_dev_, wait_kernel_immediate_resume_dev_,
-        wait_kernel_lagging_wait_dev_, stream);
-  } else {
-    launch_cots_wait_uva_copy_kernel_production(
-        static_cast<uint32_t*>(s.dev_req_slot),
-        static_cast<uint32_t*>(s.dev_done_slot), s.y_pinned_ptr,
-        reinterpret_cast<void*>(y_gpu_ptr), n_elements, stream);
-  }
-  cudaError_t le = cudaGetLastError();
-  TORCH_CHECK(le == cudaSuccess,
-              "wait_uva_kernel_on_stream: kernel launch failed: ",
               cudaGetErrorString(le));
 }
 

@@ -101,7 +101,7 @@ class CotsOffloadConfig:
     """Fraction of WQKV / MLP1 / MLP2 weight bytes resident on CPU. Single
     uniform scalar applied to all three sub-modules (matched-index invariant
     between MLP1 col-parallel and MLP2 row-parallel is automatic under uniform
-    dispatch). Phase 1a default 0.0 means no offload. Typical thesis value at
+    dispatch). Default 0.0 means no offload. Typical thesis value at
     7B B=1 decode is ~0.09 ("free" regime per phase0 §0.3.3)."""
 
     f_prefetch: float = Field(default=0.0, ge=0.0, le=1.0)
@@ -110,7 +110,7 @@ class CotsOffloadConfig:
     `dispatch_table_factory`; the Planner's factory output overrides this
     value entirely. Constraint: f_prefetch <= f_cpu_store (prefetch consumes
     CPU-stored bytes; the f_cpu_compute = f_cpu_store - f_prefetch portion is
-    CPU-computed). Default 0.0 reproduces Phase 1a behavior bit-exactly."""
+    CPU-computed). Default 0.0 keeps the CPU-stored slice CPU-computed."""
 
     kv_biased: bool = Field(default=True)
     """If True, the WQKV column picker is biased toward K/V: K+V column groups
@@ -118,7 +118,7 @@ class CotsOffloadConfig:
     and minimizes H2D contention with weight prefetch. See
     `weight_offload_design.md §WQKV Column Choice`. If False, columns are
     picked from the front of WQKV's output (Q first), useful only for
-    ablation."""
+    controlled diagnostics."""
 
     cpu_dtype: Literal["bfloat16"] = "bfloat16"
     """CPU weight dtype. Locked to BF16: phase0 §0.3.2 confirmed F.linear with
@@ -131,7 +131,7 @@ class CotsOffloadConfig:
     `cpu_num_threads_by_bucket` is unset. See `phase1a_findings.md §1.13b`."""
 
     cpu_num_threads_by_bucket: dict[int, int] | None = Field(default=None)
-    """Phase 1c Stage 4: per-`BatchDescriptor` thread count for the CPU
+    """Per-`BatchDescriptor` thread count for the native CPU
     GEMM worker. Keys are `num_tokens` bucket values (must be a subset
     of `cudagraph_capture_sizes`); values are >= 1. When unset, every
     bucket uses the scalar `cpu_num_threads`. The Planner produces
@@ -144,7 +144,7 @@ class CotsOffloadConfig:
     other threads in the process holding torch ops."""
 
     cpu_worker_affinity: list[int] | None = Field(default=None)
-    """Phase 1c Stage 4: optional CPU affinity mask for the native
+    """Optional CPU affinity mask for the native
     runner's TaskQueue worker thread. List of CPU IDs to pin the
     worker to, or None (default) for no opinion. The C++ implementation
     intersects this with the process's existing `sched_getaffinity` mask
@@ -158,7 +158,7 @@ class CotsOffloadConfig:
     Only consulted by `cpu_runner='native'`."""
 
     cpu_runner: Literal["native", "python"] = "native"
-    """Phase 1c runner selector.
+    """COTS CPU runner selector.
 
     * `"native"` (default): CPU work runs on a C++ `TaskQueue`
       worker; submit/sync go through `cudaLaunchHostFunc` host
@@ -174,7 +174,7 @@ class CotsOffloadConfig:
       otherwise. Slated for deprecation after Phase 2.
 
     See `David/Docs/implementation_roadmap.md` Phase 1c and
-    `phase1c_capture_gap_findings.md` for the capture-gap
+    `David/Docs/phase1c_findings.md` for the capture-gap
     measurements that motivate the split-graph default."""
 
     dry_run: bool = Field(default=False)
@@ -192,10 +192,8 @@ class CotsOffloadConfig:
     `--no-cots-auto-graph-split` to reproduce legacy full-capture or
     host-callback capture experiments explicitly."""
 
-    cots_capture_sync_mode: Literal[
-        "host_callback", "wait_kernel", "wait_uva_kernel"
-    ] = "host_callback"
-    """Phase 1c sync-side mechanism for the captured-replay path
+    cots_capture_sync_mode: Literal["host_callback", "wait_kernel"] = "host_callback"
+    """Sync-side mechanism for the captured-replay path
     (formerly "M3" — pre-§1c.34 boolean
     `cots_m3_wait_kernel=True` was removed in favor of this
     enum; no backward-compat alias).
@@ -207,7 +205,7 @@ class CotsOffloadConfig:
       mechanism. With `auto_graph_split=True`, native COTS graph
       mode upgrades this to `"wait_kernel"` unless explicitly
       opting out of the auto graph policy.
-    * `"wait_kernel"` (opt-in research path): the captured node
+    * `"wait_kernel"`: the captured node
       is a custom GPU wait kernel that spins on a host-mapped
       pinned `done_slot` written by the CPU worker. Replaces the
       captured `cudaLaunchHostFunc(sync_cb)` only. Submit side
@@ -216,15 +214,8 @@ class CotsOffloadConfig:
       full-capture path, this did not beat native eager; paired
       with the COTS split-graph default it is the fastest measured
       capture path on the focused Qwen2.5-7B grid.
-    * `"wait_uva_kernel"` (experimental): one captured CUDA kernel
-      waits on `done_slot` and copies the CPU pinned output into
-      the GPU output buffer, replacing both the sync host callback
-      and the separate Triton UVA-copy node. This is an optimization
-      prototype for the Phase 1c capture-gap investigation; it is
-      not the default unless the benchmark gate beats native eager.
-
     Hard-fail safety gates (in `CotsOffloader.post_init`) for
-    `wait_kernel` / `wait_uva_kernel` mode:
+    `wait_kernel` mode:
     * Requires `cpu_runner='native'` — Python runner has no
       slabs / worker thread / host-mapped `done_slot`.
     * Requires `enforce_eager=False` — kernel only makes sense

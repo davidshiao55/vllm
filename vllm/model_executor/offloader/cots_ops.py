@@ -47,35 +47,13 @@ offloader's install/teardown helpers all dereference the registry.
 
 from __future__ import annotations
 
-import atexit
 import itertools
-import os
-import sys
 from typing import TYPE_CHECKING, Any
 
 import torch
 
 from vllm.utils.cots_diag import NVTX_ENABLED as _COTS_NVTX_ENABLED
 from vllm.utils.torch_utils import direct_register_custom_op
-
-# §1c.26 / §1c.27: UVA-side ablation flag. The C++ side has its
-# own `set_ablations(ablate_d2h, ablate_hostfn,
-# ablate_submit_hostfn=False, ablate_sync_hostfn=False)` for the
-# captured cudaMemcpyAsync (D2H) and cudaLaunchHostFunc (dispatch +
-# sync, with the §1c.27 split-side narrow flags); UVA is launched
-# from the Python `_cots_sync_then_uva_impl` so its ablation gate
-# lives here. Toggled via `set_uva_ablation` at offloader install
-# time, only when dry_run + DIAG. Probe-only.
-_COTS_ABLATE_UVA: bool = False
-
-
-def set_uva_ablation(enabled: bool) -> None:
-    """§1c.26: enable/disable the UVA captured-kernel ablation.
-    Probe-only — only meaningful with dry_run + VLLM_COTS_DIAG=1.
-    Called from `CotsOffloader.post_init` after reading the env."""
-    global _COTS_ABLATE_UVA
-    _COTS_ABLATE_UVA = bool(enabled)
-
 
 if TYPE_CHECKING:
     # Type-only import; avoids forcing _cots_C at module load on
@@ -87,14 +65,8 @@ if TYPE_CHECKING:
 # `__del__` / `close()` is the only thing that removes entries; if a
 # runner is GC'd without close() the __del__ unregisters there.
 _COTS_INFER: dict[int, Any] = {}
-# §1c.33: parallel registry for the per-runner
-# `(layer_idx, bucket, op_kind) -> task_id` map. Populated by
-# NativeCotsRunner.install via `_register_task_id_for`. Read by
-# the §1c.33 atexit dump so per-task fire counts can be
-# cross-referenced with their COTS-op descriptors without the
-# runner needing to live in EngineCore as a strong reference.
-_COTS_TASK_ID_FOR: dict[int, dict[tuple[int, int, str], int]] = {}
 _COTS_ACTIVE_DISPATCH: dict[int, tuple[int, int]] = {}
+_COTS_TASK_ID_FOR: dict[int, dict[tuple[int, int, str], int]] = {}
 _NEXT_RUNNER_ID = itertools.count(1)
 
 _OP_KIND_TO_CODE: dict[str, int] = {
@@ -124,18 +96,16 @@ def _register_infer(infer: Any) -> int:
 def _unregister_infer(runner_id: int) -> None:
     """Drop the registry entry for a runner. Idempotent."""
     _COTS_INFER.pop(runner_id, None)
-    _COTS_TASK_ID_FOR.pop(runner_id, None)
     _COTS_ACTIVE_DISPATCH.pop(runner_id, None)
+    _COTS_TASK_ID_FOR.pop(runner_id, None)
 
 
-def _register_task_id_for(
+def register_task_id_map(
     runner_id: int,
     task_id_for: dict[tuple[int, int, str], int],
 ) -> None:
-    """§1c.33: store the runner's task_id map so the atexit dump
-    can cross-reference per-task fire counts with their
-    (layer_idx, bucket, op_kind) descriptors."""
-    _COTS_TASK_ID_FOR[runner_id] = dict(task_id_for)
+    """Publish the install-time slab map used by custom op dispatch."""
+    _COTS_TASK_ID_FOR[int(runner_id)] = dict(task_id_for)
 
 
 def set_active_dispatch_state(
@@ -274,8 +244,6 @@ def populate_slab_via_spec(
 def install_wait_kernel_sync_for_all_tasks(
     runner_id: int,
     n_slabs: int,
-    *,
-    fuse_uva_copy: bool = False,
 ) -> None:
     """§1c.29 commit 2: install wait-kernel sync (host-mapped pinned req/done
     slots, lazy diag-counter alloc when VLLM_COTS_DIAG=1) for
@@ -290,9 +258,7 @@ def install_wait_kernel_sync_for_all_tasks(
     """
     infer = _lookup_infer(runner_id, "install_wait_kernel_sync_for_all_tasks")
     for tid in range(int(n_slabs)):
-        infer.install_wait_kernel_sync_for_task(
-            int(tid), fuse_uva_copy=bool(fuse_uva_copy)
-        )
+        infer.install_wait_kernel_sync_for_task(int(tid))
 
 
 def set_worker_affinity(runner_id: int, mask: int) -> None:
@@ -300,48 +266,6 @@ def set_worker_affinity(runner_id: int, mask: int) -> None:
     call from `CotsOffloader.post_init` after install."""
     infer = _lookup_infer(runner_id, "set_worker_affinity")
     infer.set_worker_affinity(int(mask))
-
-
-def dump_task_resolved_fire_counts(
-    runner_id: int,
-    task_id_for: dict[tuple[int, int, str], int],
-) -> list[dict]:
-    """§1c.33: per-task fire counts cross-referenced with the
-    runner's `(layer_idx, bucket, op_kind) -> task_id` map.
-
-    Returns one record per (layer_idx, bucket, op_kind) in
-    sorted order. Each record:
-      {
-        "task_id": int,
-        "layer_idx": int,
-        "bucket": int,
-        "op_kind": str,
-        "fire_count": int,
-      }
-
-    Caller is responsible for resetting counters via
-    `infer.reset_counters()` to define the measurement window.
-    The fire-count counter is single relaxed atomic so per-fire
-    cost is ~1 ns; safe to leave always-on.
-    """
-    infer = _lookup_infer(runner_id, "dump_task_resolved_fire_counts")
-    raw = list(infer.get_task_fire_counts())  # type: ignore[attr-defined]
-    inverse: dict[int, tuple[int, int, str]] = {
-        tid: desc for desc, tid in task_id_for.items()
-    }
-    records = []
-    for tid in range(len(raw)):
-        layer, bucket, op_kind = inverse.get(tid, (-1, -1, "unknown"))
-        records.append(
-            {
-                "task_id": tid,
-                "layer_idx": layer,
-                "bucket": bucket,
-                "op_kind": op_kind,
-                "fire_count": int(raw[tid]),
-            }
-        )
-    return records
 
 
 def reset_all_counters() -> None:
@@ -548,33 +472,12 @@ def _cots_sync_then_uva_impl(
     if _COTS_NVTX_ENABLED:
         torch.cuda.nvtx.range_push("cots:py_sync_then_uva")
     try:
-        # §1c.29 commit 2: unified entry. C++ side branches per-slab
-        # on `slab.wait_kernel_sync_installed` — when wait-kernel sync
-        # was installed at offloader
-        # post_init under `cots_capture_sync_mode="wait_kernel"`, the captured
+        # C++ side branches per-slab on `wait_kernel_sync_installed`.
+        # With `cots_capture_sync_mode="wait_kernel"`, the captured
         # node is the wait kernel reading the worker-published
-        # `done_slot=seq`. Otherwise the captured node stays the
-        # legacy SyncCallback host_fn that blocks the driver thread
-        # on TaskQueue::sync(0). Python ALWAYS calls this entry —
-        # the A/B is controlled exclusively by whether the
-        # offloader installed wait-kernel sync for this task at startup.
-        fused_uva = False
-        if not _COTS_ABLATE_UVA and hasattr(
-            infer, "sync_or_wait_and_maybe_uva_on_stream"
-        ):
-            fused_uva = bool(
-                infer.sync_or_wait_and_maybe_uva_on_stream(
-                    task_id,
-                    y_gpu.data_ptr(),
-                    num_transfer_rows,
-                    y_gpu.shape[1],
-                    stream,
-                )
-            )
-        else:
-            infer.sync_or_wait_on_stream(task_id, stream)
-        if fused_uva:
-            return
+        # `done_slot=seq`. Otherwise it is the legacy SyncCallback
+        # host_fn that blocks the driver thread on TaskQueue::sync(0).
+        infer.sync_or_wait_on_stream(task_id, stream)
         # Build the CPU view over the slab pointer locally — never escapes
         # back to Python in a way Inductor would see.
         y_pinned = infer.y_pinned_view(task_id, num_transfer_rows)
@@ -588,12 +491,7 @@ def _cots_sync_then_uva_impl(
         if _COTS_NVTX_ENABLED:
             torch.cuda.nvtx.range_push("cots:py_uva_copy")
         try:
-            # §1c.26 ablation: skip the captured Triton UVA kernel
-            # entirely. Probe-only; gated upstream to dryrun + DIAG.
-            # y_gpu is left with stale data; harmless in dryrun
-            # because downstream consumers don't validate output.
-            if not _COTS_ABLATE_UVA:
-                _uva_copy_trusted_host_into_gpu(y_pinned, y_gpu)
+            _uva_copy_trusted_host_into_gpu(y_pinned, y_gpu)
         finally:
             if _COTS_NVTX_ENABLED:
                 torch.cuda.nvtx.range_pop()
@@ -650,98 +548,3 @@ def register_cots_offloader_ops() -> None:
 # Register at module import time so `torch.ops.vllm.cots_*` exist as
 # soon as cots.py imports this module.
 register_cots_offloader_ops()
-
-
-# §1c.21: dump per-runner counters at process exit. Set
-# VLLM_COTS_DUMP_COUNTERS=1 to enable. The captured-graph hot-path
-# question we want answered is whether num_tokens at submit time is
-# stuck at the captured graph-bucket size (e.g., 256) under capture
-# vs the live decode count (e.g., 1) under eager. Printing a
-# histogram once at process teardown is enough — counters are
-# `relaxed` atomics with negligible per-call cost.
-def _dump_counters_at_exit() -> None:
-    if os.environ.get("VLLM_COTS_DUMP_COUNTERS", "0") != "1":
-        return
-    if not _COTS_INFER:
-        return
-    sys.stderr.write("\n[cots §1c.21 counters]\n")
-    for rid, infer in _COTS_INFER.items():
-        try:
-            counters = dict(infer.get_counters())
-        except Exception as e:
-            sys.stderr.write(f"  runner_id={rid}: get_counters failed: {e}\n")
-            continue
-        non_zero = {k: v for k, v in counters.items() if v != 0}
-        sys.stderr.write(f"  runner_id={rid}:\n")
-        for k, v in sorted(non_zero.items()):
-            sys.stderr.write(f"    {k}: {v}\n")
-
-
-atexit.register(_dump_counters_at_exit)
-
-
-def _dump_task_fire_counts_at_exit() -> None:
-    """§1c.33: dump per-task fire counts, cross-referenced with
-    each (layer_idx, bucket, op_kind) descriptor, at process exit.
-    Gated by `VLLM_COTS_DUMP_TASK_FIRES=1`. Optionally write to
-    a file via `VLLM_COTS_DUMP_TASK_FIRES_FILE=/path/to.json`;
-    otherwise dump to stderr alongside the standard counters.
-
-    The file output is an auditable artifact for native COTS dispatch
-    accounting. Per-task fires let us see which
-    (layer, bucket, op_kind) tuples execute during capture/replay.
-    """
-    if os.environ.get("VLLM_COTS_DUMP_TASK_FIRES", "0") != "1":
-        return
-    if not _COTS_INFER:
-        return
-    file_path = os.environ.get("VLLM_COTS_DUMP_TASK_FIRES_FILE", "").strip()
-    out_records: dict[str, list[dict]] = {}
-    for rid in list(_COTS_INFER.keys()):
-        task_id_for = _COTS_TASK_ID_FOR.get(rid)
-        if task_id_for is None:
-            # Runner registered an infer but never reached install;
-            # nothing to attribute.
-            continue
-        try:
-            out_records[f"runner_{rid}"] = dump_task_resolved_fire_counts(
-                rid, task_id_for
-            )
-        except Exception as e:  # noqa: BLE001
-            sys.stderr.write(
-                f"[cots §1c.33] runner_id={rid}: "
-                f"dump_task_resolved_fire_counts failed: {e}\n"
-            )
-            continue
-    if not out_records:
-        return
-    if file_path:
-        try:
-            import json as _json
-
-            with open(file_path, "w") as fh:
-                _json.dump(out_records, fh, indent=2, default=str)
-            sys.stderr.write(f"[cots §1c.33] per-task fire counts → {file_path}\n")
-        except OSError as e:
-            sys.stderr.write(
-                f"[cots §1c.33] write to {file_path} failed: {e}; "
-                f"falling back to stderr\n"
-            )
-            file_path = ""
-    if not file_path:
-        sys.stderr.write("\n[cots §1c.33 per-task fire counts]\n")
-        for runner_key, records in out_records.items():
-            sys.stderr.write(f"  {runner_key}:\n")
-            for rec in records:
-                if rec["fire_count"] == 0:
-                    continue
-                sys.stderr.write(
-                    f"    task_id={rec['task_id']:>3}  "
-                    f"layer={rec['layer_idx']:>2}  "
-                    f"bucket={rec['bucket']:>4}  "
-                    f"op_kind={rec['op_kind']:<11}  "
-                    f"fires={rec['fire_count']}\n"
-                )
-
-
-atexit.register(_dump_task_fire_counts_at_exit)
