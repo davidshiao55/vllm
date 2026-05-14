@@ -126,6 +126,7 @@ class CotsOffloader(BaseOffloader):
         self._capture_buckets: tuple[int, ...] = ()
         self._max_num_tokens: int = 0
         self._eager_fallback_entry: tuple[float, float] = (0.0, 0.0)
+        self._has_cpu_compute_work: bool = False
 
         # Prefetch infrastructure — allocated in wrap_modules iff
         # `f_prefetch > 0`. Phase 1a behavior (`f_prefetch == 0`) leaves
@@ -212,11 +213,6 @@ class CotsOffloader(BaseOffloader):
             )
             return modules
 
-        # Allocate shared buffers AFTER all handles are registered (so we
-        # know the worst-case shapes). All GPU allocations stay inside this
-        # method (DeviceMemoryProfiler context).
-        self._allocate_activation_buffers()
-
         # Phase 1b: build dispatch table, populate per-handle prefetch
         # geometry, and (if f_prefetch > 0) allocate the streamer + buffer
         # pool and install layer-level prefetch hooks. Phase 1a (f_prefetch=0)
@@ -224,6 +220,13 @@ class CotsOffloader(BaseOffloader):
         self._build_dispatch_table()
         for h in self._handles:
             h.apply_prefetch_split_per_bucket(self._dispatch_table)
+        self._has_cpu_compute_work = self._compute_has_cpu_compute_work()
+
+        # Allocate shared CPU-compute buffers only when some bucket actually
+        # leaves rows on the CPU-compute path. Pure-prefetch configurations
+        # skip these pinned/GPU scratch buffers entirely.
+        if self._has_cpu_compute_work:
+            self._allocate_activation_buffers()
         # Install based on effective dispatch table, not config knob — a
         # Planner-emitted table can request prefetch even when config
         # f_prefetch == 0.
@@ -287,11 +290,15 @@ class CotsOffloader(BaseOffloader):
                 )
             elif isinstance(child, MergedColumnParallelLinear):
                 handle = CotsLinearHandle.for_col(
-                    child, qualified_name, f_cpu_store=self.f_cpu_store
+                    child,
+                    qualified_name,
+                    f_cpu_store=self.f_cpu_store,
                 )
             elif isinstance(child, RowParallelLinear):
                 handle = CotsLinearHandle.for_row(
-                    child, qualified_name, f_cpu_store=self.f_cpu_store
+                    child,
+                    qualified_name,
+                    f_cpu_store=self.f_cpu_store,
                 )
             else:
                 raise RuntimeError(
@@ -488,7 +495,10 @@ class CotsOffloader(BaseOffloader):
         # bytes pinned per row-handle.
 
         n_layers = len(self._layer_modules)
-        self._streamer = WeightPrefetchStreamer(n_layers=n_layers, dry_run=self.dry_run)
+        self._streamer = WeightPrefetchStreamer(
+            n_layers=n_layers,
+            dry_run=self.dry_run,
+        )
         self._streamer.buffer_pool = self._prefetch_buffer_pool
 
         for i, layer in enumerate(self._layer_modules):
@@ -656,6 +666,14 @@ class CotsOffloader(BaseOffloader):
                 return False
         return True
 
+    def _compute_has_cpu_compute_work(self) -> bool:
+        """Whether any captured bucket leaves rows for CPU GEMM."""
+        for h in self._handles:
+            for bucket in self._capture_buckets:
+                if int(h.n_cpu_compute_by_bucket.get(bucket, h.n_cpu)) > 0:
+                    return True
+        return False
+
     def _build_native_slab_specs(self) -> list[NativeSlabSpec]:
         """Build the per-(layer, bucket, op_kind) slab specs that
         NativeCotsRunner.install populates into the C++ slab pool. All
@@ -742,7 +760,7 @@ class CotsOffloader(BaseOffloader):
         `post_init` after weights have loaded (closures / slab pointers
         are stable post-install regardless of when they were taken,
         but post_init is the natural ordering point)."""
-        if self._runner is None or not self._handles:
+        if self._runner is None or not self._handles or not self._has_cpu_compute_work:
             return
         # Stage 4: validate per-bucket thread policy keys before
         # building specs so a Planner-mistyped bucket fails loudly at
@@ -937,6 +955,8 @@ class CotsOffloader(BaseOffloader):
         `slab.num_tokens.store` at submit time). Also no-op for
         `live_num_tokens <= 0` (sentinel).
         """
+        if not self._has_cpu_compute_work:
+            return
         if not isinstance(self._runner, NativeCotsRunner):
             return
         if int(live_num_tokens) <= 0:
@@ -978,7 +998,7 @@ class CotsOffloader(BaseOffloader):
         active_bucket = self._current_bucket
         if active_bucket is None:
             active_bucket = self._bucket_for(num_tokens_padded)
-        if isinstance(self._runner, NativeCotsRunner):
+        if self._has_cpu_compute_work and isinstance(self._runner, NativeCotsRunner):
             self._runner.set_active_dispatch(active_bucket, num_tokens_unpadded)
         self.sync_prev_onload()
         # CPU work scales with the semantic batch size, not bucket
@@ -1105,7 +1125,7 @@ class CotsOffloader(BaseOffloader):
         #     capturing it would silently produce wrong results, not
         #     just a slower one. Hard fail until the user either
         #     enables enforce_eager or switches to the native runner.
-        if not vllm_config.model_config.enforce_eager:
+        if self._has_cpu_compute_work and not vllm_config.model_config.enforce_eager:
             cpu_runner = getattr(self.config, "cpu_runner", "python")
             if cpu_runner != "native":
                 raise RuntimeError(
@@ -1129,7 +1149,11 @@ class CotsOffloader(BaseOffloader):
         # with a clear message until §1c.23 plumbs per-ubatch live
         # counts.
         cpu_runner = getattr(self.config, "cpu_runner", "python")
-        if cpu_runner == "native" and vllm_config.parallel_config.use_ubatching:
+        if (
+            self._has_cpu_compute_work
+            and cpu_runner == "native"
+            and vllm_config.parallel_config.use_ubatching
+        ):
             raise RuntimeError(
                 "CotsOffloader: cpu_runner='native' is currently "
                 "incompatible with vLLM microbatching/ubatching "
@@ -1152,7 +1176,7 @@ class CotsOffloader(BaseOffloader):
             self.config, "cots_capture_sync_mode", "host_callback"
         )
         wait_kernel_enabled = capture_sync_mode == "wait_kernel"
-        if wait_kernel_enabled:
+        if self._has_cpu_compute_work and wait_kernel_enabled:
             # Gate 1: native runner only. Python runner has no slabs /
             # no host-mapped done_slot / no worker thread to publish.
             if cpu_runner != "native":
@@ -1237,66 +1261,40 @@ class CotsOffloader(BaseOffloader):
         # commit 1 review-fix). After this returns, the captured
         # graph's sync_cb host_fn nodes are replaced with wait kernel
         # launches at every cots_sync_then_uva call site.
-        if wait_kernel_enabled and isinstance(self._runner, NativeCotsRunner):
+        if (
+            self._has_cpu_compute_work
+            and wait_kernel_enabled
+            and isinstance(self._runner, NativeCotsRunner)
+        ):
             self._runner.install_wait_kernel_sync()
 
-        # Post-init max-fill for layer 0. It is consumed before the current
-        # forward can issue any pre-compute prefetch; every later layer is
-        # prefetched by its predecessor's wrapper. Fill to max_n_prefetch
-        # (per-half for col, total for qkv/row); active-bucket dispatch
-        # consumes only the needed prefix.
-        if self._streamer is not None and self._layer_handles:
-            fork_event = torch.cuda.Event()
-            torch.cuda.current_stream().record_event(fork_event)
-            self._streamer.copy_stream.wait_event(fork_event)
-            with torch.cuda.stream(self._streamer.copy_stream):
-                for h in self._layer_handles[0]:
-                    if h.max_n_prefetch == 0:
-                        continue
-                    if h.kind == "col":
-                        assert h.w_cpu is not None
-                        max_half = h.max_n_prefetch // 2
-                        n_cpu_per_half_total = h.n_cpu // 2
-                        slot = h.w_prefetch_slots[h.slot_idx]
-                        slot[:max_half, :].copy_(
-                            h.w_cpu[:max_half, :], non_blocking=True
-                        )
-                        slot[max_half : 2 * max_half, :].copy_(
-                            h.w_cpu[
-                                n_cpu_per_half_total : n_cpu_per_half_total + max_half,
-                                :,
-                            ],
-                            non_blocking=True,
-                        )
-                        h.prefetch_available_rows_in_slot[h.slot_idx] = max_half
-                    elif h.kind == "row":
-                        # Stage 7-C: unified transposed `w_cpu` —
-                        # `w_cpu[:m, :]` is the prefetch source.
-                        assert h.w_cpu is not None
-                        m = h.max_n_prefetch
-                        h.w_prefetch_slots[h.slot_idx][:m, :].copy_(
-                            h.w_cpu[:m, :],
-                            non_blocking=True,
-                        )
-                        h.prefetch_available_rows_in_slot[h.slot_idx] = m
-                    else:  # qkv
-                        assert h.w_cpu is not None
-                        m = h.max_n_prefetch
-                        h.w_prefetch_slots[h.slot_idx][:m, :].copy_(
-                            h.w_cpu[:m, :], non_blocking=True
-                        )
-                        h.prefetch_available_rows_in_slot[h.slot_idx] = m
-                    h.prefetch_owner_in_slot[h.slot_idx] = h
-            self._streamer.copy_stream.synchronize()
+        # Layer 0 is filled lazily at the first forward boundary by
+        # `prepare_before_forward`. This keeps col prefetch slots
+        # active-bucket-adjacent (`[gate_active | up_active]`) instead of
+        # post-init max-filled (`[gate_max | up_max]`), so the MLP prefetch
+        # path can use one fused [gate|up] GEMM even when f_prefetch <
+        # f_cpu_store.
 
         total_offloaded = sum(
             h.w_cpu.numel() * h.w_cpu.element_size()
             for h in self._handles
             if h.w_cpu is not None
         )
-        assert self._x_pinned is not None
-        assert self._y_pinned is not None
-        assert self._y_gpu is not None
+        x_pinned_gb = (
+            0.0
+            if self._x_pinned is None
+            else self._x_pinned.numel() * self._x_pinned.element_size() / 1e9
+        )
+        y_pinned_gb = (
+            0.0
+            if self._y_pinned is None
+            else self._y_pinned.numel() * self._y_pinned.element_size() / 1e9
+        )
+        y_gpu_gb = (
+            0.0
+            if self._y_gpu is None
+            else self._y_gpu.numel() * self._y_gpu.element_size() / 1e9
+        )
 
         # Prefetch summary (zero / disabled when f_prefetch == 0).
         if self._prefetch_buffer_pool is not None:
@@ -1314,9 +1312,9 @@ class CotsOffloader(BaseOffloader):
             len(self._handles),
             len(self._fused_ops),
             total_offloaded / 1e9,
-            self._x_pinned.numel() * self._x_pinned.element_size() / 1e9,
-            self._y_pinned.numel() * self._y_pinned.element_size() / 1e9,
-            self._y_gpu.numel() * self._y_gpu.element_size() / 1e9,
+            x_pinned_gb,
+            y_pinned_gb,
+            y_gpu_gb,
             prefetch_gb,
             self._capture_buckets,
         )

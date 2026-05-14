@@ -178,12 +178,11 @@ class CotsOffloadConfig:
     measurements that motivate the split-graph default."""
 
     dry_run: bool = Field(default=False)
-    """Diagnostic: install all wrappers but skip the CPU GEMM in the worker.
-    Used by `bench_cots_dryrun_vs_none.py` to attribute the COTS-vs-none gap
-    into orchestration vs active CPU-work penalty (`phase1a_findings.md §1.14`).
-    Token output is garbage; only host bookkeeping cost is measured. Permanent
-    diagnostic — useful for verifying Phase 1c collapsed the orchestration
-    column and for catching future regressions in the COTS host path."""
+    """Diagnostic: install COTS wrappers and preserve bucket/slot/graph
+    control flow, but skip active offloaded work from both paths. CPU-compute
+    contribution is omitted; prefetch H2D and prefetched-slice GPU compute are
+    omitted. Token output is garbage; tensor shapes remain valid. Permanent
+    diagnostic for measuring the COTS control-plane floor."""
 
     auto_graph_split: bool = Field(default=True)
     """When COTS runs with CUDA graphs (`enforce_eager=False`) on the native

@@ -76,9 +76,7 @@ class CotsQKVOp:
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         offloader = self._offloader
-        assert offloader._x_pinned is not None
-        assert offloader._y_pinned is not None
-        assert offloader._y_gpu is not None
+        dry_run = offloader.dry_run
 
         h = self._handle
         assert h.w_cpu is not None
@@ -121,7 +119,7 @@ class CotsQKVOp:
             n_cpu = h.n_cpu_compute_by_bucket[b]
             pref_idx = h.prefetch_indices_cuda_by_bucket[b]
             cpu_idx = h.cpu_compute_indices_cuda_by_bucket[b]
-            if n_pref > 0:
+            if n_pref > 0 and not dry_run:
                 _assert_prefetch_slot_ready(
                     h,
                     n_pref,
@@ -130,7 +128,9 @@ class CotsQKVOp:
 
         # CPU compute path skipped when n_cpu_compute == 0 (pure-prefetch).
         y_dst: torch.Tensor | None = None
-        if n_cpu > 0:
+        if n_cpu > 0 and not dry_run:
+            assert self._runner is not None
+            assert offloader._y_gpu is not None
             desc = (h.layer_idx, b, "qkv")
             # §1c.20: BRANCH before constructing CPU pinned views.
             # The native captured path has a different compiler
@@ -147,6 +147,8 @@ class CotsQKVOp:
             if isinstance(self._runner, NativeCotsRunner):
                 self._runner.submit_with_d2h(x, h.layer_idx, "qkv")
             else:
+                assert offloader._x_pinned is not None
+                assert offloader._y_pinned is not None
                 x_in = offloader._x_pinned[: num_tokens * h.in_dim].view(
                     num_tokens, h.in_dim
                 )
@@ -166,11 +168,11 @@ class CotsQKVOp:
         # after `wait_prefetch` (issued by the layer-forward hook) has joined
         # the copy stream's H2D.
         out_pref: torch.Tensor | None = None
-        if n_pref > 0 and h.w_prefetch_slots:
+        if n_pref > 0 and h.w_prefetch_slots and not dry_run:
             slot_view = h.w_prefetch_slots[h.slot_idx].narrow(0, 0, n_pref)
             out_pref = F.linear(x, slot_view, None)
 
-        if n_cpu > 0:
+        if n_cpu > 0 and not dry_run:
             assert y_dst is not None
             assert offloader._dummy_gpu_anchor_a is not None
             assert offloader._dummy_gpu_anchor_b is not None
@@ -192,9 +194,15 @@ class CotsQKVOp:
             else:
                 self._runner.wait_and_uva(y_dst, gpu_a, gpu_b, x, desc)
 
-        out = _scatter_col_outputs_three_way(
-            out_perm, out_pref, y_dst, pref_idx, cpu_idx, h, num_tokens
-        )
+        if out_perm is None and out_pref is None and y_dst is None:
+            # Dry-run/full-offload corner: all active offloaded work is
+            # intentionally skipped, but downstream layers still need the
+            # canonical QKV shape. Values are diagnostic garbage by design.
+            out = x.new_empty((num_tokens, h.out_dim))
+        else:
+            out = _scatter_col_outputs_three_way(
+                out_perm, out_pref, y_dst, pref_idx, cpu_idx, h, num_tokens
+            )
         if bias is not None:
             out = out + bias
         return out
@@ -245,9 +253,7 @@ class CotsSwiGLUMLPOp:
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         offloader = self._offloader
-        assert offloader._x_pinned is not None
-        assert offloader._y_pinned is not None
-        assert offloader._y_gpu is not None
+        dry_run = offloader.dry_run
 
         gu_h = self._gate_up
         dn_h = self._down
@@ -272,14 +278,14 @@ class CotsSwiGLUMLPOp:
             gu_n_pref = gu_h.n_prefetch_by_bucket[b]
             dn_n_pref = dn_h.n_prefetch_by_bucket[b]
             dn_n_cpu = dn_h.n_cpu_compute_by_bucket[b]
-            if gu_n_pref > 0:
+            if gu_n_pref > 0 and not dry_run:
                 gu_n_per_half = gu_n_pref // 2
                 _assert_prefetch_slot_ready(
                     gu_h,
                     gu_n_per_half,
                     underfilled_name="col slot",
                 )
-            if dn_n_pref > 0:
+            if dn_n_pref > 0 and not dry_run:
                 _assert_prefetch_slot_ready(
                     dn_h,
                     dn_n_pref,
@@ -294,7 +300,9 @@ class CotsSwiGLUMLPOp:
         # only stable call-site identity; Python runner still uses the
         # full descriptor to select its eager callback.
         y2_gpu: torch.Tensor | None = None
-        if dn_n_cpu > 0:
+        if dn_n_cpu > 0 and not dry_run:
+            assert self._runner is not None
+            assert offloader._y_gpu is not None
             desc = (gu_h.layer_idx, b, "mlp_block")
             # §1c.20: branch BEFORE constructing the CPU pinned views
             # — Inductor materializes any CPU view it sees in the
@@ -305,6 +313,8 @@ class CotsSwiGLUMLPOp:
             if isinstance(self._runner, NativeCotsRunner):
                 self._runner.submit_with_d2h(x, gu_h.layer_idx, "mlp_block")
             else:
+                assert offloader._x_pinned is not None
+                assert offloader._y_pinned is not None
                 x_pinned = offloader._x_pinned[: num_tokens * self._in_dim].view(
                     num_tokens, self._in_dim
                 )
@@ -326,34 +336,32 @@ class CotsSwiGLUMLPOp:
             out_gpu = F.linear(gpu_silu, self._down_layer.weight, None)
 
         # GPU prefetched MLP block — adds a row-parallel partial to out_gpu.
-        # Slot layout (Phase 1b → Phase 1c refactor): col slot is
-        # FIXED-MAX `[gate_max | up_max]`. Gate region is `[0:max_half]`,
-        # up region is `[max_half:2*max_half]`. The active bucket
-        # consumes a per-half prefix `[:n_per_half]` from each region;
-        # because gate and up are no longer adjacent in memory, MLP1
-        # is two separate F.linear instead of one fused [gate|up] GEMM,
-        # and silu*up is done explicitly (math-equivalent to
-        # SiluAndMul.forward_native). MLP2/down slot is transposed
-        # (Phase 1b row-prefetch fix): shape (dn_n_pref, out_dim).
-        if gu_n_pref > 0 and gu_h.w_prefetch_slots and dn_h.w_prefetch_slots:
-            n_per_half = gu_n_pref // 2
-            max_half = gu_h.max_n_prefetch // 2
+        # Col prefetch slots are filled active-bucket-adjacent as
+        # [gate_active | up_active], so MLP1 can use one fused [gate|up] GEMM
+        # even when f_prefetch < f_cpu_store. MLP2/down slot uses the unified
+        # transposed storage layout: shape (dn_n_pref, out_dim).
+        if (
+            gu_n_pref > 0
+            and gu_h.w_prefetch_slots
+            and dn_h.w_prefetch_slots
+            and not dry_run
+        ):
             gu_slot = gu_h.w_prefetch_slots[gu_h.slot_idx]
             dn_slot = dn_h.w_prefetch_slots[dn_h.slot_idx]
-            gate_w = gu_slot[:n_per_half, :]
-            up_w = gu_slot[max_half : max_half + n_per_half, :]
-            pref_gate = F.linear(x, gate_w, None)
-            pref_up = F.linear(x, up_w, None)
-            pref_silu = F.silu(pref_gate) * pref_up
-            pref_out = pref_silu.matmul(dn_slot[:dn_n_pref, :])
-            out_gpu = pref_out if out_gpu is None else out_gpu.add_(pref_out)
+            pref_mlp1 = F.linear(x, gu_slot[:gu_n_pref, :], None)
+            pref_silu = self._act_fn(pref_mlp1)
+            dn_pref = dn_slot[:dn_n_pref, :]
+            if out_gpu is None:
+                out_gpu = pref_silu.matmul(dn_pref)
+            else:
+                out_gpu.addmm_(pref_silu, dn_pref)
 
-        if dn_n_cpu > 0:
+        if dn_n_cpu > 0 and not dry_run:
             assert y2_gpu is not None
             assert offloader._dummy_gpu_anchor_a is not None
             assert offloader._dummy_gpu_anchor_b is not None
             # MLP block: out_gpu carries a combined dep on both perm and
-            # pref GEMMs (via `out_gpu.add_(pref_out)` above), so
+            # pref GEMMs (via in-place addmm_ above), so
             # gpu_anchor_a alone covers the GPU work; gpu_anchor_b is
             # always the dummy. In the degenerate f_cpu_store=1.0 case
             # (no GPU work at all), anchor_a falls back to the dummy too
@@ -375,7 +383,11 @@ class CotsSwiGLUMLPOp:
             # activation buffer and would be clobbered by the next layer.
             out_gpu = y2_gpu.clone() if out_gpu is None else out_gpu.add_(y2_gpu)
 
-        assert out_gpu is not None, "MLP block has no active path"
+        if out_gpu is None:
+            # Dry-run/full-offload corner: CPU and prefetched contributions are
+            # deliberately omitted, but the parent decoder layer still needs a
+            # hidden-state-shaped tensor. Values are diagnostic garbage.
+            out_gpu = x.new_empty((num_tokens, self._out_dim))
         return out_gpu
 
 

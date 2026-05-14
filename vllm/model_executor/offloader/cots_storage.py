@@ -16,6 +16,27 @@ from vllm.model_executor.offloader.cots_utils import (
 )
 from vllm.utils.platform_utils import is_pin_memory_available
 
+MLP_CHANNEL_GRANULARITY = 64
+"""Planner/COTS MLP snap grid: channels per gate/up half and down input."""
+
+
+def _snap_mlp_channels(requested: float, limit: int) -> int:
+    """Snap an MLP channel count to the kernel-friendly Phase-1 grid.
+
+    MLP offload uses matched channel counts for gate, up, and down. The
+    profiler found narrow arbitrary sizes such as 96 channels can hit bad GEMM
+    shapes; multiples of 64 avoid that cliff on Qwen2.5-7B. Round to the
+    nearest grid point, break ties upward, and allow the exact full-size limit
+    even when a future model's intermediate size is not divisible by 64.
+    """
+    if requested <= 0:
+        return 0
+    if requested >= limit:
+        return limit
+    gran = MLP_CHANNEL_GRANULARITY
+    snapped = int(((requested + gran / 2) // gran) * gran)
+    return min(snapped, limit)
+
 
 class CotsLinearHandle:
     """Per-Linear partition primitive: storage + load. No execution.
@@ -223,7 +244,7 @@ class CotsLinearHandle:
             f"MergedCol expected matched partitions, got {parts}"
         )
         half = parts[0]
-        n_cpu_per_half = int(round(f_cpu_store * half))
+        n_cpu_per_half = _snap_mlp_channels(f_cpu_store * half, half)
         n_cpu = 2 * n_cpu_per_half
         if n_cpu == 0:
             return None
@@ -253,7 +274,7 @@ class CotsLinearHandle:
         f_cpu_store: float,
     ) -> CotsLinearHandle | None:
         out_dim, in_dim = tuple(linear.weight.shape)
-        n_cpu = int(round(f_cpu_store * in_dim))
+        n_cpu = _snap_mlp_channels(f_cpu_store * in_dim, in_dim)
         if n_cpu == 0:
             return None
         # LAST n_cpu input cols. Preserves the MLP1↔MLP2 matched-index
@@ -378,9 +399,9 @@ class CotsLinearHandle:
         For qkv, n_pref is snapped via the same picker as n_cpu so its
         snap grid matches: at f_prefetch == f_cpu_store the picker sees
         identical input → returns identical (n_q, n_k, n_v) → n_pref ==
-        n_cpu by construction, no residual leak. col / row already share
-        the same `round(f * dim)` rule for both n_cpu and n_pref so they
-        align without extra work.
+        n_cpu by construction, no residual leak. col / row use the shared
+        64-channel MLP snap grid for both n_cpu and n_pref, then clamp n_pref
+        to the CPU-stored cap.
         """
         cap = self.n_cpu
 
@@ -398,10 +419,16 @@ class CotsLinearHandle:
             n_pref = min(n_q + n_k + n_v, cap)
         elif self.kind == "col":
             half = self.out_dim // 2
-            n_pref_per_half = min(int(round(f_prefetch * half)), self.n_cpu_per_half)
+            n_pref_per_half = min(
+                _snap_mlp_channels(f_prefetch * half, half),
+                self.n_cpu_per_half,
+            )
             n_pref = 2 * n_pref_per_half
         else:  # row
-            n_pref = min(int(round(f_prefetch * self.in_dim)), cap)
+            n_pref = min(
+                _snap_mlp_channels(f_prefetch * self.in_dim, self.in_dim),
+                cap,
+            )
 
         # Index extraction is per-kind and depends on `cpu_indices`'s layout.
         if self.kind == "col":
@@ -542,9 +569,10 @@ class CotsLinearHandle:
 # offloaded handle so prefetch for layer i+1 can overlap with layer i's
 # compute (every layer is offloaded → K=2 is the minimum slot count for any
 # overlap; see `phase0_findings.md §0.10.1d` and the Phase 1b plan).
-# Slot shape mirrors `w_cpu`'s layout per kind:
+# Slot shape mirrors `w_cpu`'s row-major storage per kind:
 #   col / qkv : (max_n_prefetch, in_dim)   — prefetch dim 0
-#   row       : (out_dim, max_n_prefetch)  — prefetch dim 1 (pitched H2D)
+#   row       : (max_n_prefetch, out_dim)  — prefetch dim 0
+# Col slots are filled in active-bucket-adjacent layout `[gate_active | up_active]`.
 # Sized to `max_n_prefetch` (max across buckets); per-forward H2D narrows.
 # ---------------------------------------------------------------------------
 class CotsPrefetchBufferPool:
@@ -654,10 +682,9 @@ class WeightPrefetchStreamer:
         ]
         self._event_valid_for_eager: list[bool] = [False] * n_layers
         self._prefetch_in_capture: list[bool] = [False] * n_layers
-        # Diagnostic: skip the actual H2D copy on the prefetch path while
-        # keeping all bookkeeping (events, slot tracking, fork_event). Lets
-        # `Bench 2` decompose collaborative-arm overhead into orchestration
-        # vs PCIe transfer. Same diagnostic role as `prefetch_defer.py`.
+        # Public COTS dry-run is a control-plane diagnostic. The streamer
+        # skips H2D copies while preserving event ordering and slot metadata;
+        # operators skip the prefetched-slice GPU compute contribution.
         self._dry_run = dry_run
         # Cached at the start of every model forward by the first-decoder
         # pre-hook. Read by `start` to size the bucket-specific H2D.
@@ -700,8 +727,7 @@ class WeightPrefetchStreamer:
                 if n == 0:
                     continue
                 # dry_run: keep all bookkeeping (slot tracking, events,
-                # fork_event ordering) but skip the actual H2D so the
-                # measured cost is host orchestration only.
+                # fork_event ordering) but skip the actual H2D.
                 if not self._dry_run:
                     if h.kind == "row":
                         # Stage 7-C: row-handle `w_cpu` is now stored in
@@ -717,25 +743,19 @@ class WeightPrefetchStreamer:
                         dst.copy_(src, non_blocking=True)
                     elif h.kind == "col":
                         # MergedCol w_cpu layout is [gate_full | up_full].
-                        # Prefetch takes the first n_per_half rows of
-                        # EACH half (matched-index invariant). Slot
-                        # layout is FIXED-MAX `[gate_max | up_max]`
-                        # (Phase 1b → Phase 1c refactor): gate region
-                        # is `[0:max_half]`, up region is
-                        # `[max_half:2*max_half]`, regardless of the
-                        # active bucket. This makes max-fill at
-                        # post_init slice-safe and lets the operator
-                        # consume any active prefix `n_per_half` from
-                        # both regions independently.
+                        # Prefetch takes the first n_per_half rows of EACH
+                        # half and writes them active-adjacent as
+                        # [gate_active | up_active]. This keeps the common
+                        # MLP prefetch path to one [gate|up] GEMM even when
+                        # f_prefetch < f_cpu_store.
                         assert h.w_cpu is not None
                         n_per_half = n // 2
-                        max_half = h.max_n_prefetch // 2
                         n_cpu_per_half_total = h.n_cpu // 2
                         slot = h.w_prefetch_slots[h.slot_idx]
                         slot[:n_per_half, :].copy_(
                             h.w_cpu[:n_per_half, :], non_blocking=True
                         )
-                        slot[max_half : max_half + n_per_half, :].copy_(
+                        slot[n_per_half:n, :].copy_(
                             h.w_cpu[
                                 n_cpu_per_half_total : n_cpu_per_half_total
                                 + n_per_half,
@@ -769,9 +789,11 @@ class WeightPrefetchStreamer:
         self, layer_idx: int, handles: list[CotsLinearHandle]
     ) -> None:
         """Idempotent boundary repair for `layer_idx` at `current_bucket`.
-        Copies the missing suffix `[avail:required]` when the slot is
-        underfilled relative to the active bucket; no-op when already
-        sufficient. Owner mismatch is a hard error.
+        Repairs the layer-0 slot relative to the active bucket. For qkv/row,
+        larger previously-filled prefixes can be reused. For col, the slot is
+        active-adjacent `[gate_active | up_active]`, so any active-size change
+        rewrites the full active prefix. Owner mismatch is a hard error, except
+        an empty slot (`owner is None`) is filled on demand.
 
         Phase 1c precondition: bucket dispatch is decided by the active
         bucket (capture-time constant), not by slot state. This method
@@ -791,12 +813,16 @@ class WeightPrefetchStreamer:
                 continue
             avail = h.prefetch_available_rows_in_slot[h.slot_idx]
             owner = h.prefetch_owner_in_slot[h.slot_idx]
-            if owner is not h:
+            if owner is not None and owner is not h:
                 raise AssertionError(
                     f"prepare_for_forward_bucket: slot owner mismatch on "
                     f"{h.qualified_name} slot {h.slot_idx} (owner={owner})"
                 )
-            if avail >= required:
+            if h.kind == "col":
+                needs_fill = owner is None or avail != required
+            else:
+                needs_fill = owner is None or avail < required
+            if not needs_fill:
                 continue
             if not issued:
                 fork_event = torch.cuda.Event()
@@ -809,31 +835,32 @@ class WeightPrefetchStreamer:
                         # Stage 7-C: read from the unified transposed
                         # `w_cpu` instead of the dropped duplicate.
                         assert h.w_cpu is not None
-                        src = h.w_cpu[avail:required, :]
-                        h.w_prefetch_slots[h.slot_idx][avail:required, :].copy_(
+                        start = 0 if owner is None else avail
+                        src = h.w_cpu[start:required, :]
+                        h.w_prefetch_slots[h.slot_idx][start:required, :].copy_(
                             src, non_blocking=True
                         )
                     elif h.kind == "col":
                         assert h.w_cpu is not None
                         n_cpu_per_half_total = h.n_cpu // 2
-                        max_half = h.max_n_prefetch // 2
                         slot = h.w_prefetch_slots[h.slot_idx]
-                        slot[avail:required, :].copy_(
-                            h.w_cpu[avail:required, :], non_blocking=True
+                        slot[:required, :].copy_(
+                            h.w_cpu[:required, :], non_blocking=True
                         )
-                        slot[max_half + avail : max_half + required, :].copy_(
+                        slot[required : 2 * required, :].copy_(
                             h.w_cpu[
-                                n_cpu_per_half_total + avail : n_cpu_per_half_total
-                                + required,
+                                n_cpu_per_half_total : n_cpu_per_half_total + required,
                                 :,
                             ],
                             non_blocking=True,
                         )
                     else:  # qkv
                         assert h.w_cpu is not None
-                        h.w_prefetch_slots[h.slot_idx][avail:required, :].copy_(
-                            h.w_cpu[avail:required, :], non_blocking=True
+                        start = 0 if owner is None else avail
+                        h.w_prefetch_slots[h.slot_idx][start:required, :].copy_(
+                            h.w_cpu[start:required, :], non_blocking=True
                         )
+                h.prefetch_owner_in_slot[h.slot_idx] = h
                 h.prefetch_available_rows_in_slot[h.slot_idx] = required
         if issued:
             self._prefetch_in_capture[layer_idx] = in_capture
