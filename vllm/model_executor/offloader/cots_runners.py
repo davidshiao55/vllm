@@ -606,6 +606,11 @@ class NativeCotsRunner:
         from vllm.model_executor.offloader import cots_ops
 
         try:
+            # The CPU task queue can be idle while stream-ordered COTS custom
+            # ops are still unwinding. Drain CUDA first so callbacks/UVA glue
+            # cannot race with dropping the pybind infer from the registry.
+            if torch.cuda.is_available() and torch.cuda.is_initialized():
+                torch.cuda.current_stream().synchronize()
             cots_ops.sync_blocking(self._runner_id)
         finally:
             cots_ops._unregister_infer(self._runner_id)
