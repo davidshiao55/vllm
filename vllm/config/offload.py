@@ -107,10 +107,21 @@ class CotsOffloadConfig:
     f_prefetch: float = Field(default=0.0, ge=0.0, le=1.0)
     """Manual fallback for the layer-ahead weight-prefetch fraction. Only
     consulted when the offloader is constructed without a
-    `dispatch_table_factory`; the Planner's factory output overrides this
+    `dispatch_table`/factory; the Planner's table output overrides this
     value entirely. Constraint: f_prefetch <= f_cpu_store (prefetch consumes
     CPU-stored bytes; the f_cpu_compute = f_cpu_store - f_prefetch portion is
     CPU-computed). Default 0.0 keeps the CPU-stored slice CPU-computed."""
+
+    dispatch_table: dict[int, tuple[float, float]] | None = Field(default=None)
+    """Optional engine-local COTS compute dispatch table emitted by the
+    Planner. Keys are vLLM `BatchDescriptor.num_tokens` bucket values. Values
+    are `(f_cpu_compute, f_prefetch_compute)` for that bucket. When set, this
+    table overrides the uniform `f_prefetch` fallback above. Runtime validates
+    that all captured buckets are present before installing COTS slabs.
+
+    This is an engine-local interface: FastTTS/global planning decides the
+    storage budget and may provide a table; vLLM still owns snapping, bucket
+    validation, and tensor geometry."""
 
     kv_biased: bool = Field(default=True)
     """If True, the WQKV column picker is biased toward K/V: K+V column groups
@@ -227,6 +238,41 @@ class CotsOffloadConfig:
     focused Qwen2.5-7B workload grid. The legacy full-capture modes
     remain available by disabling `auto_graph_split`.
     """
+
+    @model_validator(mode="after")
+    def validate_cots_config(self) -> "CotsOffloadConfig":
+        """Validate COTS storage/dispatch invariants."""
+        if self.f_prefetch > self.f_cpu_store:
+            raise ValueError(
+                f"cots.f_prefetch ({self.f_prefetch}) must be <= "
+                f"cots.f_cpu_store ({self.f_cpu_store}); prefetch consumes "
+                "CPU-stored bytes."
+            )
+        if self.dispatch_table is None:
+            return self
+        for bucket, entry in self.dispatch_table.items():
+            if bucket <= 0:
+                raise ValueError(
+                    f"cots.dispatch_table bucket keys must be positive; got {bucket}"
+                )
+            if len(entry) != 2:
+                raise ValueError(
+                    "cots.dispatch_table values must be "
+                    "(f_cpu_compute, f_prefetch_compute)"
+                )
+            f_cpu_compute, f_prefetch_compute = entry
+            if f_cpu_compute < 0 or f_prefetch_compute < 0:
+                raise ValueError(
+                    "cots.dispatch_table fractions must be non-negative; "
+                    f"got {entry} for bucket {bucket}"
+                )
+            if f_cpu_compute + f_prefetch_compute > self.f_cpu_store + 1e-9:
+                raise ValueError(
+                    "cots.dispatch_table entry exceeds f_cpu_store: "
+                    f"bucket={bucket}, entry={entry}, "
+                    f"f_cpu_store={self.f_cpu_store}"
+                )
+        return self
 
 
 @config

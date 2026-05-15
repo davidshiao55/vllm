@@ -470,6 +470,9 @@ class EngineArgs:
     prefetch_dry_run: bool = PrefetchOffloadConfig.dry_run
     cots_f_cpu_store: float = CotsOffloadConfig.f_cpu_store
     cots_f_prefetch: float = CotsOffloadConfig.f_prefetch
+    cots_dispatch_table: dict[int, tuple[float, float]] | None = (
+        CotsOffloadConfig.dispatch_table
+    )
     cots_kv_biased: bool = CotsOffloadConfig.kv_biased
     cots_cpu_num_threads: int = CotsOffloadConfig.cpu_num_threads
     cots_cpu_num_threads_by_bucket: dict[int, int] | None = (
@@ -1082,6 +1085,9 @@ class EngineArgs:
         offload_group.add_argument("--prefetch-dry-run", **prefetch_kwargs["dry_run"])
         offload_group.add_argument("--cots-f-cpu-store", **cots_kwargs["f_cpu_store"])
         offload_group.add_argument("--cots-f-prefetch", **cots_kwargs["f_prefetch"])
+        offload_group.add_argument(
+            "--cots-dispatch-table", **cots_kwargs["dispatch_table"]
+        )
         offload_group.add_argument("--cots-kv-biased", **cots_kwargs["kv_biased"])
         offload_group.add_argument(
             "--cots-cpu-num-threads", **cots_kwargs["cpu_num_threads"]
@@ -2007,6 +2013,7 @@ class EngineArgs:
             CotsOffloadConfig(),
             f_cpu_store=self.cots_f_cpu_store,
             f_prefetch=self.cots_f_prefetch,
+            dispatch_table=self.cots_dispatch_table,
             kv_biased=self.cots_kv_biased,
             cpu_num_threads=self.cots_cpu_num_threads,
             cpu_num_threads_by_bucket=self.cots_cpu_num_threads_by_bucket,

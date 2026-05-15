@@ -246,6 +246,27 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
             cpu_offload_params=uva.cpu_offload_params,
         )
     elif backend == "cots":
-        return CotsOffloader(config=cots)
+        dispatch_table_factory = None
+        if cots.dispatch_table is not None:
+            configured_table = {
+                int(bucket): (float(pair[0]), float(pair[1]))
+                for bucket, pair in cots.dispatch_table.items()
+            }
+
+            def dispatch_table_factory(capture_buckets):
+                missing = sorted(set(capture_buckets) - set(configured_table))
+                if missing:
+                    raise ValueError(
+                        f"cots.dispatch_table is missing captured buckets: {missing}"
+                    )
+                return {
+                    int(bucket): configured_table[int(bucket)]
+                    for bucket in capture_buckets
+                }
+
+        return CotsOffloader(
+            config=cots,
+            dispatch_table_factory=dispatch_table_factory,
+        )
     else:
         return NoopOffloader()
