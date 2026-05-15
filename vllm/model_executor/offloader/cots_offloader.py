@@ -723,7 +723,6 @@ class CotsOffloader(BaseOffloader):
                 if dn_n_cpu == 0:
                     continue
                 n_pref_per_half = gu_n_pref // 2
-                inter_per_half = n_cpu_per_half_total - n_pref_per_half
                 w_gate_view = gu_h.w_cpu[n_pref_per_half:n_cpu_per_half_total, :]
                 w_up_view = gu_h.w_cpu[
                     n_cpu_per_half_total + n_pref_per_half : 2 * n_cpu_per_half_total,
@@ -750,7 +749,6 @@ class CotsOffloader(BaseOffloader):
                         w_down_ptr=int(w_down_view.data_ptr()),
                         w_down_rows=int(w_down_view.shape[0]),
                         w_down_cols=int(w_down_view.shape[1]),
-                        intermediate_per_half=int(inter_per_half),
                     )
                 )
         return specs
@@ -771,11 +769,8 @@ class CotsOffloader(BaseOffloader):
             self._runner.install(callbacks)
         elif isinstance(self._runner, NativeCotsRunner):
             slab_specs = self._build_native_slab_specs()
-            # Stage 7-C: `max_num_tokens` gates the C++ worker's
-            # submit-side / run-side bounds checks against the pinned
-            # x/y buffers. The prior `scratch_max_intermediate_per_half`
-            # parameter is gone — the silu(gate)*up intermediate is
-            # now a fresh contig tensor allocated per call.
+            # `max_num_tokens` gates the C++ worker's submit-side and
+            # run-side bounds checks against the pinned x/y buffers.
             self._runner.install(
                 slab_specs=slab_specs,
                 max_num_tokens=int(self._max_num_tokens),
@@ -1024,6 +1019,13 @@ class CotsOffloader(BaseOffloader):
 
         cots_ops.reset_all_counters()
         logger.info("[cots §1c.22] reset_all_counters() fired post-cudagraph-capture")
+
+    def shutdown(self) -> None:
+        """Drain and release the shared CPU runner at worker shutdown."""
+        if self._runner is None:
+            return
+        self._runner.close()
+        self._runner = None
 
     def _start_prefetch(self, layer_idx: int) -> None:
         if self._streamer is not None:

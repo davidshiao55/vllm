@@ -1037,6 +1037,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     # sequential in natural layout. Used by production worker paths
     # for QKV/gate/up after Stage 7-C storage unification.
     "csrc/cots/bf16_gemm_natural.cpp"
+    # CPU MLP block fast path: gate/up/SwiGLU into BF16 scratch, then down.
+    "csrc/cots/bf16_mlp_gate_up_silu.cpp"
     # §1c.29 wait kernel — compiled as CUDA so nvcc handles
     # the __global__ kernel and PTX inline asm. The other
     # sources stay C++ host code; nvcc compiles them
@@ -1095,6 +1097,9 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   # OpenMP for at::parallel_for routing into INTRA_OP_PARALLEL).
   set_source_files_properties(
     "csrc/cots/bf16_gemm_natural.cpp"
+    PROPERTIES COMPILE_FLAGS "-mavx2 -mfma -fopenmp")
+  set_source_files_properties(
+    "csrc/cots/bf16_mlp_gate_up_silu.cpp"
     PROPERTIES COMPILE_FLAGS "-mavx2 -mfma -fopenmp")
 
   message(STATUS "Enabling cots_C extension.")

@@ -138,6 +138,11 @@ class BaseOffloader(ABC):
         """
         pass
 
+    def shutdown(self) -> None:  # noqa: B027
+        """Called from worker shutdown so offloaders can drain native
+        resources deterministically. Default is no-op."""
+        pass
+
     def sync_prev_onload(self) -> None:  # noqa: B027
         """Sync previous onload operations. Override in subclasses."""
         pass

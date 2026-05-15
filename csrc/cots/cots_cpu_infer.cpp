@@ -6,16 +6,15 @@
 #include "cots_cpu_infer.h"
 
 #include <ATen/ops/linear.h>
-#include <ATen/ops/silu.h>
 #include <c10/core/InferenceMode.h>
 #include <nvtx3/nvToolsExt.h>
 #include <pthread.h>
 #include <sched.h>
 #include <torch/torch.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
-#include <cstring>
 #include <exception>
 #include <stdexcept>
 #include <utility>
@@ -34,6 +33,13 @@ void bf16_gemm_transposed_at(const at::Tensor& x, const at::Tensor& w,
 // for the natural (N, K) row-major BF16 GEMM kernel.
 void bf16_gemm_natural_at(const at::Tensor& x, const at::Tensor& w,
                           at::Tensor& y_out);
+
+// Forward declaration — defined in bf16_mlp_gate_up_silu.cpp. Production MLP
+// CPU path: gate/up/SwiGLU into BF16 scratch, then transposed down GEMM.
+void bf16_mlp_gate_up_silu_down(const uint16_t* x, const uint16_t* w_gate,
+                                const uint16_t* w_up, const uint16_t* w_down,
+                                uint16_t* y, uint16_t* z_scratch, int64_t M,
+                                int64_t H, int64_t I, int64_t O);
 
 namespace {
 
@@ -219,12 +225,14 @@ void CotsCpuInfer::populate_slab_qkv(int64_t task_id, int32_t n_threads,
   s.w_cpu_rows = w_cpu_rows;
 }
 
-void CotsCpuInfer::populate_slab_mlp(
-    int64_t task_id, int32_t n_threads, int32_t bucket_capacity_tokens,
-    uintptr_t x_pinned_ptr, int32_t in_dim, uintptr_t y_pinned_ptr,
-    int32_t cpu_out_dim, uintptr_t w_gate_ptr, int32_t w_gate_rows,
-    uintptr_t w_up_ptr, int32_t w_up_rows, uintptr_t w_down_ptr,
-    int32_t w_down_rows, int32_t w_down_cols, int32_t intermediate_per_half) {
+void CotsCpuInfer::populate_slab_mlp(int64_t task_id, int32_t n_threads,
+                                     int32_t bucket_capacity_tokens,
+                                     uintptr_t x_pinned_ptr, int32_t in_dim,
+                                     uintptr_t y_pinned_ptr,
+                                     int32_t cpu_out_dim, uintptr_t w_gate_ptr,
+                                     int32_t w_gate_rows, uintptr_t w_up_ptr,
+                                     int32_t w_up_rows, uintptr_t w_down_ptr,
+                                     int32_t w_down_rows, int32_t w_down_cols) {
   check_error();
   TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
               "populate_slab_mlp: task_id ", task_id, " out of range");
@@ -246,7 +254,6 @@ void CotsCpuInfer::populate_slab_mlp(
   s.w_down_ptr = reinterpret_cast<void*>(w_down_ptr);
   s.w_down_rows = w_down_rows;
   s.w_down_cols = w_down_cols;
-  s.intermediate_per_half = intermediate_per_half;
 }
 
 void CotsCpuInfer::populate_slab_dryrun(int64_t task_id,
@@ -840,39 +847,28 @@ void CotsCpuInfer::RunSlabOnWorker(TaskSlab* slab, uint32_t seq) {
         break;
       }
       case TaskSlab::kMlpBlock: {
-        // gate / up are contiguous prefix views of their respective halves
-        // of the gate_up CPU buffer (Phase 1b populates them this way).
-        // Stage 7-C: gate/up swap at::linear → bf16_gemm_natural_at.
-        // gate_out / up_out are per-call at::empty allocs (matches the
-        // pre-Stage-7-C at::linear path's internal output alloc count).
-        auto x_view =
-            ContigCpuViewFromBlob(slab->x_pinned_ptr, n, slab->in_dim);
-        auto w_gate = ContigCpuViewFromBlob(slab->w_gate_ptr, slab->w_gate_rows,
-                                            slab->in_dim);
-        auto w_up = ContigCpuViewFromBlob(slab->w_up_ptr, slab->w_up_rows,
-                                          slab->in_dim);
-        auto gate_out = at::empty(
-            {static_cast<int64_t>(n), static_cast<int64_t>(slab->w_gate_rows)},
-            w_gate.options());
-        auto up_out = at::empty(
-            {static_cast<int64_t>(n), static_cast<int64_t>(slab->w_up_rows)},
-            w_up.options());
-        bf16_gemm_natural_at(x_view, w_gate, gate_out);
-        bf16_gemm_natural_at(x_view, w_up, up_out);
-
-        // silu(gate)*up intermediate is a fresh contig tensor (the
-        // elementwise op allocates it). Feeds directly into the down
-        // kernel — no worker-local scratch needed.
-        auto z = at::silu(gate_out).mul_(up_out);
-
-        // Down-proj weight: transposed (K=dn_n_cpu, N=out_dim) row-major
-        // contiguous view (see TaskSlab doc in cots_cpu_infer.h). Output
-        // is written in-place into the pinned y_view.
-        auto w_down = ContigCpuViewFromBlob(slab->w_down_ptr, slab->w_down_rows,
-                                            slab->w_down_cols);
-        auto y_view =
-            ContigCpuViewFromBlob(slab->y_pinned_ptr, n, slab->cpu_out_dim);
-        bf16_gemm_transposed_at(z, w_down, y_view);
+        TORCH_CHECK(slab->w_gate_rows == slab->w_up_rows,
+                    "MLP CPU path requires gate/up row counts to match, got ",
+                    slab->w_gate_rows, " and ", slab->w_up_rows);
+        TORCH_CHECK(slab->w_down_rows == slab->w_gate_rows,
+                    "MLP CPU path requires down K to match intermediate rows, "
+                    "got down_rows=",
+                    slab->w_down_rows, " gate_rows=", slab->w_gate_rows);
+        TORCH_CHECK(slab->w_down_cols == slab->cpu_out_dim,
+                    "MLP CPU path output dim mismatch: down_cols=",
+                    slab->w_down_cols, " cpu_out_dim=", slab->cpu_out_dim);
+        const int64_t z_elems =
+            static_cast<int64_t>(n) * static_cast<int64_t>(slab->w_down_rows);
+        mlp_scratch_bf16_.resize(static_cast<size_t>(
+            std::max<int64_t>(z_elems, static_cast<int64_t>(0))));
+        bf16_mlp_gate_up_silu_down(
+            reinterpret_cast<const uint16_t*>(slab->x_pinned_ptr),
+            reinterpret_cast<const uint16_t*>(slab->w_gate_ptr),
+            reinterpret_cast<const uint16_t*>(slab->w_up_ptr),
+            reinterpret_cast<const uint16_t*>(slab->w_down_ptr),
+            reinterpret_cast<uint16_t*>(slab->y_pinned_ptr),
+            mlp_scratch_bf16_.data(), n, slab->in_dim, slab->w_down_rows,
+            slab->w_down_cols);
         break;
       }
     }

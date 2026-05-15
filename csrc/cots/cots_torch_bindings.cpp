@@ -31,7 +31,7 @@ PYBIND11_MODULE(_cots_C, m) {
            py::arg("in_dim"), py::arg("y_pinned_ptr"), py::arg("cpu_out_dim"),
            py::arg("w_gate_ptr"), py::arg("w_gate_rows"), py::arg("w_up_ptr"),
            py::arg("w_up_rows"), py::arg("w_down_ptr"), py::arg("w_down_rows"),
-           py::arg("w_down_cols"), py::arg("intermediate_per_half"))
+           py::arg("w_down_cols"))
       .def("populate_slab_dryrun", &CotsCpuInfer::populate_slab_dryrun,
            py::arg("task_id"), py::arg("bucket_capacity_tokens"),
            py::arg("x_pinned_ptr"), py::arg("in_dim"), py::arg("y_pinned_ptr"),

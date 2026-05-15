@@ -128,7 +128,6 @@ class _NativeSlabSpecMlp(NativeSlabSpec):
         w_down_ptr: int,
         w_down_rows: int,
         w_down_cols: int,
-        intermediate_per_half: int,
     ) -> None:
         super().__init__(op_descriptor)
         self.n_threads = n_threads
@@ -143,7 +142,6 @@ class _NativeSlabSpecMlp(NativeSlabSpec):
         self.w_down_ptr = w_down_ptr
         self.w_down_rows = w_down_rows
         self.w_down_cols = w_down_cols
-        self.intermediate_per_half = intermediate_per_half
 
     def populate(self, infer: object, task_id: int, *, dry_run: bool) -> None:
         # §1c.22 review-fix: see _NativeSlabSpecQkv.populate.
@@ -178,7 +176,6 @@ class _NativeSlabSpecMlp(NativeSlabSpec):
             w_down_ptr=self.w_down_ptr,
             w_down_rows=self.w_down_rows,
             w_down_cols=self.w_down_cols,
-            intermediate_per_half=self.intermediate_per_half,
         )
 
 

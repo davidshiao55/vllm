@@ -996,6 +996,13 @@ class Worker(WorkerBase):
         torch.accelerator.synchronize()
 
     def shutdown(self) -> None:
+        try:
+            from vllm.model_executor.offloader import get_offloader
+
+            get_offloader().shutdown()
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to shut down the model weight offloader.")
+
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:
             ensure_kv_transfer_shutdown()

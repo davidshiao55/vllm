@@ -128,9 +128,8 @@ struct alignas(64) TaskSlab {
   // dn_n_cpu)` view — contiguous `(dn_n_cpu, out_dim) = (K, N)` —
   // feedable to the custom `bf16_gemm_transposed` kernel.
   void* w_down_ptr = nullptr;
-  int32_t w_down_rows = 0;            // = K (dn_n_cpu)
-  int32_t w_down_cols = 0;            // = N (out_dim)
-  int32_t intermediate_per_half = 0;  // for silu*up shape
+  int32_t w_down_rows = 0;  // = K (dn_n_cpu)
+  int32_t w_down_cols = 0;  // = N (out_dim)
 };
 
 // Static sync-callback userData — owned as a stable member of CotsCpuInfer
@@ -155,10 +154,8 @@ class CotsCpuInfer {
   // buffers. Subsequent populate_slab calls only mutate the
   // pre-existing slab entries.
   //
-  // Stage 7-C removed the `scratch_max_intermediate_per_half`
-  // parameter: the silu(gate)*up intermediate is now a fresh contig
-  // tensor allocated per call by the elementwise op, no worker-local
-  // scratch needed.
+  // The MLP worker owns a lazily-resized gate/up/SwiGLU BF16 scratch
+  // buffer sized from the active slab shape.
   void install(int64_t n_slabs, int64_t max_num_tokens);
 
   // Populate a previously-reserved slab. All pointers must be POST-narrow
@@ -183,8 +180,7 @@ class CotsCpuInfer {
                          int32_t cpu_out_dim, uintptr_t w_gate_ptr,
                          int32_t w_gate_rows, uintptr_t w_up_ptr,
                          int32_t w_up_rows, uintptr_t w_down_ptr,
-                         int32_t w_down_rows, int32_t w_down_cols,
-                         int32_t intermediate_per_half);
+                         int32_t w_down_rows, int32_t w_down_cols);
 
   // Populate a slab as a dryrun-noop. §1c.20: dryrun must still
   // carry x_pinned_ptr + in_dim (so submit_on_stream's D2H copy
@@ -444,11 +440,12 @@ class CotsCpuInfer {
   // Upper bound on per-call num_tokens, set at install. Gates the
   // pinned-buffer bounds check in submit_on_stream + RunSlabOnWorker
   // so a misconfigured slab can't read past x_pinned / y_pinned.
-  // Stage 7-C removed the `scratch_silu_up_` worker-local scratch
-  // (MLP silu*up intermediate is now a fresh contig tensor per call,
-  // allocated by the elementwise op), so this is the only remaining
-  // "max tokens" state.
   int64_t max_num_tokens_ = 0;
+
+  // MLP gate/up/SwiGLU scratch. Accessed only on the single TaskQueue worker
+  // thread, so no locking is needed. Resized lazily to the active live-token
+  // and intermediate shape, then reused across MLP tasks.
+  std::vector<uint16_t> mlp_scratch_bf16_;
 
   // Stable userData for sync_on_stream's cudaLaunchHostFunc — must be
   // a member, NOT a stack/heap-per-call alloc. CUDA graph capture freezes
