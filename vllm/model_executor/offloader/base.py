@@ -24,7 +24,7 @@ class ForwardDispatchInfo:
 
     Single boundary between vLLM's model runner and the offloader so
     future per-forward state can land here without another vLLM-side
-    call site. Pushed by `GPUModelRunner._publish_offloader_dispatch`
+    call site. Pushed by `GPUModelRunner._publish_forward_dispatch`
     on the active runner path, and by legacy cudagraph utilities when
     they drive forwards directly.
 
@@ -246,6 +246,13 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
             cpu_offload_params=uva.cpu_offload_params,
         )
     elif backend == "cots":
+        # Phase 2-only hybrid KV uses offload_backend="cots" to select the
+        # hybrid KV runtime, but with zero weight placement there is no Phase 1
+        # weight work to install or dispatch. Keep that path as a true no-op so
+        # every forward does not pay CotsOffloader bucket bookkeeping.
+        if cots.f_cpu_store == 0.0 and cots.f_prefetch == 0.0:
+            return NoopOffloader()
+
         dispatch_table_factory = None
         if cots.dispatch_table is not None:
             configured_table = {

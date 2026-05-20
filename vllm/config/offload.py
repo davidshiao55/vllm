@@ -131,6 +131,20 @@ class CotsOffloadConfig:
     picked from the front of WQKV's output (Q first), useful only for
     controlled diagnostics."""
 
+    kv_split_blocks: int = Field(default=0, ge=0)
+    """Phase 2 hybrid-KV split point in KV-cache blocks. Blocks before this
+    point remain GPU-resident and blocks at/after this point belong to the CPU
+    suffix pool. Default 0 disables the hybrid-KV path."""
+
+    kv_cpu_pool_bytes: int = Field(default=0, ge=0)
+    """Phase 2 CPU suffix KV pool size in bytes. This is planner-owned
+    capacity, distinct from vLLM's native prefix-cache KV offload feature."""
+
+    kv_h2d_mode: Literal["uva"] = "uva"
+    """Phase 2 CPU->GPU artifact path. MVP supports only UVA so small CPU
+    attention outputs/LSE and CPU-produced prefix K/V do not use the explicit
+    weight-prefetch H2D copy path."""
+
     cpu_dtype: Literal["bfloat16"] = "bfloat16"
     """CPU weight dtype. Locked to BF16: phase0 §0.3.2 confirmed F.linear with
     BF16 weights uses oneDNN's optimized BF16 path (2x faster than FP32 at
@@ -239,6 +253,11 @@ class CotsOffloadConfig:
     remain available by disabling `auto_graph_split`.
     """
 
+    @property
+    def hybrid_kv_enabled(self) -> bool:
+        """Whether the Phase 2 hybrid CPU-suffix KV path is configured."""
+        return self.kv_split_blocks > 0 and self.kv_cpu_pool_bytes > 0
+
     @model_validator(mode="after")
     def validate_cots_config(self) -> "CotsOffloadConfig":
         """Validate COTS storage/dispatch invariants."""
@@ -322,7 +341,7 @@ class OffloadConfig:
         # Warn if both backends have non-default values
         uva_active = self.uva.cpu_offload_gb > 0
         prefetch_active = self.prefetch.offload_group_size > 0
-        cots_active = self.cots.f_cpu_store > 0
+        cots_active = self.cots.f_cpu_store > 0 or self.cots.hybrid_kv_enabled
         if self.offload_backend == "uva" and prefetch_active:
             warnings.warn(
                 "Prefetch offload fields are set but offload_backend='uva'. "
@@ -379,7 +398,7 @@ class OffloadConfig:
                 )
         elif cots_active and self.offload_backend != "cots":
             warnings.warn(
-                "cots.f_cpu_store is set but offload_backend is "
+                "COTS settings are set but offload_backend is "
                 f"'{self.offload_backend}', not 'cots'. cots settings will "
                 "be ignored. Pass --offload-backend cots to enable.",
                 stacklevel=2,

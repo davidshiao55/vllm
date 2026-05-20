@@ -353,7 +353,7 @@ class NativeCotsRunner:
         before the forward and resolved by the custom-op impl during
         capture/execution; it is not derived from `int(x.shape[0])`.
       * `live_num_tokens` — the **live rows to compute**, set OUT
-        OF GRAPH by `GPUModelRunner._publish_offloader_dispatch`
+        OF GRAPH by `GPUModelRunner._publish_forward_dispatch`
         BEFORE every scheduler, dummy/profile, warmup, and CUDA Graph
         capture forward. Always `live_num_tokens <= slab.num_tokens`. The
         worker's `at::linear` shapes, scratch slicing, and y_pinned

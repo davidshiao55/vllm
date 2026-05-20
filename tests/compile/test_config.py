@@ -13,9 +13,11 @@ from vllm.compilation.passes.utility.fix_functionalization import (
     FixFunctionalizationPass,
 )
 from vllm.config import (
+    CacheConfig,
     CompilationConfig,
     CotsOffloadConfig,
     CUDAGraphMode,
+    KVTransferConfig,
     OffloadConfig,
     ParallelConfig,
     SchedulerConfig,
@@ -305,6 +307,72 @@ def test_cots_auto_graph_split_can_be_disabled():
     assert config.offload_config.cots.cots_capture_sync_mode == "host_callback"
     for op in CompilationConfig.cots_splitting_ops():
         assert op not in config.compilation_config.splitting_ops
+
+
+def test_cots_hybrid_kv_config_is_derived_and_graph_piecewise():
+    cots = CotsOffloadConfig(kv_split_blocks=128, kv_cpu_pool_bytes=1 << 30)
+    assert cots.hybrid_kv_enabled
+
+    config = VllmConfig(
+        offload_config=OffloadConfig(offload_backend="cots", cots=cots),
+        compilation_config=CompilationConfig(cudagraph_mode=CUDAGraphMode.NONE),
+    )
+    assert config.scheduler_config.async_scheduling is False
+
+    graph_config = VllmConfig(
+        offload_config=OffloadConfig(offload_backend="cots", cots=cots),
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE,
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        ),
+    )
+    assert graph_config.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
+    assert graph_config.offload_config.cots.cots_capture_sync_mode == "host_callback"
+    for op in CompilationConfig.cots_splitting_ops():
+        assert op not in graph_config.compilation_config.splitting_ops
+
+    with pytest.raises(ValueError, match="does not support async scheduling"):
+        VllmConfig(
+            offload_config=OffloadConfig(offload_backend="cots", cots=cots),
+            scheduler_config=SchedulerConfig.default_factory(async_scheduling=True),
+            compilation_config=CompilationConfig(cudagraph_mode=CUDAGraphMode.NONE),
+        )
+
+
+def test_cots_hybrid_kv_rejects_unsupported_runtime_modes():
+    cots = CotsOffloadConfig(kv_split_blocks=128, kv_cpu_pool_bytes=1 << 30)
+    offload_config = OffloadConfig(offload_backend="cots", cots=cots)
+
+    with pytest.raises(ValueError, match="native vLLM KV offloading"):
+        VllmConfig(
+            offload_config=offload_config,
+            cache_config=CacheConfig(kv_offloading_size=1.0),
+            compilation_config=CompilationConfig(cudagraph_mode=CUDAGraphMode.NONE),
+        )
+
+    with pytest.raises(ValueError, match="KV transfer/connectors"):
+        VllmConfig(
+            offload_config=offload_config,
+            kv_transfer_config=KVTransferConfig(
+                kv_connector="ExampleConnector",
+                kv_role="kv_both",
+            ),
+            compilation_config=CompilationConfig(cudagraph_mode=CUDAGraphMode.NONE),
+        )
+
+    with pytest.raises(ValueError, match="single-GPU execution"):
+        VllmConfig(
+            offload_config=offload_config,
+            parallel_config=ParallelConfig(data_parallel_size=2),
+            compilation_config=CompilationConfig(cudagraph_mode=CUDAGraphMode.NONE),
+        )
+
+    with pytest.raises(ValueError, match="BF16 KV cache dtype"):
+        VllmConfig(
+            offload_config=offload_config,
+            cache_config=CacheConfig(cache_dtype="float16"),
+            compilation_config=CompilationConfig(cudagraph_mode=CUDAGraphMode.NONE),
+        )
 
 
 def test_moe_splitting_ops_deepep_ht_inductor_partition():

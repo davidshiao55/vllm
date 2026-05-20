@@ -1023,6 +1023,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   set(VLLM_COTS_EXT_SRC
     "csrc/cots/task_queue.cpp"
     "csrc/cots/cots_cpu_infer.cpp"
+    "csrc/cots/cots_suffix_attention_infer.cpp"
     "csrc/cots/cots_torch_bindings.cpp"
     # Stage 7 — custom BF16 GEMM kernel for the row-major-weight
     # layout (oneDNN has no AVX2 fast path for this layout; see
@@ -1039,6 +1040,9 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     "csrc/cots/bf16_gemm_natural.cpp"
     # CPU MLP block fast path: gate/up/SwiGLU into BF16 scratch, then down.
     "csrc/cots/bf16_mlp_gate_up_silu.cpp"
+    # Phase 2 CPU suffix attention prototype: Qwen2.5-7B BF16 decode
+    # attention with q_per_kv=7, output+LSE for online-softmax merge.
+    "csrc/cots/cpu_suffix_attention.cpp"
     # §1c.29 wait kernel — compiled as CUDA so nvcc handles
     # the __global__ kernel and PTX inline asm. The other
     # sources stay C++ host code; nvcc compiles them
@@ -1100,6 +1104,9 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     PROPERTIES COMPILE_FLAGS "-mavx2 -mfma -fopenmp")
   set_source_files_properties(
     "csrc/cots/bf16_mlp_gate_up_silu.cpp"
+    PROPERTIES COMPILE_FLAGS "-mavx2 -mfma -fopenmp")
+  set_source_files_properties(
+    "csrc/cots/cpu_suffix_attention.cpp"
     PROPERTIES COMPILE_FLAGS "-mavx2 -mfma -fopenmp")
 
   message(STATUS "Enabling cots_C extension.")

@@ -932,7 +932,7 @@ class CotsOffloader(BaseOffloader):
         if isinstance(self._runner, NativeCotsRunner):
             raise RuntimeError(
                 "CotsOffloader operator ran before dispatch state was "
-                "published. GPUModelRunner._publish_offloader_dispatch "
+                "published. GPUModelRunner._publish_forward_dispatch "
                 "must call CotsOffloader.on_dispatch before native COTS "
                 "operators execute or capture."
             )
@@ -1141,7 +1141,7 @@ class CotsOffloader(BaseOffloader):
         # §1c.21 review-fix: native runner is incompatible with vLLM
         # microbatching/ubatching (DBO or ubatch_size > 1). The
         # live-token cap
-        # (`GPUModelRunner._publish_offloader_dispatch` →
+        # (`GPUModelRunner._publish_forward_dispatch` →
         # `BaseOffloader.set_live_num_tokens`)
         # currently sets ONE global value per scheduler batch. Under
         # ubatching, a COTS operator runs on a per-ubatch slice but

@@ -9,7 +9,13 @@ import pytest
 import torch
 
 import vllm.v1.core.kv_cache_utils as kv_cache_utils
-from vllm.config import ModelConfig, SchedulerConfig, VllmConfig
+from vllm.config import (
+    CotsOffloadConfig,
+    ModelConfig,
+    OffloadConfig,
+    SchedulerConfig,
+    VllmConfig,
+)
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
@@ -755,6 +761,196 @@ def test_metrics_empty_stats():
     assert metrics.aggregated_query_total == 40
     assert metrics.aggregated_query_hit == 30
     assert metrics.hit_rate == 0.75
+
+
+def _make_cots_hybrid_vllm_config(
+    *,
+    max_model_len: int,
+    split_blocks: int,
+    cpu_pool_bytes: int,
+) -> VllmConfig:
+    return VllmConfig(
+        model_config=ModelConfig(max_model_len=max_model_len),
+        offload_config=OffloadConfig(
+            offload_backend="cots",
+            cots=CotsOffloadConfig(
+                kv_split_blocks=split_blocks,
+                kv_cpu_pool_bytes=cpu_pool_bytes,
+            ),
+        ),
+    )
+
+
+def test_cots_hybrid_kv_gpu_capacity_check_uses_split_prefix():
+    spec = new_kv_cache_spec(
+        block_size=4,
+        num_kv_heads=2,
+        head_size=8,
+        dtype=torch.bfloat16,
+    )
+    kv_cache_specs = [{"layer1": spec, "layer2": spec}]
+    page_size = spec.real_page_size_bytes
+    split_blocks = 2
+    max_model_len = 64
+    num_layers = 2
+    min_cpu_blocks = (
+        max_model_len - split_blocks * spec.block_size + spec.block_size - 1
+    ) // spec.block_size
+    vllm_config = _make_cots_hybrid_vllm_config(
+        max_model_len=max_model_len,
+        split_blocks=split_blocks,
+        cpu_pool_bytes=min_cpu_blocks * page_size * num_layers,
+    )
+
+    kv_cache_configs = get_kv_cache_configs(
+        vllm_config,
+        kv_cache_specs,
+        [page_size * num_layers * split_blocks],
+    )
+
+    assert kv_cache_configs[0].num_blocks == split_blocks
+
+
+def test_cots_hybrid_kv_rejects_cpu_pool_smaller_than_one_suffix():
+    spec = new_kv_cache_spec(
+        block_size=4,
+        num_kv_heads=2,
+        head_size=8,
+        dtype=torch.bfloat16,
+    )
+    kv_cache_specs = [{"layer1": spec, "layer2": spec}]
+    page_size = spec.real_page_size_bytes
+    split_blocks = 2
+    max_model_len = 64
+    num_layers = 2
+    min_cpu_blocks = (
+        max_model_len - split_blocks * spec.block_size + spec.block_size - 1
+    ) // spec.block_size
+    vllm_config = _make_cots_hybrid_vllm_config(
+        max_model_len=max_model_len,
+        split_blocks=split_blocks,
+        cpu_pool_bytes=(min_cpu_blocks - 1) * page_size * num_layers,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="must fit at least one max-length request suffix",
+    ):
+        get_kv_cache_configs(
+            vllm_config,
+            kv_cache_specs,
+            [page_size * num_layers * split_blocks],
+        )
+
+
+def test_cots_hybrid_kv_max_concurrency_is_cpu_limited():
+    spec = new_kv_cache_spec(
+        block_size=4,
+        num_kv_heads=2,
+        head_size=8,
+        dtype=torch.bfloat16,
+    )
+    kv_cache_specs = [{"layer1": spec, "layer2": spec}]
+    page_size = spec.real_page_size_bytes
+    split_blocks = 2
+    max_model_len = 64
+    num_layers = 2
+    suffix_blocks = (
+        max_model_len - split_blocks * spec.block_size + spec.block_size - 1
+    ) // spec.block_size
+    vllm_config = _make_cots_hybrid_vllm_config(
+        max_model_len=max_model_len,
+        split_blocks=split_blocks,
+        cpu_pool_bytes=suffix_blocks * page_size * num_layers,
+    )
+
+    kv_cache_config = get_kv_cache_configs(
+        vllm_config,
+        kv_cache_specs,
+        [page_size * num_layers * 20],
+    )[0]
+
+    assert get_max_concurrency_for_kv_cache_config(
+        vllm_config, kv_cache_config
+    ) == pytest.approx(1.0)
+
+
+def test_cots_hybrid_kv_max_concurrency_is_gpu_limited():
+    spec = new_kv_cache_spec(
+        block_size=4,
+        num_kv_heads=2,
+        head_size=8,
+        dtype=torch.bfloat16,
+    )
+    kv_cache_specs = [{"layer1": spec, "layer2": spec}]
+    page_size = spec.real_page_size_bytes
+    split_blocks = 2
+    max_model_len = 64
+    num_layers = 2
+    suffix_blocks = (
+        max_model_len - split_blocks * spec.block_size + spec.block_size - 1
+    ) // spec.block_size
+    vllm_config = _make_cots_hybrid_vllm_config(
+        max_model_len=max_model_len,
+        split_blocks=split_blocks,
+        cpu_pool_bytes=suffix_blocks * page_size * num_layers * 10,
+    )
+
+    kv_cache_config = get_kv_cache_configs(
+        vllm_config,
+        kv_cache_specs,
+        [page_size * num_layers * 4],
+    )[0]
+
+    assert get_max_concurrency_for_kv_cache_config(
+        vllm_config, kv_cache_config
+    ) == pytest.approx(2.0)
+
+
+def test_cots_hybrid_kv_rejects_unsupported_kv_specs_with_startup_diagnostic():
+    full_spec = new_kv_cache_spec(
+        block_size=4,
+        num_kv_heads=2,
+        head_size=8,
+        dtype=torch.bfloat16,
+    )
+    sliding_spec = new_kv_cache_spec(
+        block_size=4,
+        num_kv_heads=2,
+        head_size=8,
+        dtype=torch.bfloat16,
+        sliding_window=1,
+    )
+    page_size = full_spec.real_page_size_bytes
+    vllm_config = _make_cots_hybrid_vllm_config(
+        max_model_len=64,
+        split_blocks=2,
+        cpu_pool_bytes=page_size * 16,
+    )
+
+    with pytest.raises(ValueError, match="does not support sliding-window"):
+        get_kv_cache_configs(
+            vllm_config,
+            [{"layer1": full_spec, "layer2": sliding_spec}],
+            [page_size * 4],
+        )
+
+    with pytest.raises(ValueError, match="requires uniform attention KV specs"):
+        get_kv_cache_configs(
+            vllm_config,
+            [
+                {
+                    "layer1": full_spec,
+                    "layer2": new_kv_cache_spec(
+                        block_size=4,
+                        num_kv_heads=2,
+                        head_size=16,
+                        dtype=torch.bfloat16,
+                    ),
+                }
+            ],
+            [page_size * 4],
+        )
 
 
 def test_get_kv_cache_configs_multiple_workers():

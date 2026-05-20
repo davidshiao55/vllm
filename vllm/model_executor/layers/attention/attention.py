@@ -458,7 +458,7 @@ class Attention(nn.Module, AttentionLayerBase):
                     and value is not None
                 ):
                     kv_cache_dummy_dep = unified_kv_cache_update(
-                        key, value, self.layer_name
+                        key, value, self.layer_name, query=query
                     )
                 unified_attention_with_output(
                     query,
@@ -477,7 +477,7 @@ class Attention(nn.Module, AttentionLayerBase):
                     and value is not None
                 ):
                     kv_cache_dummy_dep = torch.ops.vllm.unified_kv_cache_update(
-                        key, value, self.layer_name
+                        key, value, self.layer_name, query=query
                     )
                 torch.ops.vllm.unified_attention_with_output(
                     query,
@@ -659,16 +659,44 @@ direct_register_custom_op(
 )
 
 
+def stage_cots_hybrid_query(
+    query: torch.Tensor,
+    layer_name: str,
+    key: torch.Tensor | None = None,
+    value: torch.Tensor | None = None,
+) -> None:
+    attn_metadata, _, _, _ = get_attention_context(layer_name)
+    hybrid_metadata = getattr(attn_metadata, "cots_hybrid_decode", None)
+    if hybrid_metadata is None:
+        return
+    from vllm.v1.attention.backends.cots_hybrid_attention import (
+        cots_hybrid_stage_query,
+    )
+
+    cots_hybrid_stage_query(query, hybrid_metadata, key=key, value=value)
+
+
 def unified_kv_cache_update(
     key: torch.Tensor,
     value: torch.Tensor,
     layer_name: str,
+    query: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Returns a dummy that is passed to unified_attention to signal a side effect and
     the data dependency between them to ensure torch.compile preserves ordering.
     """
-    _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
+    attn_metadata, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(
+        layer_name
+    )
+    hybrid_metadata = getattr(attn_metadata, "cots_hybrid_decode", None)
+    if hybrid_metadata is not None and query is not None:
+        from vllm.v1.attention.backends.cots_hybrid_attention import (
+            cots_hybrid_stage_query,
+        )
+
+        cots_hybrid_stage_query(query, hybrid_metadata, key=key, value=value)
+
     if layer_slot_mapping is not None:
         assert hasattr(attn_layer.impl, "do_kv_cache_update"), (
             f"{attn_layer.impl.__class__.__name__} does not support kv cache update"
@@ -680,6 +708,12 @@ def unified_kv_cache_update(
             kv_cache,
             layer_slot_mapping,
         )
+        if hybrid_metadata is not None:
+            from vllm.v1.attention.backends.cots_hybrid_attention import (
+                cots_hybrid_kv_cache_update,
+            )
+
+            cots_hybrid_kv_cache_update(key, value, hybrid_metadata)
 
     return torch.empty(0, device=kv_cache.device, dtype=kv_cache.dtype)
 
@@ -688,6 +722,7 @@ def unified_kv_cache_update_fake(
     key: torch.Tensor,
     value: torch.Tensor,
     layer_name: str,
+    query: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty(0, device=key.device, dtype=key.dtype)
 

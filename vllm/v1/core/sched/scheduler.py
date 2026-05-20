@@ -54,7 +54,11 @@ from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
-from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
+from vllm.v1.metrics.stats import (
+    CotsHybridKVStats,
+    PrefixCacheStats,
+    SchedulerStats,
+)
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
@@ -233,6 +237,16 @@ class Scheduler(SchedulerInterface):
             pcp_world_size=self.pcp_world_size,
             hash_block_size=self.block_size,
             metrics_collector=self.kv_metrics_collector,
+            cots_kv_split_blocks=(
+                vllm_config.offload_config.cots.kv_split_blocks
+                if vllm_config.offload_config.offload_backend == "cots"
+                else 0
+            ),
+            cots_kv_cpu_pool_bytes=(
+                vllm_config.offload_config.cots.kv_cpu_pool_bytes
+                if vllm_config.offload_config.offload_backend == "cots"
+                else 0
+            ),
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -880,6 +894,9 @@ class Scheduler(SchedulerInterface):
                 NewRequestData.from_request(
                     req,
                     req_to_new_blocks[req.request_id].get_block_ids(),
+                    req_to_new_blocks[req.request_id].get_cpu_block_ids(
+                        allow_none=True
+                    ),
                     req._all_token_ids,
                 )
                 for req in scheduled_new_reqs
@@ -887,7 +904,11 @@ class Scheduler(SchedulerInterface):
         else:
             new_reqs_data = [
                 NewRequestData.from_request(
-                    req, req_to_new_blocks[req.request_id].get_block_ids()
+                    req,
+                    req_to_new_blocks[req.request_id].get_block_ids(),
+                    req_to_new_blocks[req.request_id].get_cpu_block_ids(
+                        allow_none=True
+                    ),
                 )
                 for req in scheduled_new_reqs
             ]
@@ -962,6 +983,7 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+        self.kv_cache_manager.record_cots_hybrid_preemption(request)
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
@@ -1063,6 +1085,7 @@ class Scheduler(SchedulerInterface):
         req_ids: list[str] = []
         new_token_ids: list[list[int]] = []
         new_block_ids: list[tuple[list[int], ...] | None] = []
+        new_cpu_block_ids: list[tuple[list[int], ...] | None] = []
         all_token_ids: dict[str, list[int]] = {}
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
@@ -1094,9 +1117,9 @@ class Scheduler(SchedulerInterface):
                 resumed_req_ids.add(req_id)
             if not scheduled_in_prev_step:
                 all_token_ids[req_id] = req.all_token_ids.copy()
-            new_block_ids.append(
-                req_to_new_blocks[req_id].get_block_ids(allow_none=True)
-            )
+            new_blocks = req_to_new_blocks[req_id]
+            new_block_ids.append(new_blocks.get_block_ids(allow_none=True))
+            new_cpu_block_ids.append(new_blocks.get_cpu_block_ids(allow_none=True))
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders
@@ -1108,6 +1131,7 @@ class Scheduler(SchedulerInterface):
             new_token_ids=new_token_ids,
             all_token_ids=all_token_ids,
             new_block_ids=new_block_ids,
+            new_cpu_block_ids=new_cpu_block_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
         )
@@ -1312,6 +1336,7 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        cots_hybrid_kv_stats = model_runner_output.cots_hybrid_kv_stats
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -1543,7 +1568,11 @@ class Scheduler(SchedulerInterface):
 
         if (
             stats := self.make_stats(
-                spec_decoding_stats, kv_connector_stats, cudagraph_stats, perf_stats
+                spec_decoding_stats,
+                kv_connector_stats,
+                cudagraph_stats,
+                perf_stats,
+                cots_hybrid_kv_stats,
             )
         ) is not None:
             # Return stats to only one of the front-ends.
@@ -1934,6 +1963,7 @@ class Scheduler(SchedulerInterface):
         kv_connector_stats: KVConnectorStats | None = None,
         cudagraph_stats: CUDAGraphStat | None = None,
         perf_stats: PerfStats | None = None,
+        cots_hybrid_kv_stats: CotsHybridKVStats | None = None,
     ) -> SchedulerStats | None:
         if not self.log_stats:
             return None
@@ -1964,6 +1994,9 @@ class Scheduler(SchedulerInterface):
             kv_connector_stats=connector_stats_payload,
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
+            cots_hybrid_kv_stats=self.kv_cache_manager.make_cots_hybrid_kv_stats(
+                cots_hybrid_kv_stats
+            ),
         )
 
     def _get_encoder_cache_usage(self) -> float:

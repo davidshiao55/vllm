@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -37,6 +37,7 @@ class NewRequestData:
     block_ids: tuple[list[int], ...]
     num_computed_tokens: int
     lora_request: LoRARequest | None
+    cpu_block_ids: tuple[list[int], ...] | None = None
     prompt_embeds: "torch.Tensor | None" = None
 
     # Only used for v2 model runner.
@@ -47,6 +48,7 @@ class NewRequestData:
         cls,
         request: Request,
         block_ids: tuple[list[int], ...],
+        cpu_block_ids: tuple[list[int], ...] | None = None,
         prefill_token_ids: list[int] | None = None,
     ) -> "NewRequestData":
         return cls(
@@ -56,6 +58,7 @@ class NewRequestData:
             sampling_params=request.sampling_params,
             pooling_params=request.pooling_params,
             block_ids=block_ids,
+            cpu_block_ids=cpu_block_ids,
             num_computed_tokens=request.num_computed_tokens,
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
@@ -74,6 +77,7 @@ class NewRequestData:
             f"mm_features={self.mm_features},"
             f"sampling_params={self.sampling_params},"
             f"block_ids={self.block_ids},"
+            f"cpu_block_ids={self.cpu_block_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
             f"lora_request={self.lora_request},"
             f"prompt_embeds_shape={prompt_embeds_shape}"
@@ -99,6 +103,7 @@ class NewRequestData:
             f"mm_features={self.mm_features},"
             f"sampling_params={self.sampling_params},"
             f"block_ids={self.block_ids},"
+            f"cpu_block_ids={self.cpu_block_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
             f"lora_request={self.lora_request},"
             f"prompt_embeds_shape={prompt_embeds_shape}"
@@ -122,6 +127,7 @@ class CachedRequestData:
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
+    new_cpu_block_ids: list[tuple[list[int], ...] | None] = field(default_factory=list)
 
     # Version of dataclass repr with token IDs obfuscated.
     def anon_repr(self) -> str:
@@ -136,6 +142,7 @@ class CachedRequestData:
             f"new_token_ids_lens={new_token_ids_lens},"
             f"all_token_ids_lens={all_token_ids_lens},"
             f"new_block_ids={self.new_block_ids},"
+            f"new_cpu_block_ids={self.new_cpu_block_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
             f"num_output_tokens={self.num_output_tokens}"
             f")"
@@ -170,6 +177,7 @@ class CachedRequestData:
             new_token_ids=[],
             all_token_ids={},
             new_block_ids=[],
+            new_cpu_block_ids=[],
             num_computed_tokens=[],
             num_output_tokens=[],
         )

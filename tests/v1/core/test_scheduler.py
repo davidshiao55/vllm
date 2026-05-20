@@ -8,9 +8,11 @@ import torch
 
 from vllm.config import (
     CacheConfig,
+    CotsOffloadConfig,
     ECTransferConfig,
     KVTransferConfig,
     ModelConfig,
+    OffloadConfig,
     SchedulerConfig,
     SpeculativeConfig,
     VllmConfig,
@@ -653,6 +655,59 @@ def test_schedule_concurrent_batches(
         pooler_output=[],
     )
     scheduler.update_from_output(scheduler_output1, model_runner_output)
+
+
+def test_cots_hybrid_suffix_decode_can_mix_waiting_prefill():
+    scheduler = create_scheduler(
+        max_num_batched_tokens=16,
+        max_num_seqs=4,
+        block_size=4,
+        max_model_len=16,
+        enforce_eager=True,
+        offload_config=OffloadConfig(
+            offload_backend="cots",
+            cots=CotsOffloadConfig(
+                kv_split_blocks=1,
+                # create_scheduler's model fixture resolves max_model_len to
+                # 2048, so the CPU pool must fit one full suffix beyond the
+                # one-block GPU prefix: (2048 / 4 - 1) * 32 bytes.
+                kv_cpu_pool_bytes=16352,
+            ),
+        ),
+    )
+    running_req, waiting_req = create_requests(
+        num_requests=2,
+        num_tokens=4,
+        max_tokens=2,
+    )
+
+    scheduler.add_request(running_req)
+    prefill_output = scheduler.schedule()
+    assert prefill_output.num_scheduled_tokens[running_req.request_id] == 4
+
+    scheduler.update_from_output(
+        prefill_output,
+        ModelRunnerOutput(
+            req_ids=[running_req.request_id],
+            req_id_to_index={running_req.request_id: 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    assert running_req.num_computed_tokens == 4
+
+    scheduler.add_request(waiting_req)
+    decode_output = scheduler.schedule()
+
+    assert [req.req_id for req in decode_output.scheduled_new_reqs] == [
+        waiting_req.request_id
+    ]
+    assert decode_output.scheduled_cached_reqs.req_ids == [running_req.request_id]
+    assert decode_output.num_scheduled_tokens[running_req.request_id] == 1
+    assert decode_output.num_scheduled_tokens[waiting_req.request_id] == 4
+    assert len(scheduler.waiting) == 0
 
 
 @pytest.mark.parametrize("enable_chunked_prefill", [True, False])

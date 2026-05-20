@@ -474,6 +474,9 @@ class EngineArgs:
         CotsOffloadConfig.dispatch_table
     )
     cots_kv_biased: bool = CotsOffloadConfig.kv_biased
+    cots_kv_split_blocks: int = CotsOffloadConfig.kv_split_blocks
+    cots_kv_cpu_pool_bytes: int = CotsOffloadConfig.kv_cpu_pool_bytes
+    cots_kv_h2d_mode: Literal["uva"] = CotsOffloadConfig.kv_h2d_mode
     cots_cpu_num_threads: int = CotsOffloadConfig.cpu_num_threads
     cots_cpu_num_threads_by_bucket: dict[int, int] | None = (
         CotsOffloadConfig.cpu_num_threads_by_bucket
@@ -1089,6 +1092,13 @@ class EngineArgs:
             "--cots-dispatch-table", **cots_kwargs["dispatch_table"]
         )
         offload_group.add_argument("--cots-kv-biased", **cots_kwargs["kv_biased"])
+        offload_group.add_argument(
+            "--cots-kv-split-blocks", **cots_kwargs["kv_split_blocks"]
+        )
+        offload_group.add_argument(
+            "--cots-kv-cpu-pool-bytes", **cots_kwargs["kv_cpu_pool_bytes"]
+        )
+        offload_group.add_argument("--cots-kv-h2d-mode", **cots_kwargs["kv_h2d_mode"])
         offload_group.add_argument(
             "--cots-cpu-num-threads", **cots_kwargs["cpu_num_threads"]
         )
@@ -2015,6 +2025,9 @@ class EngineArgs:
             f_prefetch=self.cots_f_prefetch,
             dispatch_table=self.cots_dispatch_table,
             kv_biased=self.cots_kv_biased,
+            kv_split_blocks=self.cots_kv_split_blocks,
+            kv_cpu_pool_bytes=self.cots_kv_cpu_pool_bytes,
+            kv_h2d_mode=self.cots_kv_h2d_mode,
             cpu_num_threads=self.cots_cpu_num_threads,
             cpu_num_threads_by_bucket=self.cots_cpu_num_threads_by_bucket,
             cpu_runner=self.cots_cpu_runner,

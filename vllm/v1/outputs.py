@@ -11,6 +11,7 @@ import torch
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.metrics.stats import CotsHybridKVStats
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVConnectorKVEvents
@@ -252,6 +253,9 @@ class ModelRunnerOutput:
 
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
+
+    # Phase 2 COTS hybrid KV worker-side metrics.
+    cots_hybrid_kv_stats: CotsHybridKVStats | None = None
 
 
 # ModelRunnerOutput wrapper for async scheduling.

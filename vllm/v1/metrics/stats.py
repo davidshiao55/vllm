@@ -168,6 +168,97 @@ class KVCacheEvictionEvent:
 
 
 @dataclass
+class CotsHybridKVStats:
+    """Phase 2 COTS hybrid KV metrics for one scheduler/model step."""
+
+    hybrid_gpu_kv_blocks_used: int = 0
+    hybrid_cpu_kv_blocks_used: int = 0
+    hybrid_cpu_kv_blocks_total: int = 0
+    hybrid_preemptions: int = 0
+    hybrid_recomputed_cpu_suffix_tokens: int = 0
+    hybrid_decode_calls: int = 0
+    cpu_suffix_attn_ms: float = 0.0
+    cpu_suffix_wait_ms: float = 0.0
+    qkv_ready_wait_ms: float = 0.0
+    kv_ready_wait_ms: float = 0.0
+    cpu_suffix_read_wait_ms: float = 0.0
+    q_d2h_copy_ms: float = 0.0
+    cpu_suffix_scatter_ms: float = 0.0
+    hybrid_merge_ms: float = 0.0
+    gpu_prefix_attn_ms: float = 0.0
+    hybrid_overlap_ratio: float = 0.0
+    q_d2h_bytes: int = 0
+    kv_d2h_bytes: int = 0
+    kv_uva_h2d_bytes: int = 0
+    suffix_worker_busy_ms: float = 0.0
+    suffix_worker_queue_wait_ms: float = 0.0
+    suffix_wait_kernel_launches: int = 0
+    suffix_wait_kernel_immediate: int = 0
+    suffix_wait_kernel_lagging: int = 0
+    suffix_wait_kernel_spin_iters: int = 0
+    suffix_worker_capacity_rows: int = 0
+    suffix_worker_live_rows: int = 0
+    suffix_worker_padded_rows: int = 0
+    suffix_worker_scatter_rows: int = 0
+    suffix_worker_zero_live_count: int = 0
+
+    def merge_worker_stats(self, worker_stats: "CotsHybridKVStats") -> None:
+        self.cpu_suffix_attn_ms += worker_stats.cpu_suffix_attn_ms
+        self.cpu_suffix_wait_ms += worker_stats.cpu_suffix_wait_ms
+        self.qkv_ready_wait_ms += worker_stats.qkv_ready_wait_ms
+        self.kv_ready_wait_ms += worker_stats.kv_ready_wait_ms
+        self.cpu_suffix_read_wait_ms += worker_stats.cpu_suffix_read_wait_ms
+        self.q_d2h_copy_ms += worker_stats.q_d2h_copy_ms
+        self.cpu_suffix_scatter_ms += worker_stats.cpu_suffix_scatter_ms
+        self.hybrid_merge_ms += worker_stats.hybrid_merge_ms
+        self.gpu_prefix_attn_ms += worker_stats.gpu_prefix_attn_ms
+        self.hybrid_decode_calls += worker_stats.hybrid_decode_calls
+        self.q_d2h_bytes += worker_stats.q_d2h_bytes
+        self.kv_d2h_bytes += worker_stats.kv_d2h_bytes
+        self.kv_uva_h2d_bytes += worker_stats.kv_uva_h2d_bytes
+        self.suffix_worker_busy_ms += worker_stats.suffix_worker_busy_ms
+        self.suffix_worker_queue_wait_ms += worker_stats.suffix_worker_queue_wait_ms
+        self.suffix_wait_kernel_launches += worker_stats.suffix_wait_kernel_launches
+        self.suffix_wait_kernel_immediate += worker_stats.suffix_wait_kernel_immediate
+        self.suffix_wait_kernel_lagging += worker_stats.suffix_wait_kernel_lagging
+        self.suffix_wait_kernel_spin_iters += worker_stats.suffix_wait_kernel_spin_iters
+        self.suffix_worker_capacity_rows += worker_stats.suffix_worker_capacity_rows
+        self.suffix_worker_live_rows += worker_stats.suffix_worker_live_rows
+        self.suffix_worker_padded_rows += worker_stats.suffix_worker_padded_rows
+        self.suffix_worker_scatter_rows += worker_stats.suffix_worker_scatter_rows
+        self.suffix_worker_zero_live_count += worker_stats.suffix_worker_zero_live_count
+
+        total_ms = self.cpu_suffix_attn_ms + self.gpu_prefix_attn_ms
+        if total_ms > 0:
+            self.hybrid_overlap_ratio = (
+                min(self.cpu_suffix_attn_ms, self.gpu_prefix_attn_ms) / total_ms
+            )
+
+    def has_worker_activity(self) -> bool:
+        return bool(
+            self.cpu_suffix_attn_ms
+            or self.cpu_suffix_wait_ms
+            or self.qkv_ready_wait_ms
+            or self.kv_ready_wait_ms
+            or self.cpu_suffix_read_wait_ms
+            or self.q_d2h_copy_ms
+            or self.cpu_suffix_scatter_ms
+            or self.hybrid_merge_ms
+            or self.gpu_prefix_attn_ms
+            or self.hybrid_decode_calls
+            or self.q_d2h_bytes
+            or self.kv_d2h_bytes
+            or self.kv_uva_h2d_bytes
+            or self.suffix_worker_busy_ms
+            or self.suffix_worker_queue_wait_ms
+            or self.suffix_wait_kernel_launches
+            or self.suffix_worker_capacity_rows
+            or self.suffix_worker_live_rows
+            or self.suffix_worker_padded_rows
+        )
+
+
+@dataclass
 class SchedulerStats:
     """Stats associated with the scheduler."""
 
@@ -195,6 +286,8 @@ class SchedulerStats:
     cudagraph_stats: CUDAGraphStat | None = None
 
     perf_stats: PerfStats | None = None
+
+    cots_hybrid_kv_stats: CotsHybridKVStats | None = None
 
 
 @dataclass
