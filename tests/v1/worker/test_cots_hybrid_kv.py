@@ -31,6 +31,7 @@ def _make_store(num_layers: int = 2, max_num_reqs: int = 4) -> CotsHybridKVStore
         max_num_reqs=max_num_reqs,
         max_model_len=32,
         pin_memory=False,
+        num_query_heads=4,
     )
 
 
@@ -235,7 +236,7 @@ def test_cots_hybrid_store_overflow_prefill_clears_live_count_override() -> None
 
 
 def test_cots_hybrid_store_splits_chunks_that_cross_split() -> None:
-    store = _make_store(num_layers=1)
+    store = _make_store(num_layers=2)
 
     metadata = store.build_decode_metadata(
         layer_name="layer.0.attn",
@@ -247,6 +248,7 @@ def test_cots_hybrid_store_splits_chunks_that_cross_split() -> None:
         num_actual_tokens=4,
         cpu_block_ids_by_req=_cpu_block_ids([5]),
         req_indices_cpu=[0, 0, 0, 0],
+        req_indices_gpu=torch.tensor([0, 0, 0, 0], dtype=torch.long),
         positions_cpu=[6, 7, 8, 9],
     )
 
@@ -254,12 +256,19 @@ def test_cots_hybrid_store_splits_chunks_that_cross_split() -> None:
     assert metadata.cpu_seq_lens.tolist() == [1, 2]
     assert metadata.scatter_source_indices is not None
     assert metadata.scatter_source_indices.tolist() == [2, 3]
+    assert metadata.scatter_source_indices_gpu is not None
+    assert metadata.scatter_source_indices_gpu.tolist() == [2, 3]
     assert metadata.prefix_source_indices is not None
     assert metadata.prefix_source_indices.tolist() == [0, 1]
     assert metadata.prefix_seq_lens_cpu is not None
     assert metadata.prefix_seq_lens_cpu.tolist() == [7, 8]
     assert metadata.scatter_block_offsets is not None
     assert metadata.scatter_block_offsets.tolist() == [0, 1]
+
+    metadata_l1 = store.build_decode_metadata_from_common(
+        layer_name="layer.1.attn", common_metadata=metadata
+    )
+    assert metadata_l1.scatter_source_indices_gpu is metadata.scatter_source_indices_gpu
 
 
 def test_cots_hybrid_store_free_request_clears_cached_metadata() -> None:

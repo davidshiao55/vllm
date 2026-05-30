@@ -88,6 +88,7 @@ class CPUKVBlockPool:
         self._cached: list[OrderedDict[BlockHash, list[CPUKVCacheBlock]]] = [
             OrderedDict() for _ in num_blocks_per_group
         ]
+        self._evictable_cached_counts = [0 for _ in num_blocks_per_group]
         self._total = sum(num_blocks_per_group)
 
     @property
@@ -159,6 +160,8 @@ class CPUKVBlockPool:
             for block in group:
                 if block.block_hash is None:
                     raise RuntimeError(f"CPU KV block {block.block_id} is not cached")
+                if block.ref_cnt == 0:
+                    self._evictable_cached_counts[group_idx] -= 1
                 block.ref_cnt += 1
                 self._touch_cached_block(group_idx, block)
         self._req_to_blocks[request_id] = computed_blocks
@@ -269,6 +272,7 @@ class CPUKVBlockPool:
                     if block.block_hash is None:
                         self._free[group_idx].append(block)
                     else:
+                        self._evictable_cached_counts[group_idx] += 1
                         self._touch_cached_block(group_idx, block)
 
     def can_reset_prefix_cache(self) -> bool:
@@ -280,6 +284,7 @@ class CPUKVBlockPool:
         self._req_to_blocks.clear()
         for group_idx, group in enumerate(self._blocks):
             self._cached[group_idx].clear()
+            self._evictable_cached_counts[group_idx] = 0
             self._free[group_idx] = list(group)
             for block in group:
                 block.block_hash = None
@@ -310,15 +315,16 @@ class CPUKVBlockPool:
         return tuple(out)
 
     def _available_for_allocation(self, group_idx: int, protected_ids: set[int]) -> int:
-        available = len(self._free[group_idx])
-        seen: set[int] = set()
-        for blocks in self._cached[group_idx].values():
-            for block in blocks:
-                if block.block_id in seen:
-                    continue
-                seen.add(block.block_id)
-                if block.ref_cnt == 0 and block.block_id not in protected_ids:
-                    available += 1
+        available = (
+            len(self._free[group_idx]) + self._evictable_cached_counts[group_idx]
+        )
+        group = self._blocks[group_idx]
+        for block_id in protected_ids:
+            if block_id < 0 or block_id >= len(group):
+                continue
+            block = group[block_id]
+            if block.ref_cnt == 0 and block.block_hash is not None:
+                available -= 1
         return available
 
     def _ensure_free_blocks(
@@ -339,6 +345,7 @@ class CPUKVBlockPool:
                 if not blocks:
                     del cached[block_hash]
                 block.block_hash = None
+                self._evictable_cached_counts[group_idx] -= 1
                 self._free[group_idx].append(block)
                 return True
             if not blocks and block_hash in cached:

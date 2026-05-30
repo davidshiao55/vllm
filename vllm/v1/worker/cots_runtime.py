@@ -36,6 +36,7 @@ class CotsRuntime:
         batch_descriptor: BatchDescriptor,
         num_tokens_unpadded: int,
         positions_cpu: Sequence[int] | None = None,
+        positions_have_suffix: bool | None = None,
     ) -> ForwardDispatchInfo:
         """Publish all COTS per-forward OOG state.
 
@@ -51,6 +52,13 @@ class CotsRuntime:
         )
         get_offloader().on_dispatch(dispatch_info)
         if self.hybrid_kv is not None:
+            has_suffix = positions_have_suffix
+            if has_suffix is None and positions_cpu is not None:
+                has_suffix = self.hybrid_kv.positions_have_suffix(
+                    positions_cpu, num_tokens_unpadded
+                )
+            if has_suffix is False and self.hybrid_kv.live_counts_are_zero():
+                return dispatch_info
             self.hybrid_kv.on_dispatch(
                 dispatch_info,
                 positions_cpu=positions_cpu,

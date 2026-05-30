@@ -14,6 +14,7 @@
 #include <functional>
 #include <mutex>
 #include <thread>
+#include <utility>
 
 namespace vllm {
 namespace cots {
@@ -46,7 +47,8 @@ class TaskQueue {
     std::function<void()> task;
     std::atomic<Node*> next;
     Node() : task(nullptr), next(nullptr) {}
-    explicit Node(const std::function<void()>& t) : task(t), next(nullptr) {}
+    explicit Node(std::function<void()> t)
+        : task(std::move(t)), next(nullptr) {}
   };
 
   std::atomic<Node*> head_;

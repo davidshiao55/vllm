@@ -20,7 +20,7 @@ from typing import Protocol
 
 import torch
 
-from vllm._custom_ops import cots_qwen_bf16_scatter_suffix_kv
+from vllm._custom_ops import cots_gqa_bf16_scatter_suffix_kv
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
@@ -39,6 +39,12 @@ def _make_cuda_timing_events() -> tuple[torch.cuda.Event, torch.cuda.Event]:
         torch.cuda.Event(enable_timing=True),
         torch.cuda.Event(enable_timing=True),
     )
+
+
+def _early_suffix_submit_enabled() -> bool:
+    return os.environ.get(
+        "VLLM_COTS_HYBRID_EARLY_SUFFIX_SUBMIT", "1"
+    ).strip().lower() not in ("0", "false", "off")
 
 
 @dataclass
@@ -85,6 +91,7 @@ class CotsHybridDecodeMetadata:
     scatter_block_offsets: torch.Tensor | None = None
     req_indices_gpu: torch.Tensor | None = None
     scatter_source_indices: torch.Tensor | None = None
+    scatter_source_indices_gpu: torch.Tensor | None = None
     prefix_source_indices: torch.Tensor | None = None
     prefix_req_indices_gpu: torch.Tensor | None = None
     prefix_seq_lens_cpu: torch.Tensor | None = None
@@ -109,7 +116,7 @@ class CotsSuffixAttentionRunner(Protocol):
 
     def reset_counters(self) -> None: ...
 
-    def run_qwen_bf16_suffix_attention(
+    def run_gqa_bf16_suffix_attention(
         self,
         *,
         query: torch.Tensor,
@@ -132,7 +139,28 @@ class CotsSuffixAttentionRunner(Protocol):
         submit_stream: torch.cuda.Stream | None = None,
         submit_ready_event: torch.cuda.Event | None = None,
         submit_done_event: torch.cuda.Event | None = None,
+        sync_after_submit: bool = True,
     ) -> None: ...
+
+    def sync_gqa_bf16_suffix_attention(
+        self,
+        *,
+        cuda_anchor: torch.Tensor,
+        task_id: int = 0,
+    ) -> None: ...
+
+
+def _source_indices_for_device(
+    hybrid_metadata: CotsHybridDecodeMetadata,
+    device: torch.device,
+) -> torch.Tensor | None:
+    source_indices = hybrid_metadata.scatter_source_indices
+    if source_indices is None:
+        return None
+    cached = hybrid_metadata.scatter_source_indices_gpu
+    if cached is not None and cached.device == device:
+        return cached
+    return source_indices.to(device=device, non_blocking=True)
 
 
 class CotsPreparedNativeSuffixAttentionRunner:
@@ -188,7 +216,7 @@ class CotsPreparedNativeSuffixAttentionRunner:
             self._runner_id, int(num_tokens), int(scatter_count)
         )
 
-    def run_qwen_bf16_suffix_attention(
+    def run_gqa_bf16_suffix_attention(
         self,
         *,
         query: torch.Tensor,
@@ -211,6 +239,7 @@ class CotsPreparedNativeSuffixAttentionRunner:
         submit_stream: torch.cuda.Stream | None = None,
         submit_ready_event: torch.cuda.Event | None = None,
         submit_done_event: torch.cuda.Event | None = None,
+        sync_after_submit: bool = True,
     ) -> None:
         if cuda_anchor is None:
             raise RuntimeError(
@@ -220,10 +249,19 @@ class CotsPreparedNativeSuffixAttentionRunner:
             raise RuntimeError("prepared suffix query must be a CPU tensor")
         if query.dtype != torch.bfloat16:
             raise RuntimeError(f"prepared suffix query must be BF16, got {query.dtype}")
-        if query.dim() != 3 or query.shape[1:] != (28, 128):
+        if query.dim() != 3:
             raise RuntimeError(
-                "prepared suffix query must have shape [B, 28, 128], got "
+                "prepared suffix query must have shape [B, H, D], got "
                 f"{tuple(query.shape)}"
+            )
+        num_q_heads = int(query.shape[1])
+        head_dim = int(query.shape[2])
+        if num_q_heads <= 0:
+            raise RuntimeError("prepared suffix query must have at least one head")
+        if head_dim != 128:
+            raise RuntimeError(
+                "prepared suffix attention currently supports head_dim=128, "
+                f"got {head_dim}"
             )
         if query.stride(-1) != 1:
             raise RuntimeError("prepared suffix query head_dim stride must be 1")
@@ -231,19 +269,41 @@ class CotsPreparedNativeSuffixAttentionRunner:
             raise RuntimeError("prepared suffix KV caches must be CPU tensors")
         if key_cache.shape != value_cache.shape:
             raise RuntimeError("prepared suffix key/value cache shapes must match")
-        if key_cache.dim() != 4 or key_cache.shape[1] != 4 or key_cache.shape[3] != 128:
+        if key_cache.dim() != 4:
             raise RuntimeError(
                 "prepared suffix KV cache must have shape "
-                f"[blocks, 4, block_size, 128], got {tuple(key_cache.shape)}"
+                "[blocks, num_kv_heads, block_size, 128], got "
+                f"{tuple(key_cache.shape)}"
+            )
+        num_kv_heads = int(key_cache.shape[1])
+        cache_head_dim = int(key_cache.shape[3])
+        if num_kv_heads <= 0:
+            raise RuntimeError("prepared suffix KV cache must have at least one head")
+        if cache_head_dim != head_dim:
+            raise RuntimeError(
+                "prepared suffix KV cache head_dim must match query, got "
+                f"{cache_head_dim} vs {head_dim}"
+            )
+        if num_q_heads % num_kv_heads != 0:
+            raise RuntimeError(
+                "prepared suffix attention requires num_q_heads divisible by "
+                f"num_kv_heads, got {num_q_heads} and {num_kv_heads}"
+            )
+        heads_per_kv = num_q_heads // num_kv_heads
+        if heads_per_kv > 8:
+            raise RuntimeError(
+                "prepared suffix attention supports at most 8 query heads per "
+                f"KV head, got {heads_per_kv}"
             )
         if output.shape != query.shape or output.dtype != torch.bfloat16:
             raise RuntimeError("prepared suffix output must match BF16 query shape")
         if (
-            output_lse.shape != (28, query.shape[0])
+            output_lse.shape != (num_q_heads, query.shape[0])
             or output_lse.dtype != torch.float32
         ):
             raise RuntimeError(
-                "prepared suffix output_lse must have shape [28, B] and FP32 dtype"
+                "prepared suffix output_lse must have shape [num_q_heads, B] "
+                "and FP32 dtype"
             )
         if not block_table.is_contiguous() or not seq_lens.is_contiguous():
             raise RuntimeError(
@@ -292,9 +352,13 @@ class CotsPreparedNativeSuffixAttentionRunner:
             scatter_block_offsets_ptr = int(scatter_block_offsets.data_ptr())
 
         if scatter_from_qkv:
-            if query.stride(1) != 128 or query.stride(0) < 36 * 128:
+            combined_heads = num_q_heads + 2 * num_kv_heads
+            if (
+                query.stride(1) != head_dim
+                or query.stride(0) < combined_heads * head_dim
+            ):
                 raise RuntimeError(
-                    "prepared suffix QKV scatter requires a [B, 36, 128] "
+                    "prepared suffix QKV scatter requires a [B, Q+2KV, D] "
                     "staging layout with Q as the leading view"
                 )
         elif scatter_from_separate_kv:
@@ -316,14 +380,15 @@ class CotsPreparedNativeSuffixAttentionRunner:
                 raise RuntimeError(
                     "prepared suffix separate K/V scatter buffers must be BF16"
                 )
-            if scatter_key_cpu.shape != (
-                query.shape[0],
-                4,
-                128,
-            ) or scatter_value_cpu.shape != (query.shape[0], 4, 128):
+            expected_kv_shape = (query.shape[0], num_kv_heads, head_dim)
+            if (
+                scatter_key_cpu.shape != expected_kv_shape
+                or scatter_value_cpu.shape != expected_kv_shape
+            ):
                 raise RuntimeError(
                     "prepared suffix separate K/V scatter buffers must have shape "
-                    f"[B, 4, 128], got {tuple(scatter_key_cpu.shape)} and "
+                    f"[B, {num_kv_heads}, {head_dim}], got "
+                    f"{tuple(scatter_key_cpu.shape)} and "
                     f"{tuple(scatter_value_cpu.shape)}"
                 )
             if (
@@ -343,6 +408,9 @@ class CotsPreparedNativeSuffixAttentionRunner:
             int(task_id),
             int(query.data_ptr()),
             int(query.shape[0]),
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
             int(query.stride(0)),
             int(query.stride(1)),
             int(query.stride(2)),
@@ -375,11 +443,26 @@ class CotsPreparedNativeSuffixAttentionRunner:
                     cuda_anchor, self._runner_id, int(task_id)
                 )
                 submit_done_event.record(submit_stream)
-            torch.cuda.current_stream(cuda_anchor.device).wait_event(submit_done_event)
+            if sync_after_submit:
+                torch.cuda.current_stream(cuda_anchor.device).wait_event(
+                    submit_done_event
+                )
         else:
             torch.ops.vllm.cots_suffix_attn_submit(
                 cuda_anchor, self._runner_id, int(task_id)
             )
+        if sync_after_submit:
+            self.sync_gqa_bf16_suffix_attention(
+                cuda_anchor=cuda_anchor,
+                task_id=task_id,
+            )
+
+    def sync_gqa_bf16_suffix_attention(
+        self,
+        *,
+        cuda_anchor: torch.Tensor,
+        task_id: int = 0,
+    ) -> None:
         torch.ops.vllm.cots_suffix_attn_sync(cuda_anchor, self._runner_id, int(task_id))
 
     def close(self) -> None:
@@ -427,9 +510,8 @@ def cots_hybrid_stage_query(
     if not query.is_cuda or not staged.is_pinned():
         return
 
-    source_indices = hybrid_metadata.scatter_source_indices
+    source_indices = _source_indices_for_device(hybrid_metadata, query.device)
     if source_indices is not None:
-        source_indices = source_indices.to(device=query.device, non_blocking=True)
         query = query.index_select(0, source_indices)
         if key is not None:
             key = key.index_select(0, source_indices)
@@ -557,12 +639,15 @@ def _scatter_cpu_kv_to_suffix_cache(
     if req_indices is not None and block_ids is not None and block_offsets is not None:
         if block_ids.numel() == 0:
             return
+        num_kv_heads = hybrid_metadata.cpu_key_cache.shape[1]
+        head_dim = hybrid_metadata.cpu_key_cache.shape[3]
         if (
             req_indices.numel() == key_cpu.shape[0]
-            and key_cpu.shape[1:] == (4, 128)
-            and value_cpu.shape[1:] == (4, 128)
+            and key_cpu.shape[1:] == (num_kv_heads, head_dim)
+            and value_cpu.shape[1:] == (num_kv_heads, head_dim)
+            and head_dim == 128
         ):
-            cots_qwen_bf16_scatter_suffix_kv(
+            cots_gqa_bf16_scatter_suffix_kv(
                 key_cpu,
                 value_cpu,
                 block_ids,
@@ -614,7 +699,8 @@ def cots_hybrid_kv_cache_update(
     source_indices = hybrid_metadata.scatter_source_indices
     if source_indices is not None:
         if key.is_cuda:
-            source_indices = source_indices.to(device=key.device, non_blocking=True)
+            source_indices = _source_indices_for_device(hybrid_metadata, key.device)
+            assert source_indices is not None
         key = key.index_select(0, source_indices)
         value = value.index_select(0, source_indices)
     if key.shape[0] < batch or value.shape[0] < batch:
@@ -739,26 +825,61 @@ def cots_hybrid_decode_attention(
     q_descale: torch.Tensor | None = None,
     k_descale: torch.Tensor | None = None,
     v_descale: torch.Tensor | None = None,
+    precomputed_prefix_out: torch.Tensor | None = None,
+    precomputed_prefix_lse: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run the COTS hybrid decode attention primitive.
 
-    Phase 2 restrictions are intentionally tight: Qwen2.5-7B BF16 shape, decode
-    only (one query token per request), no ALiBi/sliding-window/sinks/FP8. The
-    surrounding FlashAttentionImpl gate enforces the feature flag and broader
-    attention restrictions before calling here.
+    Phase 2 restrictions are intentionally tight: BF16 GQA decode with
+    head_dim=128, no ALiBi/sliding-window/sinks/FP8. The surrounding
+    FlashAttentionImpl gate enforces the feature flag and broader attention
+    restrictions before calling here.
     """
 
     if query.dim() != 3:
         raise ValueError(f"query must be [B, H, D], got {tuple(query.shape)}")
-    if query.shape[1:] != (28, 128):
+    num_query_heads = int(query.shape[1])
+    head_dim = int(query.shape[2])
+    if num_query_heads <= 0:
+        raise ValueError("query must have at least one head")
+    if head_dim != 128:
         raise ValueError(
-            "COTS hybrid decode requires Qwen shape "
-            f"[B, 28, 128], got {tuple(query.shape)}"
+            f"COTS hybrid decode currently supports head_dim=128, got {head_dim}"
         )
     if query.dtype != torch.bfloat16:
         raise ValueError(f"query must be bfloat16, got {query.dtype}")
     if not query.is_cuda:
         raise ValueError("query must be CUDA-resident for GPU prefix attention")
+    if (
+        hybrid_metadata.cpu_key_cache.dim() != 4
+        or hybrid_metadata.cpu_value_cache.dim() != 4
+    ):
+        raise ValueError(
+            "CPU suffix KV caches must have shape "
+            "[blocks, num_kv_heads, block_size, head_dim]"
+        )
+    if hybrid_metadata.cpu_key_cache.shape != hybrid_metadata.cpu_value_cache.shape:
+        raise ValueError("CPU suffix key/value cache shapes must match")
+    num_kv_heads = int(hybrid_metadata.cpu_key_cache.shape[1])
+    cache_head_dim = int(hybrid_metadata.cpu_key_cache.shape[3])
+    if num_kv_heads <= 0:
+        raise ValueError("CPU suffix KV cache must have at least one head")
+    if cache_head_dim != head_dim:
+        raise ValueError(
+            "CPU suffix KV cache head_dim must match query, got "
+            f"{cache_head_dim} vs {head_dim}"
+        )
+    if num_query_heads % num_kv_heads != 0:
+        raise ValueError(
+            "COTS hybrid decode requires num_query_heads divisible by "
+            f"num_kv_heads, got {num_query_heads} and {num_kv_heads}"
+        )
+    heads_per_kv = num_query_heads // num_kv_heads
+    if heads_per_kv > 8:
+        raise ValueError(
+            "COTS hybrid decode supports at most 8 query heads per KV head, "
+            f"got {heads_per_kv}"
+        )
     if output.shape != query.shape:
         raise ValueError(
             f"output shape {tuple(output.shape)} must match query {tuple(query.shape)}"
@@ -770,7 +891,8 @@ def cots_hybrid_decode_attention(
     source_indices = hybrid_metadata.scatter_source_indices
     source_indices_gpu = None
     if source_indices is not None:
-        source_indices_gpu = source_indices.to(device=query.device, non_blocking=True)
+        source_indices_gpu = _source_indices_for_device(hybrid_metadata, query.device)
+        assert source_indices_gpu is not None
         query = query.index_select(0, source_indices_gpu)
         output = torch.empty_like(query)
 
@@ -799,7 +921,8 @@ def cots_hybrid_decode_attention(
     prefix_kv_lens = torch.full((batch,), prefix_len, dtype=torch.int32, device=device)
 
     cuda_timing = (
-        hybrid_metadata.metrics is not None
+        precomputed_prefix_out is None
+        and hybrid_metadata.metrics is not None
         and _cuda_event_timing_enabled()
         and torch.cuda.is_available()
     )
@@ -807,195 +930,272 @@ def cots_hybrid_decode_attention(
     prefix_start = prefix_end = None
     if cuda_timing:
         prefix_start, prefix_end = _make_cuda_timing_events()
-        prefix_start.record(current_stream)
 
-    descale_shape = (batch, gpu_key_cache.shape[-2])
-    prefix_out, prefix_lse = flash_attn_varlen_func(
-        q=query,
-        k=gpu_key_cache,
-        v=gpu_value_cache,
-        cu_seqlens_q=cu_query_lens,
-        seqused_k=prefix_kv_lens,
-        max_seqlen_q=1,
-        max_seqlen_k=prefix_len,
-        softmax_scale=softmax_scale,
-        causal=False,
-        block_table=gpu_block_table[:, : hybrid_metadata.split_blocks],
-        return_softmax_lse=True,
-        fa_version=fa_version,
-        q_descale=q_descale.expand(descale_shape) if q_descale is not None else None,
-        k_descale=k_descale.expand(descale_shape) if k_descale is not None else None,
-        v_descale=v_descale.expand(descale_shape) if v_descale is not None else None,
-        num_splits=1,
+    def _prepare_and_submit_suffix(
+        *, sync_after_submit: bool
+    ) -> tuple[
+        CotsSuffixAttentionRunner,
+        torch.Tensor,
+        torch.Tensor,
+        float,
+    ]:
+        suffix_runner = hybrid_metadata.suffix_attention_runner
+        if suffix_runner is None:
+            raise RuntimeError("COTS hybrid decode metadata has no suffix runner")
+        qkv_scatter_in_runner = False
+        separate_kv_scatter_in_runner = False
+        scatter_key_cpu = None
+        scatter_value_cpu = None
+        qkv_ready_already_synchronized = False
+        suffix_submit_stream = None
+        suffix_submit_ready_event = None
+        suffix_submit_done_event = None
+        if hybrid_metadata.staged_query_valid:
+            assert (
+                hybrid_metadata.staged_query_cpu is not None
+                or hybrid_metadata.staged_qkv_cpu is not None
+            )
+            query_event = hybrid_metadata.query_ready_event
+            kv_event = hybrid_metadata.kv_ready_event
+            if query_event is not None and not (
+                hybrid_metadata.staged_kv_valid and query_event is kv_event
+            ):
+                if (
+                    suffix_runner.kind == "native_prepared"
+                    and hybrid_metadata.suffix_submit_stream is not None
+                    and not torch.cuda.is_current_stream_capturing()
+                ):
+                    suffix_submit_stream = hybrid_metadata.suffix_submit_stream
+                    suffix_submit_ready_event = query_event
+                    suffix_submit_done_event = hybrid_metadata.suffix_submit_done_event
+                elif suffix_runner.kind == "native_prepared":
+                    torch.cuda.current_stream(device).wait_event(query_event)
+                    qkv_ready_already_synchronized = True
+                else:
+                    wait_start = time.perf_counter()
+                    query_event.synchronize()
+                    qkv_ready_already_synchronized = hybrid_metadata.staged_qkv_valid
+                    if hybrid_metadata.metrics is not None:
+                        wait_ms = (time.perf_counter() - wait_start) * 1000.0
+                        hybrid_metadata.metrics.cpu_suffix_wait_ms += wait_ms
+                        hybrid_metadata.metrics.qkv_ready_wait_ms += wait_ms
+            if (
+                hybrid_metadata.staged_qkv_valid
+                and hybrid_metadata.staged_qkv_cpu is not None
+            ):
+                query_cpu = hybrid_metadata.staged_qkv_cpu[:batch, : query.shape[1], :]
+                qkv_scatter_in_runner = (
+                    suffix_runner.kind == "native_prepared"
+                    and hybrid_metadata.scatter_block_ids is not None
+                    and hybrid_metadata.scatter_block_offsets is not None
+                    and hybrid_metadata.scatter_block_ids.numel() > 0
+                )
+            else:
+                assert hybrid_metadata.staged_query_cpu is not None
+                query_cpu = hybrid_metadata.staged_query_cpu[:batch]
+                separate_kv_scatter_in_runner = (
+                    suffix_runner.kind == "native_prepared"
+                    and hybrid_metadata.staged_kv_valid
+                    and hybrid_metadata.staged_key_cpu is not None
+                    and hybrid_metadata.staged_value_cpu is not None
+                    and hybrid_metadata.scatter_block_ids is not None
+                    and hybrid_metadata.scatter_block_offsets is not None
+                    and hybrid_metadata.scatter_block_ids.numel() > 0
+                )
+                if separate_kv_scatter_in_runner:
+                    if kv_event is not None:
+                        if suffix_submit_stream is not None:
+                            suffix_submit_ready_event = kv_event
+                        else:
+                            torch.cuda.current_stream(device).wait_event(kv_event)
+                    staged_key_cpu = hybrid_metadata.staged_key_cpu
+                    staged_value_cpu = hybrid_metadata.staged_value_cpu
+                    assert staged_key_cpu is not None
+                    assert staged_value_cpu is not None
+                    scatter_key_cpu = staged_key_cpu[:batch]
+                    scatter_value_cpu = staged_value_cpu[:batch]
+        else:
+            query_cpu = query.detach().to("cpu")
+            if hybrid_metadata.metrics is not None:
+                hybrid_metadata.metrics.q_d2h_bytes += query[:batch].nbytes
+        if not (qkv_scatter_in_runner or separate_kv_scatter_in_runner):
+            _finish_staged_kv_cache_update(
+                hybrid_metadata,
+                batch,
+                ready_already_synchronized=qkv_ready_already_synchronized,
+            )
+        cpu_seq_lens = hybrid_metadata.cpu_seq_lens
+
+        suffix_out_cpu = (
+            hybrid_metadata.suffix_out_cpu[:batch]
+            if hybrid_metadata.suffix_out_cpu is not None
+            else torch.empty(
+                query_cpu.shape,
+                dtype=query_cpu.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+        )
+        suffix_lse_cpu = (
+            hybrid_metadata.suffix_lse_cpu[:, :batch]
+            if hybrid_metadata.suffix_lse_cpu is not None
+            else torch.empty(
+                (num_query_heads, batch),
+                dtype=torch.float32,
+                device="cpu",
+                pin_memory=True,
+            )
+        )
+        cpu_suffix_start = time.perf_counter()
+        suffix_kwargs = dict(
+            query=query_cpu,
+            key_cache=hybrid_metadata.cpu_key_cache,
+            value_cache=hybrid_metadata.cpu_value_cache,
+            block_table=hybrid_metadata.cpu_block_table,
+            seq_lens=cpu_seq_lens,
+            scale=softmax_scale,
+            output=suffix_out_cpu,
+            output_lse=suffix_lse_cpu,
+            cuda_anchor=query,
+            task_id=hybrid_metadata.suffix_attention_task_id,
+            scatter_block_ids=(
+                hybrid_metadata.scatter_block_ids
+                if (qkv_scatter_in_runner or separate_kv_scatter_in_runner)
+                else None
+            ),
+            scatter_block_offsets=(
+                hybrid_metadata.scatter_block_offsets
+                if (qkv_scatter_in_runner or separate_kv_scatter_in_runner)
+                else None
+            ),
+            scatter_key_cpu=scatter_key_cpu,
+            scatter_value_cpu=scatter_value_cpu,
+            scatter_from_qkv=qkv_scatter_in_runner,
+            scatter_from_separate_kv=separate_kv_scatter_in_runner,
+            snapshot_inputs=hybrid_metadata.suffix_attention_snapshot_inputs,
+        )
+        if suffix_submit_stream is not None:
+            suffix_kwargs["submit_stream"] = suffix_submit_stream
+            suffix_kwargs["submit_ready_event"] = suffix_submit_ready_event
+            suffix_kwargs["submit_done_event"] = suffix_submit_done_event
+        if not sync_after_submit:
+            suffix_kwargs["sync_after_submit"] = False
+        suffix_runner.run_gqa_bf16_suffix_attention(**suffix_kwargs)
+        if qkv_scatter_in_runner or separate_kv_scatter_in_runner:
+            hybrid_metadata.staged_kv_valid = False
+            if qkv_scatter_in_runner:
+                hybrid_metadata.staged_qkv_valid = False
+        return (
+            suffix_runner,
+            suffix_out_cpu,
+            suffix_lse_cpu,
+            cpu_suffix_start,
+        )
+
+    early_suffix_state = None
+    early_suffix_submit = (
+        _early_suffix_submit_enabled()
+        and precomputed_prefix_out is None
+        and hybrid_metadata.suffix_attention_runner is not None
+        and hybrid_metadata.suffix_attention_runner.kind == "native_prepared"
+        and hybrid_metadata.staged_query_valid
+        and hybrid_metadata.suffix_submit_stream is not None
+        and hybrid_metadata.suffix_submit_done_event is not None
+        and not torch.cuda.is_current_stream_capturing()
     )
+    if early_suffix_submit:
+        early_suffix_state = _prepare_and_submit_suffix(sync_after_submit=False)
+
+    if (precomputed_prefix_out is None) != (precomputed_prefix_lse is None):
+        raise ValueError("precomputed prefix output and LSE must be provided together")
+    if precomputed_prefix_out is not None:
+        assert precomputed_prefix_lse is not None
+        prefix_out = precomputed_prefix_out
+        prefix_lse = precomputed_prefix_lse
+        if source_indices_gpu is not None:
+            prefix_out = prefix_out.index_select(0, source_indices_gpu)
+            prefix_lse = prefix_lse.index_select(1, source_indices_gpu)
+        expected_prefix_shape = query.shape
+        expected_lse_shape = (num_query_heads, batch)
+        if prefix_out.shape != expected_prefix_shape:
+            raise ValueError(
+                "precomputed prefix output has unexpected shape, got "
+                f"{tuple(prefix_out.shape)} vs {tuple(expected_prefix_shape)}"
+            )
+        if prefix_lse.shape != expected_lse_shape:
+            raise ValueError(
+                "precomputed prefix LSE has unexpected shape, got "
+                f"{tuple(prefix_lse.shape)} vs {expected_lse_shape}"
+            )
+    else:
+        if cuda_timing:
+            assert prefix_start is not None
+            prefix_start.record(current_stream)
+        descale_shape = (batch, gpu_key_cache.shape[-2])
+        prefix_out, prefix_lse = flash_attn_varlen_func(
+            q=query,
+            k=gpu_key_cache,
+            v=gpu_value_cache,
+            out=None,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=prefix_kv_lens,
+            max_seqlen_q=1,
+            max_seqlen_k=prefix_len,
+            softmax_scale=softmax_scale,
+            causal=False,
+            block_table=gpu_block_table[:, : hybrid_metadata.split_blocks],
+            return_softmax_lse=True,
+            fa_version=fa_version,
+            q_descale=q_descale.expand(descale_shape)
+            if q_descale is not None
+            else None,
+            k_descale=k_descale.expand(descale_shape)
+            if k_descale is not None
+            else None,
+            v_descale=v_descale.expand(descale_shape)
+            if v_descale is not None
+            else None,
+            num_splits=1,
+        )
     if cuda_timing:
         assert prefix_end is not None
         prefix_end.record(current_stream)
 
-    # Artifact path: materialize the tiny query on CPU, compute suffix
+    # Suffix path: materialize the tiny query on CPU, compute suffix
     # attention, then expose output/LSE back to GPU for merge. Q and K/V are
     # preferably staged before this call so their waits can overlap with GPU
     # prefix attention.
-    suffix_runner = hybrid_metadata.suffix_attention_runner
-    if suffix_runner is None:
-        raise RuntimeError("COTS hybrid decode metadata has no suffix runner")
-    qkv_scatter_in_runner = False
-    separate_kv_scatter_in_runner = False
-    scatter_key_cpu = None
-    scatter_value_cpu = None
-    qkv_ready_already_synchronized = False
-    suffix_submit_stream = None
-    suffix_submit_ready_event = None
-    suffix_submit_done_event = None
-    if hybrid_metadata.staged_query_valid:
-        assert (
-            hybrid_metadata.staged_query_cpu is not None
-            or hybrid_metadata.staged_qkv_cpu is not None
-        )
-        query_event = hybrid_metadata.query_ready_event
-        kv_event = hybrid_metadata.kv_ready_event
-        if query_event is not None and not (
-            hybrid_metadata.staged_kv_valid and query_event is kv_event
-        ):
-            if (
-                suffix_runner.kind == "native_prepared"
-                and hybrid_metadata.suffix_submit_stream is not None
-                and not torch.cuda.is_current_stream_capturing()
-            ):
-                suffix_submit_stream = hybrid_metadata.suffix_submit_stream
-                suffix_submit_ready_event = query_event
-                suffix_submit_done_event = hybrid_metadata.suffix_submit_done_event
-            elif suffix_runner.kind == "native_prepared":
-                torch.cuda.current_stream(device).wait_event(query_event)
-                qkv_ready_already_synchronized = True
-            else:
-                wait_start = time.perf_counter()
-                query_event.synchronize()
-                qkv_ready_already_synchronized = hybrid_metadata.staged_qkv_valid
-                if hybrid_metadata.metrics is not None:
-                    wait_ms = (time.perf_counter() - wait_start) * 1000.0
-                    hybrid_metadata.metrics.cpu_suffix_wait_ms += wait_ms
-                    hybrid_metadata.metrics.qkv_ready_wait_ms += wait_ms
-        if (
-            hybrid_metadata.staged_qkv_valid
-            and hybrid_metadata.staged_qkv_cpu is not None
-        ):
-            query_cpu = hybrid_metadata.staged_qkv_cpu[:batch, : query.shape[1], :]
-            qkv_scatter_in_runner = (
-                suffix_runner.kind == "native_prepared"
-                and hybrid_metadata.scatter_block_ids is not None
-                and hybrid_metadata.scatter_block_offsets is not None
-                and hybrid_metadata.scatter_block_ids.numel() > 0
-            )
-        else:
-            assert hybrid_metadata.staged_query_cpu is not None
-            query_cpu = hybrid_metadata.staged_query_cpu[:batch]
-            separate_kv_scatter_in_runner = (
-                suffix_runner.kind == "native_prepared"
-                and hybrid_metadata.staged_kv_valid
-                and hybrid_metadata.staged_key_cpu is not None
-                and hybrid_metadata.staged_value_cpu is not None
-                and hybrid_metadata.scatter_block_ids is not None
-                and hybrid_metadata.scatter_block_offsets is not None
-                and hybrid_metadata.scatter_block_ids.numel() > 0
-            )
-            if separate_kv_scatter_in_runner:
-                if kv_event is not None:
-                    if suffix_submit_stream is not None:
-                        suffix_submit_ready_event = kv_event
-                    else:
-                        torch.cuda.current_stream(device).wait_event(kv_event)
-                staged_key_cpu = hybrid_metadata.staged_key_cpu
-                staged_value_cpu = hybrid_metadata.staged_value_cpu
-                assert staged_key_cpu is not None
-                assert staged_value_cpu is not None
-                scatter_key_cpu = staged_key_cpu[:batch]
-                scatter_value_cpu = staged_value_cpu[:batch]
+    if early_suffix_state is None:
+        suffix_state = _prepare_and_submit_suffix(sync_after_submit=True)
     else:
-        query_cpu = query.detach().to("cpu")
-        if hybrid_metadata.metrics is not None:
-            hybrid_metadata.metrics.q_d2h_bytes += query[:batch].nbytes
-    if not (qkv_scatter_in_runner or separate_kv_scatter_in_runner):
-        _finish_staged_kv_cache_update(
-            hybrid_metadata,
-            batch,
-            ready_already_synchronized=qkv_ready_already_synchronized,
-        )
-    cpu_seq_lens = hybrid_metadata.cpu_seq_lens
-
-    suffix_out_cpu = (
-        hybrid_metadata.suffix_out_cpu[:batch]
-        if hybrid_metadata.suffix_out_cpu is not None
-        else torch.empty(
-            query_cpu.shape,
-            dtype=query_cpu.dtype,
-            device="cpu",
-            pin_memory=True,
-        )
-    )
-    suffix_lse_cpu = (
-        hybrid_metadata.suffix_lse_cpu
-        if hybrid_metadata.suffix_lse_cpu is not None
-        else torch.empty(
-            (28, batch),
-            dtype=torch.float32,
-            device="cpu",
-            pin_memory=True,
-        )
-    )
-    cpu_suffix_start = time.perf_counter()
-    suffix_kwargs = dict(
-        query=query_cpu,
-        key_cache=hybrid_metadata.cpu_key_cache,
-        value_cache=hybrid_metadata.cpu_value_cache,
-        block_table=hybrid_metadata.cpu_block_table,
-        seq_lens=cpu_seq_lens,
-        scale=softmax_scale,
-        output=suffix_out_cpu,
-        output_lse=suffix_lse_cpu,
-        cuda_anchor=query,
-        task_id=hybrid_metadata.suffix_attention_task_id,
-        scatter_block_ids=(
-            hybrid_metadata.scatter_block_ids
-            if (qkv_scatter_in_runner or separate_kv_scatter_in_runner)
-            else None
-        ),
-        scatter_block_offsets=(
-            hybrid_metadata.scatter_block_offsets
-            if (qkv_scatter_in_runner or separate_kv_scatter_in_runner)
-            else None
-        ),
-        scatter_key_cpu=scatter_key_cpu,
-        scatter_value_cpu=scatter_value_cpu,
-        scatter_from_qkv=qkv_scatter_in_runner,
-        scatter_from_separate_kv=separate_kv_scatter_in_runner,
-        snapshot_inputs=hybrid_metadata.suffix_attention_snapshot_inputs,
-    )
-    if suffix_submit_stream is not None:
-        suffix_kwargs["submit_stream"] = suffix_submit_stream
-        suffix_kwargs["submit_ready_event"] = suffix_submit_ready_event
-        suffix_kwargs["submit_done_event"] = suffix_submit_done_event
-    suffix_runner.run_qwen_bf16_suffix_attention(**suffix_kwargs)
-    if qkv_scatter_in_runner or separate_kv_scatter_in_runner:
-        hybrid_metadata.staged_kv_valid = False
-        if qkv_scatter_in_runner:
-            hybrid_metadata.staged_qkv_valid = False
+        suffix_state = early_suffix_state
+    (
+        suffix_runner,
+        suffix_out_cpu,
+        suffix_lse_cpu,
+        cpu_suffix_start,
+    ) = suffix_state
     if cuda_timing and prefix_start is not None and prefix_end is not None:
         prefix_end.synchronize()
         assert hybrid_metadata.metrics is not None
         hybrid_metadata.metrics.gpu_prefix_attn_ms += prefix_start.elapsed_time(
             prefix_end
         )
+    if early_suffix_state is not None:
+        suffix_runner.sync_gqa_bf16_suffix_attention(
+            cuda_anchor=query,
+            task_id=hybrid_metadata.suffix_attention_task_id,
+        )
     if hybrid_metadata.metrics is not None:
         hybrid_metadata.metrics.hybrid_decode_calls += 1
         hybrid_metadata.metrics.cpu_suffix_attn_ms += (
             time.perf_counter() - cpu_suffix_start
         ) * 1000.0
+
     if hybrid_metadata.metrics is not None:
         hybrid_metadata.metrics.kv_uva_h2d_bytes += (
             suffix_out_cpu.nbytes + suffix_lse_cpu.nbytes
         )
-
     # The suffix buffers are CPU-written pinned memory consumed by the GPU via
     # UVA. The CPU writes complete before the merge kernel is launched.
     suffix_out_gpu = get_accelerator_view_from_cpu_tensor(suffix_out_cpu)

@@ -210,11 +210,6 @@ class KVCacheManager:
         self.cots_kv_split_tokens = 0
         self.cots_hybrid_preemptions = 0
         self.cots_hybrid_recomputed_cpu_suffix_tokens = 0
-        # Hybrid KV keeps a request fully GPU-resident when its final context
-        # fits. Requests that would overrun GPU KV use the block-aligned CPU
-        # suffix tier from their first post-split allocation.
-        self.cots_hybrid_full_gpu_req_ids: set[str] = set()
-        self.cots_hybrid_cpu_suffix_req_ids: set[str] = set()
         self.cots_hybrid_accounting: HybridKVAccounting | None = None
         self.cots_cpu_block_pool: CPUKVBlockPool | None = None
         if self.cots_hybrid_kv_enabled:
@@ -290,29 +285,9 @@ class KVCacheManager:
             return num_tokens
         return min(num_tokens, self.cots_kv_split_tokens)
 
-    def _cots_gpu_num_tokens_for_request(self, request_id: str, num_tokens: int) -> int:
-        if not self.cots_hybrid_kv_enabled:
-            return num_tokens
-        if request_id not in self.cots_hybrid_cpu_suffix_req_ids:
-            return num_tokens
-        return min(num_tokens, self.cots_kv_split_tokens)
-
-    def _cots_final_target_num_tokens(self, request: Request, floor_tokens: int) -> int:
-        target_tokens = request.num_prompt_tokens + request.max_tokens
-        return min(max(floor_tokens, target_tokens), self.max_model_len)
-
     def _cots_cpu_blocks_for_tokens(self, num_tokens: int) -> list[int]:
         if self.cots_hybrid_accounting is None:
             return []
-        return self.cots_hybrid_accounting.cpu_blocks_for_tokens(num_tokens)
-
-    def _cots_cpu_blocks_for_request_tokens(
-        self, request_id: str, num_tokens: int
-    ) -> list[int]:
-        if self.cots_hybrid_accounting is None:
-            return []
-        if request_id not in self.cots_hybrid_cpu_suffix_req_ids:
-            return [0 for _ in self.cots_hybrid_accounting.block_sizes]
         return self.cots_hybrid_accounting.cpu_blocks_for_tokens(num_tokens)
 
     def _cots_can_allocate_cpu_blocks(
@@ -326,7 +301,7 @@ class KVCacheManager:
         return self.cots_cpu_block_pool.can_extend_with_computed(
             request_id,
             computed_cpu_block_ids,
-            self._cots_cpu_blocks_for_request_tokens(request_id, num_tokens),
+            self._cots_cpu_blocks_for_tokens(num_tokens),
         )
 
     def _cots_allocate_new_computed_cpu_blocks(
@@ -345,7 +320,7 @@ class KVCacheManager:
     ) -> tuple[list[int], ...] | None:
         if self.cots_cpu_block_pool is None:
             return None
-        target_blocks = self._cots_cpu_blocks_for_request_tokens(request_id, num_tokens)
+        target_blocks = self._cots_cpu_blocks_for_tokens(num_tokens)
         current_blocks = self.cots_cpu_block_pool.get_block_ids(request_id)
         if len(current_blocks) == len(target_blocks) and all(
             len(current) >= target
@@ -466,9 +441,7 @@ class KVCacheManager:
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
         max_cache_hit_length = request.num_tokens - 1
-        gpu_max_cache_hit_length = self._cots_gpu_num_tokens_for_request(
-            request.request_id, max_cache_hit_length
-        )
+        gpu_max_cache_hit_length = self._cots_gpu_num_tokens(max_cache_hit_length)
         computed_blocks, num_new_computed_tokens = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, gpu_max_cache_hit_length
@@ -540,52 +513,8 @@ class KVCacheManager:
             self.max_model_len,
         )
         full_num_tokens = min(request.num_tokens, self.max_model_len)
-        final_target_num_tokens = self._cots_final_target_num_tokens(
-            request, full_num_tokens
-        )
-
-        if (
-            self.cots_hybrid_kv_enabled
-            and final_target_num_tokens > self.cots_kv_split_tokens
-            and request.request_id not in self.cots_hybrid_full_gpu_req_ids
-            and request.request_id not in self.cots_hybrid_cpu_suffix_req_ids
-        ):
-            full_gpu_blocks = self.coordinator.get_num_blocks_to_allocate(
-                request_id=request.request_id,
-                num_tokens=final_target_num_tokens,
-                new_computed_blocks=new_computed_block_list,
-                num_encoder_tokens=num_encoder_tokens,
-                total_computed_tokens=total_computed_tokens,
-                num_tokens_main_model=final_target_num_tokens,
-            )
-            if full_gpu_blocks <= self.block_pool.get_num_free_blocks():
-                return True
-            split_tokens = min(final_target_num_tokens, self.cots_kv_split_tokens)
-            split_computed = min(total_computed_tokens, self.cots_kv_split_tokens)
-            split_gpu_blocks = self.coordinator.get_num_blocks_to_allocate(
-                request_id=request.request_id,
-                num_tokens=split_tokens,
-                new_computed_blocks=new_computed_block_list,
-                num_encoder_tokens=num_encoder_tokens,
-                total_computed_tokens=split_computed,
-                num_tokens_main_model=split_tokens,
-            )
-            if split_gpu_blocks > self.block_pool.get_num_free_blocks():
-                return False
-            if self.cots_cpu_block_pool is None:
-                return True
-            return self.cots_cpu_block_pool.can_extend_with_computed(
-                request.request_id,
-                new_computed_cpu_block_ids,
-                self._cots_cpu_blocks_for_tokens(final_target_num_tokens),
-            )
-
-        gpu_full_num_tokens = self._cots_gpu_num_tokens_for_request(
-            request.request_id, full_num_tokens
-        )
-        gpu_total_computed_tokens = self._cots_gpu_num_tokens_for_request(
-            request.request_id, total_computed_tokens
-        )
+        gpu_full_num_tokens = self._cots_gpu_num_tokens(full_num_tokens)
+        gpu_total_computed_tokens = self._cots_gpu_num_tokens(total_computed_tokens)
         num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,
             num_tokens=gpu_full_num_tokens,
@@ -715,15 +644,9 @@ class KVCacheManager:
             self.max_model_len,
         )
 
-        gpu_total_computed_tokens = self._cots_gpu_num_tokens_for_request(
-            request.request_id, total_computed_tokens
-        )
-        gpu_num_tokens_main_model = self._cots_gpu_num_tokens_for_request(
-            request.request_id, num_tokens_main_model
-        )
-        gpu_num_tokens_need_slot = self._cots_gpu_num_tokens_for_request(
-            request.request_id, num_tokens_need_slot
-        )
+        gpu_total_computed_tokens = self._cots_gpu_num_tokens(total_computed_tokens)
+        gpu_num_tokens_main_model = self._cots_gpu_num_tokens(num_tokens_main_model)
+        gpu_num_tokens_need_slot = self._cots_gpu_num_tokens(num_tokens_need_slot)
 
         # Free the blocks that are skipped during the attention computation
         # (e.g., tokens outside the sliding window).
@@ -735,85 +658,24 @@ class KVCacheManager:
             request.request_id, gpu_total_computed_tokens
         )
 
-        final_target_num_tokens = self._cots_final_target_num_tokens(
-            request, num_tokens_need_slot
+        num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+            request_id=request.request_id,
+            num_tokens=gpu_num_tokens_need_slot,
+            new_computed_blocks=new_computed_block_list,
+            num_encoder_tokens=num_encoder_tokens,
+            total_computed_tokens=gpu_total_computed_tokens,
+            num_tokens_main_model=gpu_num_tokens_main_model,
         )
 
-        if (
-            self.cots_hybrid_kv_enabled
-            and final_target_num_tokens > self.cots_kv_split_tokens
-            and request.request_id not in self.cots_hybrid_full_gpu_req_ids
-            and request.request_id not in self.cots_hybrid_cpu_suffix_req_ids
+        if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
+            # Cannot allocate new GPU prefix blocks.
+            return None
+        if not self._cots_can_allocate_cpu_blocks(
+            request.request_id, num_tokens_need_slot, new_computed_cpu_block_ids
         ):
-            full_gpu_blocks = self.coordinator.get_num_blocks_to_allocate(
-                request_id=request.request_id,
-                num_tokens=final_target_num_tokens,
-                new_computed_blocks=new_computed_block_list,
-                num_encoder_tokens=num_encoder_tokens,
-                total_computed_tokens=total_computed_tokens,
-                num_tokens_main_model=num_tokens_main_model,
-            )
-            if (
-                new_computed_cpu_block_ids is None
-                and full_gpu_blocks <= self.block_pool.get_num_free_blocks()
-            ):
-                self.cots_hybrid_full_gpu_req_ids.add(request.request_id)
-                gpu_total_computed_tokens = total_computed_tokens
-                gpu_num_tokens_main_model = num_tokens_main_model
-                gpu_num_tokens_need_slot = final_target_num_tokens
-                num_blocks_to_allocate = full_gpu_blocks
-            else:
-                split_total_computed_tokens = min(
-                    total_computed_tokens, self.cots_kv_split_tokens
-                )
-                split_num_tokens_main_model = min(
-                    num_tokens_main_model, self.cots_kv_split_tokens
-                )
-                split_num_tokens_need_slot = min(
-                    num_tokens_need_slot, self.cots_kv_split_tokens
-                )
-                split_gpu_blocks = self.coordinator.get_num_blocks_to_allocate(
-                    request_id=request.request_id,
-                    num_tokens=split_num_tokens_need_slot,
-                    new_computed_blocks=new_computed_block_list,
-                    num_encoder_tokens=num_encoder_tokens,
-                    total_computed_tokens=split_total_computed_tokens,
-                    num_tokens_main_model=split_num_tokens_main_model,
-                )
-                if split_gpu_blocks > self.block_pool.get_num_free_blocks():
-                    return None
-                if self.cots_cpu_block_pool is not None and not (
-                    self.cots_cpu_block_pool.can_extend_with_computed(
-                        request.request_id,
-                        new_computed_cpu_block_ids,
-                        self._cots_cpu_blocks_for_tokens(num_tokens_need_slot),
-                    )
-                ):
-                    return None
-                self.cots_hybrid_cpu_suffix_req_ids.add(request.request_id)
-                gpu_total_computed_tokens = split_total_computed_tokens
-                gpu_num_tokens_main_model = split_num_tokens_main_model
-                gpu_num_tokens_need_slot = split_num_tokens_need_slot
-                num_blocks_to_allocate = split_gpu_blocks
-        else:
-            num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
-                request_id=request.request_id,
-                num_tokens=gpu_num_tokens_need_slot,
-                new_computed_blocks=new_computed_block_list,
-                num_encoder_tokens=num_encoder_tokens,
-                total_computed_tokens=gpu_total_computed_tokens,
-                num_tokens_main_model=gpu_num_tokens_main_model,
-            )
-
-            if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
-                # Cannot allocate new GPU prefix blocks.
-                return None
-            if not self._cots_can_allocate_cpu_blocks(
-                request.request_id, num_tokens_need_slot, new_computed_cpu_block_ids
-            ):
-                # Cannot allocate new CPU suffix blocks. Report failure before
-                # mutating either tier so the scheduler can preempt/recompute.
-                return None
+            # Cannot allocate new CPU suffix blocks. Report failure before
+            # mutating either tier so the scheduler can preempt/recompute.
+            return None
 
         if (
             new_computed_block_list is not self.empty_kv_cache_blocks.blocks
@@ -825,8 +687,8 @@ class KVCacheManager:
             self.coordinator.allocate_new_computed_blocks(
                 request_id=request.request_id,
                 new_computed_blocks=new_computed_block_list,
-                num_local_computed_tokens=self._cots_gpu_num_tokens_for_request(
-                    request.request_id, num_local_computed_tokens
+                num_local_computed_tokens=self._cots_gpu_num_tokens(
+                    num_local_computed_tokens
                 ),
                 num_external_computed_tokens=0
                 if self.cots_hybrid_kv_enabled
@@ -862,9 +724,7 @@ class KVCacheManager:
         )
         self.coordinator.cache_blocks(
             request,
-            self._cots_gpu_num_tokens_for_request(
-                request.request_id, num_tokens_to_cache
-            ),
+            self._cots_gpu_num_tokens(num_tokens_to_cache),
         )
         self._cots_cache_cpu_blocks(request, num_tokens_to_cache)
 
@@ -879,8 +739,6 @@ class KVCacheManager:
             request: The request to free the blocks.
         """
         self.coordinator.free(request.request_id)
-        self.cots_hybrid_full_gpu_req_ids.discard(request.request_id)
-        self.cots_hybrid_cpu_suffix_req_ids.discard(request.request_id)
         if self.cots_cpu_block_pool is not None:
             self.cots_cpu_block_pool.free(request.request_id)
 
@@ -921,8 +779,6 @@ class KVCacheManager:
             return False
         if not self.block_pool.reset_prefix_cache():
             return False
-        self.cots_hybrid_full_gpu_req_ids.clear()
-        self.cots_hybrid_cpu_suffix_req_ids.clear()
         if (
             self.cots_cpu_block_pool is not None
             and not self.cots_cpu_block_pool.reset_prefix_cache()
@@ -1001,9 +857,7 @@ class KVCacheManager:
         if self.enable_caching:
             self.coordinator.cache_blocks(
                 request,
-                self._cots_gpu_num_tokens_for_request(
-                    request.request_id, num_computed_tokens
-                ),
+                self._cots_gpu_num_tokens(num_computed_tokens),
             )
             self._cots_cache_cpu_blocks(request, num_computed_tokens)
 

@@ -388,23 +388,58 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        cots_timing = os.environ.get("VLLM_COTS_HYBRID_ENGINE_TIMING") == "1"
+        step_start = time.perf_counter() if cots_timing else 0.0
         scheduler_output = self.scheduler.schedule()
+        schedule_end = time.perf_counter() if cots_timing else 0.0
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        execute_submit_end = time.perf_counter() if cots_timing else 0.0
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+        grammar_end = time.perf_counter() if cots_timing else 0.0
         with (
             self.log_error_detail(scheduler_output),
             self.log_iteration_details(scheduler_output),
         ):
             model_output = future.result()
+            future_end = time.perf_counter() if cots_timing else 0.0
+            sample_end = future_end
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+                sample_end = time.perf_counter() if cots_timing else 0.0
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
+        abort_end = time.perf_counter() if cots_timing else 0.0
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        update_end = time.perf_counter() if cots_timing else 0.0
+
+        if cots_timing:
+            timing_iter = getattr(self, "_cots_engine_timing_iter", 0)
+            details = compute_iteration_details(scheduler_output)
+            logger.info(
+                "COTS engine timing iter=%d ctx_req=%d ctx_tok=%d "
+                "gen_req=%d gen_tok=%d schedule_ms=%.3f "
+                "execute_submit_ms=%.3f grammar_ms=%.3f future_ms=%.3f "
+                "sample_ms=%.3f abort_ms=%.3f update_ms=%.3f "
+                "total_step_ms=%.3f",
+                timing_iter,
+                details.num_ctx_requests,
+                details.num_ctx_tokens,
+                details.num_generation_requests,
+                details.num_generation_tokens,
+                (schedule_end - step_start) * 1000.0,
+                (execute_submit_end - schedule_end) * 1000.0,
+                (grammar_end - execute_submit_end) * 1000.0,
+                (future_end - grammar_end) * 1000.0,
+                (sample_end - future_end) * 1000.0,
+                (abort_end - sample_end) * 1000.0,
+                (update_end - abort_end) * 1000.0,
+                (update_end - step_start) * 1000.0,
+            )
+            self._cots_engine_timing_iter = timing_iter + 1
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
@@ -1689,7 +1724,10 @@ class DPEngineCoreProc(EngineCoreProc):
         if counts != self.last_counts:
             self.last_counts = counts
             stats = SchedulerStats(
-                *counts, step_counter=self.step_counter, current_wave=self.current_wave
+                num_running_reqs=counts[0],
+                num_waiting_reqs=counts[1],
+                step_counter=self.step_counter,
+                current_wave=self.current_wave,
             )
             self.output_queue.put_nowait((-1, EngineCoreOutputs(scheduler_stats=stats)))
 

@@ -15,7 +15,7 @@ import os
 import time
 from collections.abc import Sequence
 from contextlib import suppress
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -52,7 +52,7 @@ class CotsHybridKVStore:
         max_num_reqs: int,
         max_model_len: int,
         pin_memory: bool,
-        num_query_heads: int = 28,
+        num_query_heads: int,
         enable_suffix_read_events: bool = True,
     ) -> None:
         if not layer_names:
@@ -301,6 +301,15 @@ class CotsHybridKVStore:
             for layer_name, base in self._suffix_attention_task_base_ids.items()
         }
         self._last_live_counts: tuple[int, int] | None = None
+        self._submit_timing_stats: dict[str, float] = {}
+
+    def reset_submit_timing_stats(self) -> None:
+        self._submit_timing_stats = {}
+
+    def drain_submit_timing_stats(self) -> dict[str, float]:
+        stats = self._submit_timing_stats
+        self._submit_timing_stats = {}
+        return stats
 
     def set_live_counts(self, num_tokens: int, scatter_count: int) -> None:
         live_counts = (int(num_tokens), int(scatter_count))
@@ -308,6 +317,15 @@ class CotsHybridKVStore:
             return
         self._suffix_attention_runner.set_runtime_counts(*live_counts)
         self._last_live_counts = live_counts
+
+    def live_counts_are_zero(self) -> bool:
+        return self._last_live_counts == (0, 0)
+
+    def positions_have_suffix(
+        self, positions_cpu: Sequence[int], num_tokens: int
+    ) -> bool:
+        count = min(int(num_tokens), len(positions_cpu))
+        return any(int(positions_cpu[i]) >= self.split_tokens for i in range(count))
 
     def on_dispatch(
         self,
@@ -365,11 +383,43 @@ class CotsHybridKVStore:
     def _drain_suffix_runner_counters(self, stats: CotsHybridKVStats) -> None:
         counters = self._suffix_attention_runner.get_counters()
         self._suffix_attention_runner.reset_counters()
+        stats.suffix_submit_prepare_ms += (
+            counters.get("suffix_submit_prepare_total_ns", 0) / 1_000_000.0
+        )
+        stats.suffix_submit_metadata_snapshot_ms += (
+            counters.get("suffix_submit_metadata_snapshot_total_ns", 0) / 1_000_000.0
+        )
+        stats.suffix_submit_launch_hostfunc_ms += (
+            counters.get("suffix_submit_launch_hostfunc_total_ns", 0) / 1_000_000.0
+        )
+        stats.suffix_dispatch_cb_ms += (
+            counters.get("suffix_dispatch_cb_total_ns", 0) / 1_000_000.0
+        )
+        stats.suffix_dispatch_snapshot_ms += (
+            counters.get("suffix_dispatch_cb_snapshot_total_ns", 0) / 1_000_000.0
+        )
+        stats.suffix_dispatch_enqueue_ms += (
+            counters.get("suffix_dispatch_cb_enqueue_total_ns", 0) / 1_000_000.0
+        )
         stats.suffix_worker_busy_ms += (
             counters.get("suffix_worker_busy_total_ns", 0) / 1_000_000.0
         )
         stats.suffix_worker_queue_wait_ms += (
             counters.get("suffix_worker_queue_wait_total_ns", 0) / 1_000_000.0
+        )
+        stats.suffix_worker_scatter_ms += (
+            counters.get("suffix_worker_scatter_total_ns", 0) / 1_000_000.0
+        )
+        stats.suffix_worker_attention_ms += (
+            counters.get("suffix_worker_attention_total_ns", 0) / 1_000_000.0
+        )
+        stats.suffix_worker_requested_num_threads = max(
+            stats.suffix_worker_requested_num_threads,
+            counters.get("suffix_worker_requested_num_threads", 0),
+        )
+        stats.suffix_worker_observed_num_threads = max(
+            stats.suffix_worker_observed_num_threads,
+            counters.get("suffix_worker_observed_num_threads", 0),
         )
         stats.suffix_wait_kernel_launches += counters.get(
             "suffix_wait_kernel_launch_count", 0
@@ -593,6 +643,212 @@ class CotsHybridKVStore:
             scatter_block_offsets,
         )
 
+    def _prepare_layer_decode_buffers(
+        self,
+        layer_name: str,
+        batch: int,
+    ) -> tuple[Any, ...]:
+        can_use_static_staging = batch <= self._max_num_reqs
+        staging_done_event = None
+        suffix_read_event = None
+        suffix_attention_snapshot_inputs = True
+
+        if can_use_static_staging:
+            slot_start = self._next_staging_slot[layer_name]
+            slot_id = slot_start
+            if self.pin_memory and torch.cuda.is_available():
+                selected_event = None
+                for offset in range(self._num_staging_slots):
+                    candidate = (slot_start + offset) % self._num_staging_slots
+                    candidate_event = self._staging_reuse_events.get(
+                        (layer_name, candidate)
+                    )
+                    if candidate_event is None or candidate_event.query():
+                        slot_id = candidate
+                        selected_event = candidate_event
+                        break
+                else:
+                    slot_id = slot_start
+                    selected_event = self._staging_reuse_events.get(
+                        (layer_name, slot_id)
+                    )
+                    if selected_event is not None:
+                        staging_wait_start = time.perf_counter()
+                        selected_event.synchronize()
+                        self._runtime_stats.cpu_suffix_read_wait_ms += (
+                            time.perf_counter() - staging_wait_start
+                        ) * 1000.0
+                if selected_event is None:
+                    selected_event = torch.cuda.Event(blocking=False)
+                    self._staging_reuse_events[(layer_name, slot_id)] = selected_event
+                staging_done_event = selected_event
+                suffix_attention_snapshot_inputs = False
+            self._next_staging_slot[layer_name] = (
+                slot_id + 1
+            ) % self._num_staging_slots
+
+            staged_query_cpu = self._query_staging_slots[layer_name][slot_id][:batch]
+            staged_qkv_cpu = self._qkv_staging_slots[layer_name][slot_id][:batch]
+            staged_key_cpu = self._key_staging_slots[layer_name][slot_id][:batch]
+            staged_value_cpu = self._value_staging_slots[layer_name][slot_id][:batch]
+            suffix_out_cpu = self._suffix_out_slots[layer_name][slot_id][:batch]
+            suffix_lse_by_batch = self._suffix_lse_slots[layer_name][slot_id]
+            suffix_lse_cpu = suffix_lse_by_batch.get(batch)
+            if suffix_lse_cpu is None:
+                suffix_lse_cpu = torch.empty(
+                    (self.num_query_heads, batch),
+                    dtype=torch.float32,
+                    device="cpu",
+                    pin_memory=self.pin_memory,
+                )
+                suffix_lse_by_batch[batch] = suffix_lse_cpu
+            suffix_task_id = (
+                self._suffix_attention_task_base_ids[layer_name]
+                + slot_id * self._max_num_reqs
+                + batch
+                - 1
+            )
+            query_copy_stream = self._query_copy_streams[layer_name]
+            query_ready_event = self._query_ready_events[layer_name]
+            kv_copy_stream = self._kv_copy_streams[layer_name]
+            kv_ready_event = self._kv_ready_events[layer_name]
+            suffix_submit_stream = self._query_copy_streams[layer_name]
+            suffix_submit_done_event = self._suffix_submit_done_events[layer_name][
+                slot_id
+            ]
+        else:
+            suffix_lse_by_batch = self._suffix_lse_buffers[layer_name]
+            suffix_lse_cpu = suffix_lse_by_batch.get(batch)
+            if suffix_lse_cpu is None:
+                suffix_lse_cpu = torch.empty(
+                    (self.num_query_heads, batch),
+                    dtype=torch.float32,
+                    device="cpu",
+                    pin_memory=self.pin_memory,
+                )
+                suffix_lse_by_batch[batch] = suffix_lse_cpu
+            if (
+                self.pin_memory
+                and self.enable_suffix_read_events
+                and torch.cuda.is_available()
+            ):
+                suffix_read_event = self._suffix_read_events[layer_name].get(batch)
+                if suffix_read_event is None:
+                    suffix_read_event = torch.cuda.Event(blocking=False)
+                    self._suffix_read_events[layer_name][batch] = suffix_read_event
+                else:
+                    read_wait_start = time.perf_counter()
+                    suffix_read_event.synchronize()
+                    self._runtime_stats.cpu_suffix_read_wait_ms += (
+                        time.perf_counter() - read_wait_start
+                    ) * 1000.0
+
+            # Row-expanded CPU suffix prefill is eager-only in this first pass.
+            # Use synchronous D2H staging and a per-layer overflow native task.
+            # Unlike captured decode buckets, the overflow task is populated
+            # with its exact live row/scatter counts. Clear the graph-style
+            # live-count override so it cannot apply to a smaller prepared task.
+            self.set_live_counts(-1, -1)
+            staged_query_cpu = None
+            staged_qkv_cpu = None
+            staged_key_cpu = None
+            staged_value_cpu = None
+            suffix_out_by_batch = self._suffix_out_overflow_buffers[layer_name]
+            suffix_out_cpu = suffix_out_by_batch.get(batch)
+            if suffix_out_cpu is None:
+                suffix_out_cpu = self._empty_cpu_tensor(
+                    (batch, self.num_query_heads, self.head_size), dtype=self.dtype
+                )
+                suffix_out_by_batch[batch] = suffix_out_cpu
+            suffix_task_id = self._suffix_attention_overflow_task_ids[layer_name]
+            query_copy_stream = None
+            query_ready_event = None
+            kv_copy_stream = None
+            kv_ready_event = None
+            suffix_submit_stream = None
+            suffix_submit_done_event = None
+
+        return (
+            staged_query_cpu,
+            staged_qkv_cpu,
+            query_copy_stream,
+            query_ready_event,
+            staged_key_cpu,
+            staged_value_cpu,
+            kv_copy_stream,
+            kv_ready_event,
+            suffix_out_cpu,
+            suffix_lse_cpu,
+            suffix_submit_stream,
+            suffix_submit_done_event,
+            suffix_read_event,
+            staging_done_event,
+            suffix_task_id,
+            suffix_attention_snapshot_inputs,
+        )
+
+    def build_decode_metadata_from_common(
+        self,
+        *,
+        layer_name: str,
+        common_metadata: CotsHybridDecodeMetadata,
+    ) -> CotsHybridDecodeMetadata:
+        if layer_name not in self._key_caches:
+            raise KeyError(f"Unknown COTS hybrid KV layer: {layer_name}")
+        batch = int(common_metadata.cpu_seq_lens.shape[0])
+        (
+            staged_query_cpu,
+            staged_qkv_cpu,
+            query_copy_stream,
+            query_ready_event,
+            staged_key_cpu,
+            staged_value_cpu,
+            kv_copy_stream,
+            kv_ready_event,
+            suffix_out_cpu,
+            suffix_lse_cpu,
+            suffix_submit_stream,
+            suffix_submit_done_event,
+            suffix_read_event,
+            staging_done_event,
+            suffix_task_id,
+            suffix_attention_snapshot_inputs,
+        ) = self._prepare_layer_decode_buffers(layer_name, batch)
+        return CotsHybridDecodeMetadata(
+            cpu_key_cache=self._key_caches[layer_name],
+            cpu_value_cache=self._value_caches[layer_name],
+            cpu_block_table=common_metadata.cpu_block_table,
+            cpu_seq_lens=common_metadata.cpu_seq_lens,
+            split_blocks=self.split_blocks,
+            metrics=self._runtime_stats,
+            staged_query_cpu=staged_query_cpu,
+            staged_qkv_cpu=staged_qkv_cpu,
+            query_copy_stream=query_copy_stream,
+            query_ready_event=query_ready_event,
+            staged_key_cpu=staged_key_cpu,
+            staged_value_cpu=staged_value_cpu,
+            kv_copy_stream=kv_copy_stream,
+            kv_ready_event=kv_ready_event,
+            suffix_out_cpu=suffix_out_cpu,
+            suffix_lse_cpu=suffix_lse_cpu,
+            suffix_submit_stream=suffix_submit_stream,
+            suffix_submit_done_event=suffix_submit_done_event,
+            suffix_read_done_event=suffix_read_event,
+            staging_done_event=staging_done_event,
+            scatter_req_indices=common_metadata.scatter_req_indices,
+            scatter_block_ids=common_metadata.scatter_block_ids,
+            scatter_block_offsets=common_metadata.scatter_block_offsets,
+            req_indices_gpu=common_metadata.req_indices_gpu,
+            scatter_source_indices=common_metadata.scatter_source_indices,
+            scatter_source_indices_gpu=common_metadata.scatter_source_indices_gpu,
+            prefix_source_indices=common_metadata.prefix_source_indices,
+            prefix_req_indices_gpu=common_metadata.prefix_req_indices_gpu,
+            prefix_seq_lens_cpu=common_metadata.prefix_seq_lens_cpu,
+            suffix_attention_runner=self._suffix_attention_runner,
+            suffix_attention_task_id=suffix_task_id,
+            suffix_attention_snapshot_inputs=suffix_attention_snapshot_inputs,
+        )
+
     def build_decode_metadata(
         self,
         *,
@@ -610,6 +866,25 @@ class CotsHybridKVStore:
     ) -> CotsHybridDecodeMetadata | None:
         """Return per-layer CPU suffix metadata, or None before the split."""
 
+        submit_timing = os.environ.get("VLLM_COTS_HYBRID_SUBMIT_TIMING") == "1"
+        submit_timing_last = time.perf_counter() if submit_timing else 0.0
+
+        def _mark_submit_timing(bucket: str) -> None:
+            nonlocal submit_timing_last
+            if not submit_timing:
+                return
+            now = time.perf_counter()
+            self._submit_timing_stats[bucket] = (
+                self._submit_timing_stats.get(bucket, 0.0)
+                + (now - submit_timing_last) * 1000.0
+            )
+            submit_timing_last = now
+
+        if submit_timing:
+            self._submit_timing_stats["calls"] = (
+                self._submit_timing_stats.get("calls", 0.0) + 1.0
+            )
+
         if layer_name not in self._key_caches:
             raise KeyError(f"Unknown COTS hybrid KV layer: {layer_name}")
         if len(req_ids) == 0 or num_actual_tokens <= 0:
@@ -619,6 +894,7 @@ class CotsHybridKVStore:
         prefix_source_indices = None
         prefix_req_indices_gpu = None
         prefix_seq_lens_cpu = None
+        scatter_source_indices_gpu = None
         if req_indices_cpu is None:
             if num_actual_tokens != num_reqs:
                 return None
@@ -684,6 +960,7 @@ class CotsHybridKVStore:
                         dtype=torch.long,
                     )
             active_req_indices_gpu = None
+            token_rows_gpu = None
             if req_indices_gpu is not None:
                 token_rows_gpu = torch.tensor(
                     token_rows, dtype=torch.long, device=req_indices_gpu.device
@@ -693,6 +970,7 @@ class CotsHybridKVStore:
                 range(num_reqs)
             ):
                 active_req_indices_gpu = None
+        _mark_submit_timing("row_filter_ms")
         if positions_cpu is None and max_query_len != 1:
             return None
         if (
@@ -703,6 +981,7 @@ class CotsHybridKVStore:
             return None
         if not token_rows:
             return None
+        _mark_submit_timing("guards_ms")
 
         active_req_ids = [req_ids[idx] for idx in active_req_indices]
         effective_max_query_len = 1 if positions_cpu is not None else max_query_len
@@ -727,6 +1006,7 @@ class CotsHybridKVStore:
             if cpu_block_ids_by_req is None
             else [cpu_block_ids_by_req[idx] for idx in active_req_indices]
         )
+        _mark_submit_timing("active_tensors_ms")
 
         common_key = self._common_decode_cache_key(
             req_ids=active_req_ids,
@@ -737,9 +1017,18 @@ class CotsHybridKVStore:
             num_actual_tokens=len(active_req_ids),
             cpu_block_ids_by_req=active_cpu_block_ids_by_req,
         )
+        _mark_submit_timing("cache_key_ms")
         if common_key == self._common_cache_key:
             common = self._common_cache_value
+            if submit_timing:
+                self._submit_timing_stats["common_cache_hits"] = (
+                    self._submit_timing_stats.get("common_cache_hits", 0.0) + 1.0
+                )
         else:
+            if submit_timing:
+                self._submit_timing_stats["common_cache_misses"] = (
+                    self._submit_timing_stats.get("common_cache_misses", 0.0) + 1.0
+                )
             common = self._build_common_decode_metadata(
                 req_ids=active_req_ids,
                 seq_lens_cpu=active_seq_lens_cpu,
@@ -751,6 +1040,7 @@ class CotsHybridKVStore:
             )
             self._common_cache_key = common_key
             self._common_cache_value = common
+        _mark_submit_timing("common_ms")
         if common is None:
             return None
 
@@ -762,112 +1052,40 @@ class CotsHybridKVStore:
             scatter_block_offsets,
         ) = common
         batch = len(active_req_ids)
-        can_use_static_staging = batch <= self._max_num_reqs
-        staging_done_event = None
-        suffix_read_event = None
-        suffix_attention_snapshot_inputs = True
-
-        if can_use_static_staging:
-            slot_start = self._next_staging_slot[layer_name]
-            slot_id = slot_start
-            if self.pin_memory and torch.cuda.is_available():
-                selected_event = None
-                for offset in range(self._num_staging_slots):
-                    candidate = (slot_start + offset) % self._num_staging_slots
-                    candidate_event = self._staging_reuse_events.get(
-                        (layer_name, candidate)
+        (
+            staged_query_cpu,
+            staged_qkv_cpu,
+            query_copy_stream,
+            query_ready_event,
+            staged_key_cpu,
+            staged_value_cpu,
+            kv_copy_stream,
+            kv_ready_event,
+            suffix_out_cpu,
+            suffix_lse_cpu,
+            suffix_submit_stream,
+            suffix_submit_done_event,
+            suffix_read_event,
+            staging_done_event,
+            suffix_task_id,
+            suffix_attention_snapshot_inputs,
+        ) = self._prepare_layer_decode_buffers(layer_name, batch)
+        _mark_submit_timing("staging_ms")
+        scatter_source_indices = None
+        if not (
+            len(token_rows) == num_actual_tokens
+            and token_rows == list(range(num_actual_tokens))
+        ):
+            scatter_source_indices = torch.tensor(token_rows, dtype=torch.long)
+            if req_indices_gpu is not None:
+                scatter_source_indices_gpu = (
+                    token_rows_gpu
+                    if token_rows_gpu is not None
+                    else torch.tensor(
+                        token_rows, dtype=torch.long, device=req_indices_gpu.device
                     )
-                    if candidate_event is None or candidate_event.query():
-                        slot_id = candidate
-                        selected_event = candidate_event
-                        break
-                else:
-                    slot_id = slot_start
-                    selected_event = self._staging_reuse_events.get(
-                        (layer_name, slot_id)
-                    )
-                    if selected_event is not None:
-                        staging_wait_start = time.perf_counter()
-                        selected_event.synchronize()
-                        self._runtime_stats.cpu_suffix_read_wait_ms += (
-                            time.perf_counter() - staging_wait_start
-                        ) * 1000.0
-                if selected_event is None:
-                    selected_event = torch.cuda.Event(blocking=False)
-                    self._staging_reuse_events[(layer_name, slot_id)] = selected_event
-                staging_done_event = selected_event
-                suffix_attention_snapshot_inputs = False
-            self._next_staging_slot[layer_name] = (
-                slot_id + 1
-            ) % self._num_staging_slots
-
-            staged_query_cpu = self._query_staging_slots[layer_name][slot_id][:batch]
-            staged_qkv_cpu = self._qkv_staging_slots[layer_name][slot_id][:batch]
-            staged_key_cpu = self._key_staging_slots[layer_name][slot_id][:batch]
-            staged_value_cpu = self._value_staging_slots[layer_name][slot_id][:batch]
-            suffix_out_cpu = self._suffix_out_slots[layer_name][slot_id][:batch]
-            suffix_lse_by_batch = self._suffix_lse_slots[layer_name][slot_id]
-            suffix_lse_cpu = suffix_lse_by_batch.get(batch)
-            if suffix_lse_cpu is None:
-                suffix_lse_cpu = torch.empty(
-                    (self.num_query_heads, batch),
-                    dtype=torch.float32,
-                    device="cpu",
-                    pin_memory=self.pin_memory,
                 )
-                suffix_lse_by_batch[batch] = suffix_lse_cpu
-            suffix_task_id = (
-                self._suffix_attention_task_base_ids[layer_name]
-                + slot_id * self._max_num_reqs
-                + batch
-                - 1
-            )
-        else:
-            suffix_lse_by_batch = self._suffix_lse_buffers[layer_name]
-            suffix_lse_cpu = suffix_lse_by_batch.get(batch)
-            if suffix_lse_cpu is None:
-                suffix_lse_cpu = torch.empty(
-                    (self.num_query_heads, batch),
-                    dtype=torch.float32,
-                    device="cpu",
-                    pin_memory=self.pin_memory,
-                )
-                suffix_lse_by_batch[batch] = suffix_lse_cpu
-            if (
-                self.pin_memory
-                and self.enable_suffix_read_events
-                and torch.cuda.is_available()
-            ):
-                suffix_read_event = self._suffix_read_events[layer_name].get(batch)
-                if suffix_read_event is None:
-                    suffix_read_event = torch.cuda.Event(blocking=False)
-                    self._suffix_read_events[layer_name][batch] = suffix_read_event
-                else:
-                    read_wait_start = time.perf_counter()
-                    suffix_read_event.synchronize()
-                    self._runtime_stats.cpu_suffix_read_wait_ms += (
-                        time.perf_counter() - read_wait_start
-                    ) * 1000.0
-
-            # Row-expanded CPU suffix prefill is eager-only in this first pass.
-            # Use synchronous D2H staging and a per-layer overflow native task.
-            # Unlike captured decode buckets, the overflow task is populated
-            # with its exact live row/scatter counts. Clear the graph-style
-            # live-count override so it cannot apply to a smaller prepared task.
-            self.set_live_counts(-1, -1)
-            staged_query_cpu = None
-            staged_qkv_cpu = None
-            staged_key_cpu = None
-            staged_value_cpu = None
-            suffix_out_by_batch = self._suffix_out_overflow_buffers[layer_name]
-            suffix_out_cpu = suffix_out_by_batch.get(batch)
-            if suffix_out_cpu is None:
-                suffix_out_cpu = self._empty_cpu_tensor(
-                    (batch, self.num_query_heads, self.head_size), dtype=self.dtype
-                )
-                suffix_out_by_batch[batch] = suffix_out_cpu
-            suffix_task_id = self._suffix_attention_overflow_task_ids[layer_name]
-        return CotsHybridDecodeMetadata(
+        metadata = CotsHybridDecodeMetadata(
             cpu_key_cache=self._key_caches[layer_name],
             cpu_value_cache=self._value_caches[layer_name],
             cpu_block_table=block_table,
@@ -876,42 +1094,24 @@ class CotsHybridKVStore:
             metrics=self._runtime_stats,
             staged_query_cpu=staged_query_cpu,
             staged_qkv_cpu=staged_qkv_cpu,
-            query_copy_stream=(
-                self._query_copy_streams[layer_name] if can_use_static_staging else None
-            ),
-            query_ready_event=(
-                self._query_ready_events[layer_name] if can_use_static_staging else None
-            ),
+            query_copy_stream=query_copy_stream,
+            query_ready_event=query_ready_event,
             staged_key_cpu=staged_key_cpu,
             staged_value_cpu=staged_value_cpu,
-            kv_copy_stream=(
-                self._kv_copy_streams[layer_name] if can_use_static_staging else None
-            ),
-            kv_ready_event=(
-                self._kv_ready_events[layer_name] if can_use_static_staging else None
-            ),
+            kv_copy_stream=kv_copy_stream,
+            kv_ready_event=kv_ready_event,
             suffix_out_cpu=suffix_out_cpu,
             suffix_lse_cpu=suffix_lse_cpu,
-            suffix_submit_stream=(
-                self._query_copy_streams[layer_name] if can_use_static_staging else None
-            ),
-            suffix_submit_done_event=(
-                self._suffix_submit_done_events[layer_name][slot_id]
-                if can_use_static_staging
-                else None
-            ),
+            suffix_submit_stream=suffix_submit_stream,
+            suffix_submit_done_event=suffix_submit_done_event,
             suffix_read_done_event=suffix_read_event,
             staging_done_event=staging_done_event,
             scatter_req_indices=scatter_req_indices,
             scatter_block_ids=scatter_block_ids,
             scatter_block_offsets=scatter_block_offsets,
             req_indices_gpu=active_req_indices_gpu,
-            scatter_source_indices=None
-            if (
-                len(token_rows) == num_actual_tokens
-                and token_rows == list(range(num_actual_tokens))
-            )
-            else torch.tensor(token_rows, dtype=torch.long),
+            scatter_source_indices=scatter_source_indices,
+            scatter_source_indices_gpu=scatter_source_indices_gpu,
             prefix_source_indices=prefix_source_indices,
             prefix_req_indices_gpu=prefix_req_indices_gpu,
             prefix_seq_lens_cpu=prefix_seq_lens_cpu,
@@ -919,3 +1119,5 @@ class CotsHybridKVStore:
             suffix_attention_task_id=suffix_task_id,
             suffix_attention_snapshot_inputs=suffix_attention_snapshot_inputs,
         )
+        _mark_submit_timing("metadata_obj_ms")
+        return metadata

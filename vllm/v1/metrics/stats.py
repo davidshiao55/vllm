@@ -177,6 +177,11 @@ class CotsHybridKVStats:
     hybrid_preemptions: int = 0
     hybrid_recomputed_cpu_suffix_tokens: int = 0
     hybrid_decode_calls: int = 0
+    hybrid_mixed_decode_calls: int = 0
+    hybrid_mixed_prefix_rows: int = 0
+    hybrid_mixed_suffix_rows: int = 0
+    hybrid_mixed_prefix_attn_ms: float = 0.0
+    hybrid_mixed_prefix_wall_ms: float = 0.0
     cpu_suffix_attn_ms: float = 0.0
     cpu_suffix_wait_ms: float = 0.0
     qkv_ready_wait_ms: float = 0.0
@@ -190,8 +195,18 @@ class CotsHybridKVStats:
     q_d2h_bytes: int = 0
     kv_d2h_bytes: int = 0
     kv_uva_h2d_bytes: int = 0
+    suffix_submit_prepare_ms: float = 0.0
+    suffix_submit_metadata_snapshot_ms: float = 0.0
+    suffix_submit_launch_hostfunc_ms: float = 0.0
+    suffix_dispatch_cb_ms: float = 0.0
+    suffix_dispatch_snapshot_ms: float = 0.0
+    suffix_dispatch_enqueue_ms: float = 0.0
     suffix_worker_busy_ms: float = 0.0
     suffix_worker_queue_wait_ms: float = 0.0
+    suffix_worker_scatter_ms: float = 0.0
+    suffix_worker_attention_ms: float = 0.0
+    suffix_worker_requested_num_threads: int = 0
+    suffix_worker_observed_num_threads: int = 0
     suffix_wait_kernel_launches: int = 0
     suffix_wait_kernel_immediate: int = 0
     suffix_wait_kernel_lagging: int = 0
@@ -213,11 +228,36 @@ class CotsHybridKVStats:
         self.hybrid_merge_ms += worker_stats.hybrid_merge_ms
         self.gpu_prefix_attn_ms += worker_stats.gpu_prefix_attn_ms
         self.hybrid_decode_calls += worker_stats.hybrid_decode_calls
+        self.hybrid_mixed_decode_calls += worker_stats.hybrid_mixed_decode_calls
+        self.hybrid_mixed_prefix_rows += worker_stats.hybrid_mixed_prefix_rows
+        self.hybrid_mixed_suffix_rows += worker_stats.hybrid_mixed_suffix_rows
+        self.hybrid_mixed_prefix_attn_ms += worker_stats.hybrid_mixed_prefix_attn_ms
+        self.hybrid_mixed_prefix_wall_ms += worker_stats.hybrid_mixed_prefix_wall_ms
         self.q_d2h_bytes += worker_stats.q_d2h_bytes
         self.kv_d2h_bytes += worker_stats.kv_d2h_bytes
         self.kv_uva_h2d_bytes += worker_stats.kv_uva_h2d_bytes
+        self.suffix_submit_prepare_ms += worker_stats.suffix_submit_prepare_ms
+        self.suffix_submit_metadata_snapshot_ms += (
+            worker_stats.suffix_submit_metadata_snapshot_ms
+        )
+        self.suffix_submit_launch_hostfunc_ms += (
+            worker_stats.suffix_submit_launch_hostfunc_ms
+        )
+        self.suffix_dispatch_cb_ms += worker_stats.suffix_dispatch_cb_ms
+        self.suffix_dispatch_snapshot_ms += worker_stats.suffix_dispatch_snapshot_ms
+        self.suffix_dispatch_enqueue_ms += worker_stats.suffix_dispatch_enqueue_ms
         self.suffix_worker_busy_ms += worker_stats.suffix_worker_busy_ms
         self.suffix_worker_queue_wait_ms += worker_stats.suffix_worker_queue_wait_ms
+        self.suffix_worker_scatter_ms += worker_stats.suffix_worker_scatter_ms
+        self.suffix_worker_attention_ms += worker_stats.suffix_worker_attention_ms
+        self.suffix_worker_requested_num_threads = max(
+            self.suffix_worker_requested_num_threads,
+            worker_stats.suffix_worker_requested_num_threads,
+        )
+        self.suffix_worker_observed_num_threads = max(
+            self.suffix_worker_observed_num_threads,
+            worker_stats.suffix_worker_observed_num_threads,
+        )
         self.suffix_wait_kernel_launches += worker_stats.suffix_wait_kernel_launches
         self.suffix_wait_kernel_immediate += worker_stats.suffix_wait_kernel_immediate
         self.suffix_wait_kernel_lagging += worker_stats.suffix_wait_kernel_lagging
@@ -246,11 +286,24 @@ class CotsHybridKVStats:
             or self.hybrid_merge_ms
             or self.gpu_prefix_attn_ms
             or self.hybrid_decode_calls
+            or self.hybrid_mixed_decode_calls
+            or self.hybrid_mixed_prefix_attn_ms
+            or self.hybrid_mixed_prefix_wall_ms
             or self.q_d2h_bytes
             or self.kv_d2h_bytes
             or self.kv_uva_h2d_bytes
+            or self.suffix_submit_prepare_ms
+            or self.suffix_submit_metadata_snapshot_ms
+            or self.suffix_submit_launch_hostfunc_ms
+            or self.suffix_dispatch_cb_ms
+            or self.suffix_dispatch_snapshot_ms
+            or self.suffix_dispatch_enqueue_ms
             or self.suffix_worker_busy_ms
             or self.suffix_worker_queue_wait_ms
+            or self.suffix_worker_scatter_ms
+            or self.suffix_worker_attention_ms
+            or self.suffix_worker_requested_num_threads
+            or self.suffix_worker_observed_num_threads
             or self.suffix_wait_kernel_launches
             or self.suffix_worker_capacity_rows
             or self.suffix_worker_live_rows

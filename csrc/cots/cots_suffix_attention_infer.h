@@ -60,6 +60,9 @@ struct alignas(64) SuffixAttentionTask {
   void* scatter_value_ptr = nullptr;
 
   int32_t query_capacity = 0;
+  int32_t num_q_heads = 0;
+  int32_t num_kv_heads = 0;
+  int32_t head_dim = 0;
   int64_t query_stride0 = 0;
   int64_t query_stride1 = 0;
   int64_t query_stride2 = 0;
@@ -85,6 +88,7 @@ class CotsSuffixAttentionInfer {
 
   void populate_task(
       int64_t task_id, uintptr_t query_ptr, int32_t query_capacity,
+      int32_t num_q_heads, int32_t num_kv_heads, int32_t head_dim,
       int64_t query_stride0, int64_t query_stride1, int64_t query_stride2,
       uintptr_t key_cache_ptr, int32_t num_cpu_blocks, int32_t block_size,
       uintptr_t value_cache_ptr, uintptr_t block_table_ptr,
@@ -148,18 +152,32 @@ class CotsSuffixAttentionInfer {
 
   std::atomic<int64_t> populate_count_{0};
   std::atomic<int64_t> submit_count_{0};
+  std::atomic<int64_t> submit_prepare_total_ns_{0};
+  std::atomic<int64_t> submit_metadata_snapshot_total_ns_{0};
+  std::atomic<int64_t> submit_launch_hostfunc_total_ns_{0};
   std::atomic<int64_t> dispatch_cb_count_{0};
+  std::atomic<int64_t> dispatch_cb_total_ns_{0};
+  std::atomic<int64_t> dispatch_cb_snapshot_total_ns_{0};
+  std::atomic<int64_t> dispatch_cb_enqueue_total_ns_{0};
   std::atomic<int64_t> legacy_sync_cb_count_{0};
   std::atomic<int64_t> legacy_sync_cb_wait_total_ns_{0};
   std::atomic<int64_t> wait_kernel_launch_count_{0};
   std::atomic<int64_t> worker_run_count_{0};
+  std::atomic<int64_t> worker_requested_num_threads_{0};
+  std::atomic<int64_t> worker_observed_num_threads_{0};
   std::atomic<int64_t> worker_busy_total_ns_{0};
   std::atomic<int64_t> worker_queue_wait_total_ns_{0};
+  std::atomic<int64_t> worker_scatter_total_ns_{0};
+  std::atomic<int64_t> worker_attention_total_ns_{0};
   std::atomic<int64_t> worker_capacity_rows_{0};
   std::atomic<int64_t> worker_live_rows_{0};
   std::atomic<int64_t> worker_padded_rows_{0};
   std::atomic<int64_t> worker_scatter_rows_{0};
   std::atomic<int64_t> worker_zero_live_count_{0};
+
+  uint32_t* wait_kernel_slots_host_ = nullptr;
+  uint32_t* wait_kernel_slots_dev_ = nullptr;
+  int64_t wait_kernel_slots_capacity_ = 0;
 
   int64_t* wait_kernel_spin_iters_host_ = nullptr;
   int64_t* wait_kernel_spin_iters_dev_ = nullptr;
@@ -171,6 +189,8 @@ class CotsSuffixAttentionInfer {
   std::atomic<bool> has_error_{false};
   std::mutex error_mtx_;
   std::string last_error_msg_;
+
+  int32_t worker_current_num_threads_ = 0;
 };
 
 }  // namespace cots

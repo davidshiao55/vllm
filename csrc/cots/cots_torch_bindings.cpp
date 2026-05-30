@@ -16,38 +16,37 @@ using vllm::cots::CotsCpuInfer;
 using vllm::cots::CotsSuffixAttentionInfer;
 
 namespace vllm::cots {
-void qwen_bf16_suffix_attention_at(const at::Tensor& query,
-                                   const at::Tensor& key_cache,
-                                   const at::Tensor& value_cache,
-                                   const at::Tensor& block_table,
-                                   const at::Tensor& seq_lens, double scale,
-                                   at::Tensor& output, at::Tensor& output_lse);
-void qwen_bf16_scatter_suffix_kv_at(const at::Tensor& key,
-                                    const at::Tensor& value,
-                                    const at::Tensor& block_ids,
-                                    const at::Tensor& block_offsets,
-                                    at::Tensor& key_cache,
-                                    at::Tensor& value_cache);
+void gqa_bf16_suffix_attention_at(const at::Tensor& query,
+                                  const at::Tensor& key_cache,
+                                  const at::Tensor& value_cache,
+                                  const at::Tensor& block_table,
+                                  const at::Tensor& seq_lens, double scale,
+                                  at::Tensor& output, at::Tensor& output_lse);
+void gqa_bf16_scatter_suffix_kv_at(const at::Tensor& key,
+                                   const at::Tensor& value,
+                                   const at::Tensor& block_ids,
+                                   const at::Tensor& block_offsets,
+                                   at::Tensor& key_cache,
+                                   at::Tensor& value_cache);
 }  // namespace vllm::cots
 
 PYBIND11_MODULE(_cots_C, m) {
   m.doc() = "COTS Phase 1c native CPU runner (vllm/csrc/cots/).";
 
-  m.def("qwen_bf16_suffix_attention",
-        &vllm::cots::qwen_bf16_suffix_attention_at, py::arg("query"),
-        py::arg("key_cache"), py::arg("value_cache"), py::arg("block_table"),
-        py::arg("seq_lens"), py::arg("scale"), py::arg("output"),
-        py::arg("output_lse"));
-  m.def("qwen_bf16_scatter_suffix_kv",
-        &vllm::cots::qwen_bf16_scatter_suffix_kv_at, py::arg("key"),
+  m.def("gqa_bf16_suffix_attention", &vllm::cots::gqa_bf16_suffix_attention_at,
+        py::arg("query"), py::arg("key_cache"), py::arg("value_cache"),
+        py::arg("block_table"), py::arg("seq_lens"), py::arg("scale"),
+        py::arg("output"), py::arg("output_lse"));
+  m.def("gqa_bf16_scatter_suffix_kv",
+        &vllm::cots::gqa_bf16_scatter_suffix_kv_at, py::arg("key"),
         py::arg("value"), py::arg("block_ids"), py::arg("block_offsets"),
         py::arg("key_cache"), py::arg("value_cache"));
-
   py::class_<CotsSuffixAttentionInfer>(m, "CotsSuffixAttentionInfer")
       .def(py::init<>())
       .def("install", &CotsSuffixAttentionInfer::install, py::arg("n_tasks"))
       .def("populate_task", &CotsSuffixAttentionInfer::populate_task,
            py::arg("task_id"), py::arg("query_ptr"), py::arg("query_capacity"),
+           py::arg("num_q_heads"), py::arg("num_kv_heads"), py::arg("head_dim"),
            py::arg("query_stride0"), py::arg("query_stride1"),
            py::arg("query_stride2"), py::arg("key_cache_ptr"),
            py::arg("num_cpu_blocks"), py::arg("block_size"),

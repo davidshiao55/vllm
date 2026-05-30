@@ -3179,7 +3179,7 @@ def cpu_attention_with_kv_cache(
     )
 
 
-def cots_qwen_bf16_suffix_attention(
+def cots_gqa_bf16_suffix_attention(
     query: torch.Tensor,
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
@@ -3191,7 +3191,7 @@ def cots_qwen_bf16_suffix_attention(
 ) -> None:
     from vllm import _cots_C
 
-    _cots_C.qwen_bf16_suffix_attention(
+    _cots_C.gqa_bf16_suffix_attention(
         query,
         key_cache,
         value_cache,
@@ -3203,7 +3203,7 @@ def cots_qwen_bf16_suffix_attention(
     )
 
 
-def cots_qwen_bf16_scatter_suffix_kv(
+def cots_gqa_bf16_scatter_suffix_kv(
     key: torch.Tensor,
     value: torch.Tensor,
     block_ids: torch.Tensor,
@@ -3213,7 +3213,7 @@ def cots_qwen_bf16_scatter_suffix_kv(
 ) -> None:
     from vllm import _cots_C
 
-    _cots_C.qwen_bf16_scatter_suffix_kv(
+    _cots_C.gqa_bf16_scatter_suffix_kv(
         key,
         value,
         block_ids,

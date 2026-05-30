@@ -8,7 +8,7 @@ import torch
 
 pytest.importorskip("vllm._cots_C")
 
-from vllm._custom_ops import cots_qwen_bf16_suffix_attention  # noqa: E402
+from vllm._custom_ops import cots_gqa_bf16_suffix_attention  # noqa: E402
 from vllm.v1.attention.backends.cots_hybrid_attention import (  # noqa: E402
     CotsHybridDecodeMetadata,
     cots_hybrid_decode_attention,
@@ -108,7 +108,7 @@ def _decode_attn_full_reference(
 class _DirectSuffixRunner:
     kind = "test_direct"
 
-    def run_qwen_bf16_suffix_attention(
+    def run_gqa_bf16_suffix_attention(
         self,
         *,
         query: torch.Tensor,
@@ -132,7 +132,7 @@ class _DirectSuffixRunner:
         del cuda_anchor, task_id, scatter_block_ids, scatter_block_offsets
         del scatter_key_cpu, scatter_value_cpu
         del scatter_from_qkv, scatter_from_separate_kv, snapshot_inputs
-        cots_qwen_bf16_suffix_attention(
+        cots_gqa_bf16_suffix_attention(
             query=query,
             key_cache=key_cache,
             value_cache=value_cache,
@@ -185,7 +185,7 @@ def test_cots_hybrid_attention_merge_matches_full_reference(
 
     suffix_out_cpu = torch.empty_like(query)
     suffix_lse_cpu = torch.empty(28, batch, dtype=torch.float32)
-    cots_qwen_bf16_suffix_attention(
+    cots_gqa_bf16_suffix_attention(
         query=query,
         key_cache=suffix_key_cache,
         value_cache=suffix_value_cache,
@@ -493,7 +493,7 @@ class _PrefixOnlySuffixRunner:
         self.calls = 0
         self.seen_seq_lens: list[int] | None = None
 
-    def run_qwen_bf16_suffix_attention(
+    def run_gqa_bf16_suffix_attention(
         self,
         *,
         query: torch.Tensor,
@@ -534,7 +534,7 @@ class _RecordingPreparedSuffixRunner:
         self.scatter_block_offsets: torch.Tensor | None = None
         self.query_stride: tuple[int, ...] | None = None
 
-    def run_qwen_bf16_suffix_attention(
+    def run_gqa_bf16_suffix_attention(
         self,
         *,
         query: torch.Tensor,

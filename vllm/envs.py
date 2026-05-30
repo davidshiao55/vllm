@@ -50,8 +50,12 @@ if TYPE_CHECKING:
     VLLM_COTS_NVTX: bool = False
     VLLM_COTS_WAIT_KERNEL_DIAG: bool = False
     VLLM_COTS_SUFFIX_COUNTERS: bool = False
+    VLLM_COTS_SUFFIX_NUM_THREADS: int = 0
     VLLM_COTS_SUFFIX_WAIT_KERNEL_DIAG: bool = False
     VLLM_COTS_HYBRID_CUDA_TIMING: bool = False
+    VLLM_COTS_HYBRID_SUBMIT_TIMING: bool = False
+    VLLM_COTS_HYBRID_EARLY_SUFFIX_SUBMIT: bool = True
+    VLLM_COTS_HYBRID_COALESCED_PREFIX: bool = True
     VLLM_USE_FLASHINFER_SAMPLER: bool | None = None
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
@@ -713,6 +717,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     == "1",
     "VLLM_COTS_SUFFIX_COUNTERS": lambda: os.getenv("VLLM_COTS_SUFFIX_COUNTERS", "0")
     == "1",
+    "VLLM_COTS_SUFFIX_NUM_THREADS": lambda: int(
+        os.getenv("VLLM_COTS_SUFFIX_NUM_THREADS", "0")
+    ),
     "VLLM_COTS_SUFFIX_WAIT_KERNEL_DIAG": lambda: os.getenv(
         "VLLM_COTS_SUFFIX_WAIT_KERNEL_DIAG", "0"
     )
@@ -721,6 +728,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_COTS_HYBRID_CUDA_TIMING", "0"
     )
     == "1",
+    "VLLM_COTS_HYBRID_SUBMIT_TIMING": lambda: os.getenv(
+        "VLLM_COTS_HYBRID_SUBMIT_TIMING", "0"
+    )
+    == "1",
+    "VLLM_COTS_HYBRID_EARLY_SUFFIX_SUBMIT": lambda: os.getenv(
+        "VLLM_COTS_HYBRID_EARLY_SUFFIX_SUBMIT", "1"
+    )
+    .strip()
+    .lower()
+    not in ("0", "false", "off"),
+    "VLLM_COTS_HYBRID_COALESCED_PREFIX": lambda: os.getenv(
+        "VLLM_COTS_HYBRID_COALESCED_PREFIX", "1"
+    )
+    .strip()
+    .lower()
+    not in ("0", "false", "off"),
     # If set, vllm will use flashinfer sampler
     "VLLM_USE_FLASHINFER_SAMPLER": lambda: bool(
         int(os.environ["VLLM_USE_FLASHINFER_SAMPLER"])

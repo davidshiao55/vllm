@@ -206,6 +206,40 @@ def test_hybrid_kv_manager_caps_gpu_blocks_and_allocates_cpu_suffix():
     assert len(all_blocks.get_cpu_block_ids()[0]) == 1
 
 
+def test_hybrid_cpu_suffix_appears_only_after_crossing_split():
+    block_size = 4
+    manager = _make_kv_cache_manager(
+        block_size=block_size,
+        num_gpu_blocks=12,
+        num_cpu_blocks=2,
+        split_blocks=2,
+        max_model_len=16,
+    )
+    request = _make_request("req-a", prompt_len=7, block_size=block_size)
+
+    prompt_blocks = manager.allocate_slots(request, num_new_tokens=7)
+    assert prompt_blocks is not None
+    assert len(manager.get_blocks(request.request_id).get_block_ids()[0]) == 2
+    assert (
+        manager.get_blocks(request.request_id).get_cpu_block_ids(allow_none=True)
+        is None
+    )
+
+    request.num_computed_tokens = 7
+    request.append_output_token_ids(7)
+    split_edge_blocks = manager.allocate_slots(request, num_new_tokens=1)
+    assert split_edge_blocks is not None
+    assert split_edge_blocks.get_cpu_block_ids(allow_none=True) is None
+    assert len(manager.get_blocks(request.request_id).get_block_ids()[0]) == 2
+
+    request.num_computed_tokens = 8
+    request.append_output_token_ids(8)
+    suffix_blocks = manager.allocate_slots(request, num_new_tokens=1)
+    assert suffix_blocks is not None
+    assert suffix_blocks.get_block_ids(allow_none=True) is None
+    assert len(suffix_blocks.get_cpu_block_ids()[0]) == 1
+
+
 def test_hybrid_kv_manager_cpu_failure_returns_none_before_mutation():
     block_size = 4
     manager = _make_kv_cache_manager(
@@ -235,7 +269,7 @@ def test_hybrid_kv_manager_cpu_failure_returns_none_before_mutation():
     assert len(retry_blocks.get_cpu_block_ids()[0]) == 1
 
 
-def test_full_gpu_cache_commit_is_not_split_capped():
+def test_hybrid_cache_commit_is_split_between_gpu_prefix_and_cpu_suffix():
     block_size = 4
     manager = _make_kv_cache_manager(
         block_size=block_size,
@@ -246,11 +280,11 @@ def test_full_gpu_cache_commit_is_not_split_capped():
         enable_caching=True,
     )
     req_a = _make_request("req-a", prompt_len=13, block_size=block_size)
-    assert manager.allocate_slots(req_a, num_new_tokens=13) is not None
-    assert req_a.request_id in manager.cots_hybrid_full_gpu_req_ids
-    assert (
-        manager.get_blocks(req_a.request_id).get_cpu_block_ids(allow_none=True) is None
-    )
+    allocated_blocks = manager.allocate_slots(req_a, num_new_tokens=13)
+
+    assert allocated_blocks is not None
+    assert len(manager.get_blocks(req_a.request_id).get_block_ids()[0]) == 2
+    assert len(manager.get_blocks(req_a.request_id).get_cpu_block_ids()[0]) == 2
 
     manager.free(req_a)
 
@@ -258,15 +292,15 @@ def test_full_gpu_cache_commit_is_not_split_capped():
     computed_blocks, num_computed_tokens = manager.get_computed_blocks(req_b)
 
     assert num_computed_tokens == 12
-    assert len(computed_blocks.get_block_ids()[0]) == 3
-    assert computed_blocks.get_cpu_block_ids(allow_none=True) is None
+    assert len(computed_blocks.get_block_ids()[0]) == 2
+    assert len(computed_blocks.get_cpu_block_ids()[0]) == 1
 
 
-def test_hybrid_uses_cpu_suffix_when_final_context_does_not_fit():
+def test_hybrid_uses_cpu_suffix_by_position_even_when_gpu_has_room():
     block_size = 4
     manager = _make_kv_cache_manager(
         block_size=block_size,
-        num_gpu_blocks=3,
+        num_gpu_blocks=12,
         num_cpu_blocks=2,
         split_blocks=2,
         max_model_len=16,
@@ -274,17 +308,22 @@ def test_hybrid_uses_cpu_suffix_when_final_context_does_not_fit():
     )
 
     request = _make_request("req-a", prompt_len=8, block_size=block_size)
-    assert manager.allocate_slots(request, num_new_tokens=8) is not None
+    prompt_blocks = manager.allocate_slots(request, num_new_tokens=8)
+    assert prompt_blocks is not None
+    assert len(manager.get_blocks(request.request_id).get_block_ids()[0]) == 2
+    assert (
+        manager.get_blocks(request.request_id).get_cpu_block_ids(allow_none=True)
+        is None
+    )
+
     request.num_computed_tokens = 8
     request.append_output_token_ids(1)
-
     decode_blocks = manager.allocate_slots(request, num_new_tokens=1)
 
     assert decode_blocks is not None
-    assert request.request_id not in manager.cots_hybrid_full_gpu_req_ids
-    assert request.request_id in manager.cots_hybrid_cpu_suffix_req_ids
     assert decode_blocks.get_block_ids(allow_none=True) is None
     assert len(decode_blocks.get_cpu_block_ids()[0]) == 1
+    assert len(manager.get_blocks(request.request_id).get_block_ids()[0]) == 2
 
 
 def test_hybrid_kv_manager_does_not_evict_live_cached_cpu_suffix():
@@ -446,8 +485,6 @@ def test_hybrid_kv_manager_reports_and_resets_metrics():
     request.num_computed_tokens = 9
 
     manager.record_cots_hybrid_preemption(request)
-    manager.cots_hybrid_full_gpu_req_ids.add("gpu-live")
-    manager.cots_hybrid_cpu_suffix_req_ids.add("cpu-live")
     stats = manager.make_cots_hybrid_kv_stats(
         CotsHybridKVStats(
             cpu_suffix_attn_ms=2.0,
@@ -469,8 +506,6 @@ def test_hybrid_kv_manager_reports_and_resets_metrics():
     assert stats.q_d2h_bytes == 256
     assert stats.kv_d2h_bytes == 128
     assert stats.kv_uva_h2d_bytes == 64
-    assert manager.cots_hybrid_full_gpu_req_ids == {"gpu-live"}
-    assert manager.cots_hybrid_cpu_suffix_req_ids == {"req-a", "cpu-live"}
 
     next_stats = manager.make_cots_hybrid_kv_stats()
     assert next_stats is not None

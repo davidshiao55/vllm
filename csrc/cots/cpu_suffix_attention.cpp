@@ -4,10 +4,9 @@
 // COTS Phase 2 CPU suffix attention prototype.
 //
 // This is intentionally thesis-owned and narrow: decode-only BF16 suffix
-// attention for Qwen2.5-7B's GQA shape (28 query heads, 4 KV heads,
-// head_dim=128). vLLM's generic CPU attention is kept as a reference path;
-// this kernel exists so the COTS path can specialize the q_per_kv=7 case
-// instead of falling back to MHA-like work.
+// attention for GQA models with head_dim=128 and at most 8 query heads per KV
+// head. That covers the current Qwen2.5 and Llama 3 BF16 targets while keeping
+// the inner loop specialized enough for the COTS artifact path.
 
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
@@ -31,12 +30,10 @@ namespace vllm {
 namespace cots {
 namespace {
 
-constexpr int64_t kQwenNumQHeads = 28;
-constexpr int64_t kQwenNumKVHeads = 4;
-constexpr int64_t kQwenHeadsPerKV = 7;
-constexpr int64_t kQwenHeadDim = 128;
+constexpr int64_t kMaxHeadsPerKV = 8;
+constexpr int64_t kSupportedHeadDim = 128;
 constexpr int64_t kVecWidth = 8;
-constexpr int64_t kStackProbSeqLen = 128;
+constexpr int64_t kTwoPassMaxSeqLen = 128;
 
 inline float bf16_to_f32_scalar(uint16_t b) {
   uint32_t u = static_cast<uint32_t>(b) << 16;
@@ -102,6 +99,20 @@ struct SuffixAttentionStrides {
   int64_t lse_b;
 };
 
+struct SuffixScatterParams {
+  const uint16_t* key;
+  const uint16_t* value;
+  const int64_t* block_ids;
+  const int64_t* block_offsets;
+  int64_t count;
+  int64_t key_b;
+  int64_t key_h;
+  int64_t key_d;
+  int64_t value_b;
+  int64_t value_h;
+  int64_t value_d;
+};
+
 inline int32_t block_table_value(const int32_t* block_table,
                                  const SuffixAttentionStrides& strides,
                                  int64_t seq_idx, int64_t block_col) {
@@ -113,7 +124,7 @@ inline void zero_one_head(scalar_t* output,
                           const SuffixAttentionStrides& strides,
                           int64_t seq_idx, int64_t q_head) {
   scalar_t* out = output + seq_idx * strides.out_b + q_head * strides.out_h;
-  for (int64_t d = 0; d < kQwenHeadDim; ++d) {
+  for (int64_t d = 0; d < kSupportedHeadDim; ++d) {
     out[d * strides.out_d] = 0;
   }
 }
@@ -126,18 +137,62 @@ inline const uint16_t* kv_ptr(const uint16_t* cache,
          token_in_block * strides.kv_token;
 }
 
-void qwen_suffix_attention_one_group(
-    const uint16_t* query, const uint16_t* key_cache,
-    const uint16_t* value_cache, const int32_t* block_table,
-    const int32_t* seq_lens, uint16_t* output, float* output_lse,
-    const SuffixAttentionStrides& strides, int64_t block_size,
-    int64_t num_blocks, int64_t seq_idx, int64_t kv_head, float scale) {
+inline uint16_t* kv_ptr_mut(uint16_t* cache,
+                            const SuffixAttentionStrides& strides,
+                            int64_t block_id, int64_t kv_head,
+                            int64_t token_in_block) {
+  return cache + block_id * strides.kv_block + kv_head * strides.kv_head +
+         token_in_block * strides.kv_token;
+}
+
+inline const uint16_t* scatter_key_head_ptr(const SuffixScatterParams& scatter,
+                                            int64_t seq_idx, int64_t kv_head) {
+  return scatter.key + seq_idx * scatter.key_b + kv_head * scatter.key_h;
+}
+
+inline const uint16_t* scatter_value_head_ptr(
+    const SuffixScatterParams& scatter, int64_t seq_idx, int64_t kv_head) {
+  return scatter.value + seq_idx * scatter.value_b + kv_head * scatter.value_h;
+}
+
+inline void prefetch_bf16_head(const uint16_t* ptr) {
+  _mm_prefetch(reinterpret_cast<const char*>(ptr), _MM_HINT_T0);
+  _mm_prefetch(reinterpret_cast<const char*>(ptr + 32), _MM_HINT_T0);
+  _mm_prefetch(reinterpret_cast<const char*>(ptr + 64), _MM_HINT_T0);
+  _mm_prefetch(reinterpret_cast<const char*>(ptr + 96), _MM_HINT_T0);
+}
+
+template <int64_t HeadsPerKV>
+void gqa_suffix_attention_one_group(
+    const uint16_t* query, uint16_t* key_cache, uint16_t* value_cache,
+    const int32_t* block_table, const int32_t* seq_lens, uint16_t* output,
+    float* output_lse, const SuffixAttentionStrides& strides,
+    int64_t block_size, int64_t num_blocks, int64_t seq_idx, int64_t kv_head,
+    float scale, const SuffixScatterParams* scatter) {
   const int64_t seq_len = seq_lens[seq_idx];
-  const int64_t q_head_base = kv_head * kQwenHeadsPerKV;
+  constexpr int64_t heads_per_kv = HeadsPerKV;
+  const int64_t q_head_base = kv_head * heads_per_kv;
   constexpr float neg_inf = -std::numeric_limits<float>::infinity();
 
+  if (scatter != nullptr && seq_idx < scatter->count) {
+    const int64_t scatter_block_id = scatter->block_ids[seq_idx];
+    const int64_t scatter_block_offset = scatter->block_offsets[seq_idx];
+    const uint16_t* scatter_k_head =
+        scatter_key_head_ptr(*scatter, seq_idx, kv_head);
+    const uint16_t* scatter_v_head =
+        scatter_value_head_ptr(*scatter, seq_idx, kv_head);
+    uint16_t* dst_key = kv_ptr_mut(key_cache, strides, scatter_block_id,
+                                   kv_head, scatter_block_offset);
+    uint16_t* dst_value = kv_ptr_mut(value_cache, strides, scatter_block_id,
+                                     kv_head, scatter_block_offset);
+    for (int64_t d = 0; d < kSupportedHeadDim; ++d) {
+      dst_key[d * strides.kv_d] = scatter_k_head[d * scatter->key_d];
+      dst_value[d * strides.kv_d] = scatter_v_head[d * scatter->value_d];
+    }
+  }
+
   if (seq_len <= 0) {
-    for (int64_t q = 0; q < kQwenHeadsPerKV; ++q) {
+    for (int64_t q = 0; q < heads_per_kv; ++q) {
       const int64_t q_head = q_head_base + q;
       output_lse[q_head * strides.lse_h + seq_idx * strides.lse_b] = neg_inf;
       zero_one_head(output, strides, seq_idx, q_head);
@@ -145,170 +200,259 @@ void qwen_suffix_attention_one_group(
     return;
   }
 
-  float max_logits[kQwenHeadsPerKV];
-  std::fill(std::begin(max_logits), std::end(max_logits), neg_inf);
-  float sums[kQwenHeadsPerKV];
-  std::fill(std::begin(sums), std::end(sums), 0.0f);
-
-  std::array<float, kQwenHeadsPerKV * kStackProbSeqLen> stack_probs;
-  std::vector<float> heap_probs;
-  float* probs = nullptr;
-  if (seq_len <= kStackProbSeqLen) {
-    probs = stack_probs.data();
-  } else {
-    heap_probs.resize(kQwenHeadsPerKV * seq_len);
-    probs = heap_probs.data();
-  }
-
-  std::array<const uint16_t*, kStackProbSeqLen> stack_v_ptrs;
-  std::vector<const uint16_t*> heap_v_ptrs;
-  const uint16_t** v_ptrs = nullptr;
-  if (seq_len <= kStackProbSeqLen) {
-    v_ptrs = stack_v_ptrs.data();
-  } else {
-    heap_v_ptrs.resize(seq_len);
-    v_ptrs = heap_v_ptrs.data();
-  }
-
-  const uint16_t* q_ptrs[kQwenHeadsPerKV];
-  for (int64_t q = 0; q < kQwenHeadsPerKV; ++q) {
+  const uint16_t* q_ptrs[HeadsPerKV];
+  for (int64_t q = 0; q < heads_per_kv; ++q) {
     const int64_t q_head = q_head_base + q;
     q_ptrs[q] = query + seq_idx * strides.q_b + q_head * strides.q_h;
   }
 
-  alignas(32) std::array<float, kQwenHeadsPerKV * kQwenHeadDim> q_f32;
-  for (int64_t q = 0; q < kQwenHeadsPerKV; ++q) {
-    float* q_dst = q_f32.data() + q * kQwenHeadDim;
-    for (int64_t d = 0; d < kQwenHeadDim; d += kVecWidth) {
+  alignas(32) std::array<float, HeadsPerKV * kSupportedHeadDim> q_f32;
+  for (int64_t q = 0; q < heads_per_kv; ++q) {
+    float* q_dst = q_f32.data() + q * kSupportedHeadDim;
+    for (int64_t d = 0; d < kSupportedHeadDim; d += kVecWidth) {
       const __m256 q_vec = load8_bf16_as_f32(q_ptrs[q] + d * strides.q_d);
       _mm256_store_ps(q_dst + d, q_vec);
     }
   }
 
+  if (seq_len <= kTwoPassMaxSeqLen) {
+    alignas(
+        32) thread_local std::array<float, kMaxHeadsPerKV * kTwoPassMaxSeqLen>
+        logits;
+    float two_pass_max_logits[HeadsPerKV];
+    std::fill(two_pass_max_logits, two_pass_max_logits + heads_per_kv, neg_inf);
+
+    for (int64_t block_col = 0, t = 0; t < seq_len; ++block_col) {
+      const int32_t block_id =
+          block_table_value(block_table, strides, seq_idx, block_col);
+  #ifndef NDEBUG
+      TORCH_CHECK(block_id >= 0 && block_id < num_blocks,
+                  "block_table contains an out-of-range block id: ", block_id,
+                  " valid range is [0, ", num_blocks, ")");
+  #endif
+      const int64_t block_token_begin = block_col * block_size;
+      const int64_t block_token_end =
+          std::min(seq_len, block_token_begin + block_size);
+
+      for (; t < block_token_end; ++t) {
+        const int64_t token_in_block = t - block_token_begin;
+        const uint16_t* k_ptr =
+            kv_ptr(key_cache, strides, block_id, kv_head, token_in_block);
+        if (t + 1 < block_token_end) {
+          const int64_t next_token_in_block = token_in_block + 1;
+          prefetch_bf16_head(kv_ptr(key_cache, strides, block_id, kv_head,
+                                    next_token_in_block));
+        }
+
+        __m256 acc[HeadsPerKV];
+        for (int64_t q = 0; q < heads_per_kv; ++q) {
+          acc[q] = _mm256_setzero_ps();
+        }
+
+        for (int64_t d = 0; d < kSupportedHeadDim; d += kVecWidth) {
+          const __m256 k_vec = load8_bf16_as_f32(k_ptr + d * strides.kv_d);
+          for (int64_t q = 0; q < heads_per_kv; ++q) {
+            const __m256 q_vec =
+                _mm256_load_ps(q_f32.data() + q * kSupportedHeadDim + d);
+            acc[q] = _mm256_fmadd_ps(q_vec, k_vec, acc[q]);
+          }
+        }
+
+        for (int64_t q = 0; q < heads_per_kv; ++q) {
+          const float logit = hreduce_ps(acc[q]) * scale;
+          logits[q * kTwoPassMaxSeqLen + t] = logit;
+          two_pass_max_logits[q] = std::max(two_pass_max_logits[q], logit);
+        }
+      }
+    }
+
+    alignas(32) std::array<float, HeadsPerKV * kSupportedHeadDim> out_f32;
+    std::fill(out_f32.begin(), out_f32.end(), 0.0f);
+    float two_pass_sums[HeadsPerKV];
+    std::fill(two_pass_sums, two_pass_sums + heads_per_kv, 0.0f);
+
+    for (int64_t block_col = 0, t = 0; t < seq_len; ++block_col) {
+      const int32_t block_id =
+          block_table_value(block_table, strides, seq_idx, block_col);
+      const int64_t block_token_begin = block_col * block_size;
+      const int64_t block_token_end =
+          std::min(seq_len, block_token_begin + block_size);
+
+      for (; t < block_token_end; ++t) {
+        const int64_t token_in_block = t - block_token_begin;
+        const uint16_t* v_ptr =
+            kv_ptr(value_cache, strides, block_id, kv_head, token_in_block);
+        if (t + 1 < block_token_end) {
+          const int64_t next_token_in_block = token_in_block + 1;
+          prefetch_bf16_head(kv_ptr(value_cache, strides, block_id, kv_head,
+                                    next_token_in_block));
+        }
+
+        __m256 beta_vec[HeadsPerKV];
+        for (int64_t q = 0; q < heads_per_kv; ++q) {
+          const float beta = std::exp(logits[q * kTwoPassMaxSeqLen + t] -
+                                      two_pass_max_logits[q]);
+          two_pass_sums[q] += beta;
+          beta_vec[q] = _mm256_set1_ps(beta);
+        }
+
+        for (int64_t d = 0; d < kSupportedHeadDim; d += kVecWidth) {
+          const __m256 v_vec = load8_bf16_as_f32(v_ptr + d * strides.kv_d);
+          for (int64_t q = 0; q < heads_per_kv; ++q) {
+            float* out_dst = out_f32.data() + q * kSupportedHeadDim + d;
+            const __m256 prev = _mm256_load_ps(out_dst);
+            const __m256 next = _mm256_fmadd_ps(beta_vec[q], v_vec, prev);
+            _mm256_store_ps(out_dst, next);
+          }
+        }
+      }
+    }
+
+    for (int64_t q = 0; q < heads_per_kv; ++q) {
+      const float inv_sum = 1.0f / two_pass_sums[q];
+      const float lse = std::log(two_pass_sums[q]) + two_pass_max_logits[q];
+      const int64_t q_head = q_head_base + q;
+      output_lse[q_head * strides.lse_h + seq_idx * strides.lse_b] = lse;
+      const __m256 inv_sum_vec = _mm256_set1_ps(inv_sum);
+      for (int64_t d = 0; d < kSupportedHeadDim; d += kVecWidth) {
+        const __m256 out_vec = _mm256_mul_ps(
+            _mm256_load_ps(out_f32.data() + q * kSupportedHeadDim + d),
+            inv_sum_vec);
+        uint16_t* out_ptr = output + seq_idx * strides.out_b +
+                            q_head * strides.out_h + d * strides.out_d;
+        store8_f32_as_bf16(out_vec, out_ptr);
+      }
+    }
+    return;
+  }
+
+  alignas(32) std::array<float, HeadsPerKV * kSupportedHeadDim> out_f32;
+  std::fill(out_f32.begin(), out_f32.end(), 0.0f);
+
+  float max_logits[HeadsPerKV];
+  std::fill(max_logits, max_logits + heads_per_kv, neg_inf);
+  float sums[HeadsPerKV];
+  std::fill(sums, sums + heads_per_kv, 0.0f);
+
   for (int64_t block_col = 0, t = 0; t < seq_len; ++block_col) {
     const int32_t block_id =
         block_table_value(block_table, strides, seq_idx, block_col);
+  #ifndef NDEBUG
     TORCH_CHECK(block_id >= 0 && block_id < num_blocks,
                 "block_table contains an out-of-range block id: ", block_id,
                 " valid range is [0, ", num_blocks, ")");
+  #endif
     const int64_t block_token_begin = block_col * block_size;
     const int64_t block_token_end =
         std::min(seq_len, block_token_begin + block_size);
 
-    for (; t + 1 < block_token_end; t += 2) {
-      const int64_t token_in_block = t - block_token_begin;
-      const uint16_t* k0_ptr =
-          kv_ptr(key_cache, strides, block_id, kv_head, token_in_block);
-      const uint16_t* k1_ptr =
-          kv_ptr(key_cache, strides, block_id, kv_head, token_in_block + 1);
-      v_ptrs[t] =
-          kv_ptr(value_cache, strides, block_id, kv_head, token_in_block);
-      v_ptrs[t + 1] =
-          kv_ptr(value_cache, strides, block_id, kv_head, token_in_block + 1);
-
-      __m256 acc0[kQwenHeadsPerKV];
-      __m256 acc1[kQwenHeadsPerKV];
-      for (int64_t q = 0; q < kQwenHeadsPerKV; ++q) {
-        acc0[q] = _mm256_setzero_ps();
-        acc1[q] = _mm256_setzero_ps();
-      }
-
-      for (int64_t d = 0; d < kQwenHeadDim; d += kVecWidth) {
-        const __m256 k0_vec = load8_bf16_as_f32(k0_ptr + d * strides.kv_d);
-        const __m256 k1_vec = load8_bf16_as_f32(k1_ptr + d * strides.kv_d);
-        for (int64_t q = 0; q < kQwenHeadsPerKV; ++q) {
-          const __m256 q_vec =
-              _mm256_load_ps(q_f32.data() + q * kQwenHeadDim + d);
-          acc0[q] = _mm256_fmadd_ps(q_vec, k0_vec, acc0[q]);
-          acc1[q] = _mm256_fmadd_ps(q_vec, k1_vec, acc1[q]);
-        }
-      }
-
-      for (int64_t q = 0; q < kQwenHeadsPerKV; ++q) {
-        const float logit0 = hreduce_ps(acc0[q]) * scale;
-        const float logit1 = hreduce_ps(acc1[q]) * scale;
-        probs[q * seq_len + t] = logit0;
-        probs[q * seq_len + t + 1] = logit1;
-        max_logits[q] = std::max(max_logits[q], std::max(logit0, logit1));
-      }
-    }
-
-    if (t < block_token_end) {
+    for (; t < block_token_end; ++t) {
       const int64_t token_in_block = t - block_token_begin;
       const uint16_t* k_ptr =
           kv_ptr(key_cache, strides, block_id, kv_head, token_in_block);
-      v_ptrs[t] =
+      const uint16_t* v_ptr =
           kv_ptr(value_cache, strides, block_id, kv_head, token_in_block);
 
-      __m256 acc[kQwenHeadsPerKV];
-      for (int64_t q = 0; q < kQwenHeadsPerKV; ++q) {
+      if (t + 1 < block_token_end) {
+        const int64_t next_token_in_block = token_in_block + 1;
+        prefetch_bf16_head(
+            kv_ptr(key_cache, strides, block_id, kv_head, next_token_in_block));
+        prefetch_bf16_head(kv_ptr(value_cache, strides, block_id, kv_head,
+                                  next_token_in_block));
+      }
+
+      __m256 acc[HeadsPerKV];
+      for (int64_t q = 0; q < heads_per_kv; ++q) {
         acc[q] = _mm256_setzero_ps();
       }
 
-      for (int64_t d = 0; d < kQwenHeadDim; d += kVecWidth) {
+      for (int64_t d = 0; d < kSupportedHeadDim; d += kVecWidth) {
         const __m256 k_vec = load8_bf16_as_f32(k_ptr + d * strides.kv_d);
-        for (int64_t q = 0; q < kQwenHeadsPerKV; ++q) {
+        for (int64_t q = 0; q < heads_per_kv; ++q) {
           const __m256 q_vec =
-              _mm256_load_ps(q_f32.data() + q * kQwenHeadDim + d);
+              _mm256_load_ps(q_f32.data() + q * kSupportedHeadDim + d);
           acc[q] = _mm256_fmadd_ps(q_vec, k_vec, acc[q]);
         }
       }
 
-      for (int64_t q = 0; q < kQwenHeadsPerKV; ++q) {
+      float alpha[HeadsPerKV];
+      float beta[HeadsPerKV];
+      for (int64_t q = 0; q < heads_per_kv; ++q) {
         const float logit = hreduce_ps(acc[q]) * scale;
-        probs[q * seq_len + t] = logit;
-        max_logits[q] = std::max(max_logits[q], logit);
+        const float old_max = max_logits[q];
+        const float new_max = std::max(old_max, logit);
+        alpha[q] = std::exp(old_max - new_max);
+        beta[q] = std::exp(logit - new_max);
+        sums[q] = sums[q] * alpha[q] + beta[q];
+        max_logits[q] = new_max;
       }
-      ++t;
+
+      __m256 alpha_vec[HeadsPerKV];
+      __m256 beta_vec[HeadsPerKV];
+      for (int64_t q = 0; q < heads_per_kv; ++q) {
+        alpha_vec[q] = _mm256_set1_ps(alpha[q]);
+        beta_vec[q] = _mm256_set1_ps(beta[q]);
+      }
+
+      for (int64_t d = 0; d < kSupportedHeadDim; d += kVecWidth) {
+        const __m256 v_vec = load8_bf16_as_f32(v_ptr + d * strides.kv_d);
+        for (int64_t q = 0; q < heads_per_kv; ++q) {
+          float* out_dst = out_f32.data() + q * kSupportedHeadDim + d;
+          const __m256 prev = _mm256_load_ps(out_dst);
+          const __m256 scaled = _mm256_mul_ps(prev, alpha_vec[q]);
+          const __m256 next = _mm256_fmadd_ps(beta_vec[q], v_vec, scaled);
+          _mm256_store_ps(out_dst, next);
+        }
+      }
     }
   }
 
-  float inv_sums[kQwenHeadsPerKV];
-  for (int64_t q = 0; q < kQwenHeadsPerKV; ++q) {
-    for (int64_t t = 0; t < seq_len; ++t) {
-      const float prob = std::exp(probs[q * seq_len + t] - max_logits[q]);
-      probs[q * seq_len + t] = prob;
-      sums[q] += prob;
-    }
-    inv_sums[q] = 1.0f / sums[q];
-    for (int64_t t = 0; t < seq_len; ++t) {
-      probs[q * seq_len + t] *= inv_sums[q];
-    }
+  for (int64_t q = 0; q < heads_per_kv; ++q) {
+    const float inv_sum = 1.0f / sums[q];
     const float lse = std::log(sums[q]) + max_logits[q];
     const int64_t q_head = q_head_base + q;
     output_lse[q_head * strides.lse_h + seq_idx * strides.lse_b] = lse;
-  }
-
-  for (int64_t d = 0; d < kQwenHeadDim; d += kVecWidth) {
-    __m256 out_acc[kQwenHeadsPerKV];
-    for (int64_t q = 0; q < kQwenHeadsPerKV; ++q) {
-      out_acc[q] = _mm256_setzero_ps();
-    }
-    for (int64_t t = 0; t < seq_len; ++t) {
-      const __m256 v_vec = load8_bf16_as_f32(v_ptrs[t] + d * strides.kv_d);
-      for (int64_t q = 0; q < kQwenHeadsPerKV; ++q) {
-        const __m256 prob_vec = _mm256_set1_ps(probs[q * seq_len + t]);
-        out_acc[q] = _mm256_fmadd_ps(prob_vec, v_vec, out_acc[q]);
-      }
-    }
-    for (int64_t q = 0; q < kQwenHeadsPerKV; ++q) {
-      const int64_t q_head = q_head_base + q;
+    const __m256 inv_sum_vec = _mm256_set1_ps(inv_sum);
+    for (int64_t d = 0; d < kSupportedHeadDim; d += kVecWidth) {
+      const __m256 out_vec = _mm256_mul_ps(
+          _mm256_load_ps(out_f32.data() + q * kSupportedHeadDim + d),
+          inv_sum_vec);
       uint16_t* out_ptr = output + seq_idx * strides.out_b +
                           q_head * strides.out_h + d * strides.out_d;
-      store8_f32_as_bf16(out_acc[q], out_ptr);
+      store8_f32_as_bf16(out_vec, out_ptr);
     }
   }
 }
 
+template <int64_t HeadsPerKV>
+void run_gqa_suffix_attention_groups(
+    const uint16_t* q_ptr, uint16_t* k_ptr, uint16_t* v_ptr,
+    const int32_t* bt_ptr, const int32_t* len_ptr, uint16_t* out_ptr,
+    float* lse_ptr, const SuffixAttentionStrides& strides, int64_t batch,
+    int64_t block_size, int64_t num_blocks, int64_t num_kv_heads, float scale_f,
+    const SuffixScatterParams* scatter = nullptr) {
+  at::parallel_for(0, batch * num_kv_heads, /*grain_size=*/8,
+                   [&](int64_t begin, int64_t end) {
+                     for (int64_t task = begin; task < end; ++task) {
+                       const int64_t seq_idx = task / num_kv_heads;
+                       const int64_t kv_head = task - seq_idx * num_kv_heads;
+                       gqa_suffix_attention_one_group<HeadsPerKV>(
+                           q_ptr, k_ptr, v_ptr, bt_ptr, len_ptr, out_ptr,
+                           lse_ptr, strides, block_size, num_blocks, seq_idx,
+                           kv_head, scale_f, scatter);
+                     }
+                   });
+}
+
 #endif  // VLLM_COTS_SUFFIX_ATTN_HAS_AVX2_FMA
 
-void validate_qwen_suffix_attention_tensors(const at::Tensor& query,
-                                            const at::Tensor& key_cache,
-                                            const at::Tensor& value_cache,
-                                            const at::Tensor& block_table,
-                                            const at::Tensor& seq_lens,
-                                            const at::Tensor& output,
-                                            const at::Tensor& output_lse) {
+void validate_gqa_suffix_attention_tensors(const at::Tensor& query,
+                                           const at::Tensor& key_cache,
+                                           const at::Tensor& value_cache,
+                                           const at::Tensor& block_table,
+                                           const at::Tensor& seq_lens,
+                                           const at::Tensor& output,
+                                           const at::Tensor& output_lse) {
   TORCH_CHECK(query.device().is_cpu(), "query must be a CPU tensor");
   TORCH_CHECK(key_cache.device().is_cpu(), "key_cache must be a CPU tensor");
   TORCH_CHECK(value_cache.device().is_cpu(),
@@ -326,23 +470,46 @@ void validate_qwen_suffix_attention_tensors(const at::Tensor& query,
   TORCH_CHECK(output.dtype() == at::kBFloat16, "output must be bfloat16");
   TORCH_CHECK(output_lse.dtype() == at::kFloat, "output_lse must be float32");
   TORCH_CHECK(block_table.dtype() == at::kInt,
-              "block_table must be int32 for the prototype");
+              "block_table must be int32 for the COTS suffix kernel");
   TORCH_CHECK(seq_lens.dtype() == at::kInt,
-              "seq_lens must be int32 for the prototype");
+              "seq_lens must be int32 for the COTS suffix kernel");
 
-  TORCH_CHECK(query.dim() == 3, "query must have shape [B, 28, 128]");
-  TORCH_CHECK(output.dim() == 3, "output must have shape [B, 28, 128]");
-  TORCH_CHECK(key_cache.dim() == 4,
-              "key_cache must have shape [blocks, 4, block_size, 128]");
-  TORCH_CHECK(value_cache.dim() == 4,
-              "value_cache must have shape [blocks, 4, block_size, 128]");
+  TORCH_CHECK(query.dim() == 3, "query must have shape [B, num_q_heads, 128]");
+  TORCH_CHECK(output.dim() == 3,
+              "output must have shape [B, num_q_heads, 128]");
+  TORCH_CHECK(
+      key_cache.dim() == 4,
+      "key_cache must have shape [blocks, num_kv_heads, block_size, 128]");
+  TORCH_CHECK(
+      value_cache.dim() == 4,
+      "value_cache must have shape [blocks, num_kv_heads, block_size, 128]");
   TORCH_CHECK(block_table.dim() == 2, "block_table must be 2D");
   TORCH_CHECK(seq_lens.dim() == 1, "seq_lens must be 1D");
-  TORCH_CHECK(output_lse.dim() == 2, "output_lse must have shape [28, B]");
+  TORCH_CHECK(output_lse.dim() == 2,
+              "output_lse must have shape [num_q_heads, B]");
 
   const int64_t batch = query.size(0);
+  const int64_t num_q_heads = query.size(1);
+  const int64_t head_dim = query.size(2);
+  const int64_t num_kv_heads = key_cache.size(1);
   const int64_t block_size = key_cache.size(2);
+  TORCH_CHECK(batch >= 0, "query batch must be non-negative");
+  TORCH_CHECK(num_q_heads > 0, "query must have at least one head");
+  TORCH_CHECK(num_kv_heads > 0, "key_cache must have at least one KV head");
   TORCH_CHECK(block_size > 0, "key_cache block_size must be positive");
+  TORCH_CHECK(head_dim == kSupportedHeadDim,
+              "COTS suffix attention currently supports head_dim=128, got ",
+              head_dim);
+  TORCH_CHECK(key_cache.size(3) == head_dim,
+              "key_cache head_dim must match query head_dim");
+  TORCH_CHECK(num_q_heads % num_kv_heads == 0,
+              "num_q_heads must be divisible by num_kv_heads, got ",
+              num_q_heads, " and ", num_kv_heads);
+  const int64_t heads_per_kv = num_q_heads / num_kv_heads;
+  TORCH_CHECK(heads_per_kv <= kMaxHeadsPerKV,
+              "COTS suffix attention supports at most ", kMaxHeadsPerKV,
+              " query heads per KV head, got ", heads_per_kv);
+
   const auto* len_ptr = seq_lens.data_ptr<int32_t>();
   for (int64_t seq_idx = 0; seq_idx < batch; ++seq_idx) {
     const int64_t seq_len = len_ptr[seq_idx];
@@ -352,23 +519,15 @@ void validate_qwen_suffix_attention_tensors(const at::Tensor& query,
                 "block_table has too few columns for seq_lens: needed ",
                 needed_blocks, ", got ", block_table.size(1));
   }
-  TORCH_CHECK(query.size(1) == kQwenNumQHeads && query.size(2) == kQwenHeadDim,
-              "query must have shape [B, 28, 128]");
-  TORCH_CHECK(output.size(0) == batch && output.size(1) == kQwenNumQHeads &&
-                  output.size(2) == kQwenHeadDim,
-              "output shape must match query");
-  TORCH_CHECK(
-      key_cache.size(1) == kQwenNumKVHeads && key_cache.size(3) == kQwenHeadDim,
-      "key_cache must have shape [blocks, 4, block_size, 128]");
+  TORCH_CHECK(output.sizes() == query.sizes(), "output shape must match query");
   TORCH_CHECK(value_cache.sizes() == key_cache.sizes(),
               "value_cache shape must match key_cache");
   TORCH_CHECK(block_table.size(0) == batch,
               "block_table batch dimension must match query");
   TORCH_CHECK(seq_lens.size(0) == batch,
               "seq_lens size must match query batch");
-  TORCH_CHECK(
-      output_lse.size(0) == kQwenNumQHeads && output_lse.size(1) == batch,
-      "output_lse must have shape [28, B]");
+  TORCH_CHECK(output_lse.size(0) == num_q_heads && output_lse.size(1) == batch,
+              "output_lse must have shape [num_q_heads, B]");
 
   TORCH_CHECK(query.stride(2) == 1, "query head_dim must be contiguous");
   TORCH_CHECK(key_cache.stride(3) == 1,
@@ -377,9 +536,9 @@ void validate_qwen_suffix_attention_tensors(const at::Tensor& query,
               "value_cache head_dim must be contiguous");
   TORCH_CHECK(output.stride(2) == 1, "output head_dim must be contiguous");
   TORCH_CHECK(block_table.is_contiguous(),
-              "block_table must be contiguous in the prototype");
+              "block_table must be contiguous in the COTS suffix kernel");
   TORCH_CHECK(seq_lens.is_contiguous(),
-              "seq_lens must be contiguous in the prototype");
+              "seq_lens must be contiguous in the COTS suffix kernel");
   TORCH_CHECK(output_lse.stride(1) == 1,
               "output_lse sequence dimension must be contiguous");
 
@@ -402,18 +561,47 @@ void validate_qwen_suffix_attention_tensors(const at::Tensor& query,
 
 }  // namespace
 
-void qwen_bf16_suffix_attention_at(const at::Tensor& query,
-                                   const at::Tensor& key_cache,
-                                   const at::Tensor& value_cache,
-                                   const at::Tensor& block_table,
-                                   const at::Tensor& seq_lens, double scale,
-                                   at::Tensor& output, at::Tensor& output_lse) {
-  validate_qwen_suffix_attention_tensors(
+void gqa_bf16_suffix_attention_unchecked_at(const at::Tensor& query,
+                                            const at::Tensor& key_cache,
+                                            const at::Tensor& value_cache,
+                                            const at::Tensor& block_table,
+                                            const at::Tensor& seq_lens,
+                                            double scale, at::Tensor& output,
+                                            at::Tensor& output_lse);
+void gqa_bf16_suffix_attention_scatter_unchecked_at(
+    const at::Tensor& query, const at::Tensor& key_cache,
+    const at::Tensor& value_cache, const at::Tensor& block_table,
+    const at::Tensor& seq_lens, double scale, at::Tensor& output,
+    at::Tensor& output_lse, const at::Tensor& scatter_key,
+    const at::Tensor& scatter_value, const at::Tensor& scatter_block_ids,
+    const at::Tensor& scatter_block_offsets);
+
+void gqa_bf16_suffix_attention_at(const at::Tensor& query,
+                                  const at::Tensor& key_cache,
+                                  const at::Tensor& value_cache,
+                                  const at::Tensor& block_table,
+                                  const at::Tensor& seq_lens, double scale,
+                                  at::Tensor& output, at::Tensor& output_lse) {
+  validate_gqa_suffix_attention_tensors(
       query, key_cache, value_cache, block_table, seq_lens, output, output_lse);
+  gqa_bf16_suffix_attention_unchecked_at(query, key_cache, value_cache,
+                                         block_table, seq_lens, scale, output,
+                                         output_lse);
+}
+
+void gqa_bf16_suffix_attention_unchecked_at(const at::Tensor& query,
+                                            const at::Tensor& key_cache,
+                                            const at::Tensor& value_cache,
+                                            const at::Tensor& block_table,
+                                            const at::Tensor& seq_lens,
+                                            double scale, at::Tensor& output,
+                                            at::Tensor& output_lse) {
 #if VLLM_COTS_SUFFIX_ATTN_HAS_AVX2_FMA
   const int64_t batch = query.size(0);
   const int64_t block_size = key_cache.size(2);
   const int64_t num_blocks = key_cache.size(0);
+  const int64_t num_kv_heads = key_cache.size(1);
+  const int64_t heads_per_kv = query.size(1) / num_kv_heads;
   const auto strides = SuffixAttentionStrides{
       query.stride(0),      query.stride(1),       query.stride(2),
       key_cache.stride(0),  key_cache.stride(1),   key_cache.stride(2),
@@ -423,80 +611,204 @@ void qwen_bf16_suffix_attention_at(const at::Tensor& query,
   };
 
   const auto* q_ptr = reinterpret_cast<const uint16_t*>(query.data_ptr());
-  const auto* k_ptr = reinterpret_cast<const uint16_t*>(key_cache.data_ptr());
-  const auto* v_ptr = reinterpret_cast<const uint16_t*>(value_cache.data_ptr());
+  auto* k_ptr = reinterpret_cast<uint16_t*>(key_cache.data_ptr());
+  auto* v_ptr = reinterpret_cast<uint16_t*>(value_cache.data_ptr());
   const auto* bt_ptr = block_table.data_ptr<int32_t>();
   const auto* len_ptr = seq_lens.data_ptr<int32_t>();
   auto* out_ptr = reinterpret_cast<uint16_t*>(output.data_ptr());
   auto* lse_ptr = output_lse.data_ptr<float>();
   const float scale_f = static_cast<float>(scale);
 
-  at::parallel_for(0, batch * kQwenNumKVHeads, /*grain_size=*/1,
-                   [&](int64_t begin, int64_t end) {
-                     for (int64_t task = begin; task < end; ++task) {
-                       const int64_t seq_idx = task / kQwenNumKVHeads;
-                       const int64_t kv_head = task - seq_idx * kQwenNumKVHeads;
-                       qwen_suffix_attention_one_group(
-                           q_ptr, k_ptr, v_ptr, bt_ptr, len_ptr, out_ptr,
-                           lse_ptr, strides, block_size, num_blocks, seq_idx,
-                           kv_head, scale_f);
-                     }
-                   });
+  switch (heads_per_kv) {
+    case 1:
+      run_gqa_suffix_attention_groups<1>(
+          q_ptr, k_ptr, v_ptr, bt_ptr, len_ptr, out_ptr, lse_ptr, strides,
+          batch, block_size, num_blocks, num_kv_heads, scale_f);
+      break;
+    case 2:
+      run_gqa_suffix_attention_groups<2>(
+          q_ptr, k_ptr, v_ptr, bt_ptr, len_ptr, out_ptr, lse_ptr, strides,
+          batch, block_size, num_blocks, num_kv_heads, scale_f);
+      break;
+    case 3:
+      run_gqa_suffix_attention_groups<3>(
+          q_ptr, k_ptr, v_ptr, bt_ptr, len_ptr, out_ptr, lse_ptr, strides,
+          batch, block_size, num_blocks, num_kv_heads, scale_f);
+      break;
+    case 4:
+      run_gqa_suffix_attention_groups<4>(
+          q_ptr, k_ptr, v_ptr, bt_ptr, len_ptr, out_ptr, lse_ptr, strides,
+          batch, block_size, num_blocks, num_kv_heads, scale_f);
+      break;
+    case 5:
+      run_gqa_suffix_attention_groups<5>(
+          q_ptr, k_ptr, v_ptr, bt_ptr, len_ptr, out_ptr, lse_ptr, strides,
+          batch, block_size, num_blocks, num_kv_heads, scale_f);
+      break;
+    case 6:
+      run_gqa_suffix_attention_groups<6>(
+          q_ptr, k_ptr, v_ptr, bt_ptr, len_ptr, out_ptr, lse_ptr, strides,
+          batch, block_size, num_blocks, num_kv_heads, scale_f);
+      break;
+    case 7:
+      run_gqa_suffix_attention_groups<7>(
+          q_ptr, k_ptr, v_ptr, bt_ptr, len_ptr, out_ptr, lse_ptr, strides,
+          batch, block_size, num_blocks, num_kv_heads, scale_f);
+      break;
+    case 8:
+      run_gqa_suffix_attention_groups<8>(
+          q_ptr, k_ptr, v_ptr, bt_ptr, len_ptr, out_ptr, lse_ptr, strides,
+          batch, block_size, num_blocks, num_kv_heads, scale_f);
+      break;
+    default:
+      TORCH_CHECK(false, "unsupported COTS GQA heads_per_kv=", heads_per_kv);
+  }
 #else
-  TORCH_CHECK(false, "COTS Qwen suffix attention requires AVX2+FMA");
+  TORCH_CHECK(false, "COTS suffix attention requires AVX2+FMA");
 #endif
 }
 
-void qwen_bf16_scatter_suffix_kv_at(const at::Tensor& key,
-                                    const at::Tensor& value,
-                                    const at::Tensor& block_ids,
-                                    const at::Tensor& block_offsets,
-                                    at::Tensor& key_cache,
-                                    at::Tensor& value_cache) {
-  TORCH_CHECK(key.device().is_cpu(), "key must be a CPU tensor");
-  TORCH_CHECK(value.device().is_cpu(), "value must be a CPU tensor");
-  TORCH_CHECK(block_ids.device().is_cpu(), "block_ids must be a CPU tensor");
-  TORCH_CHECK(block_offsets.device().is_cpu(),
-              "block_offsets must be a CPU tensor");
-  TORCH_CHECK(key_cache.device().is_cpu(), "key_cache must be a CPU tensor");
-  TORCH_CHECK(value_cache.device().is_cpu(),
-              "value_cache must be a CPU tensor");
-
-  TORCH_CHECK(key.dtype() == at::kBFloat16, "key must be bfloat16");
-  TORCH_CHECK(value.dtype() == at::kBFloat16, "value must be bfloat16");
-  TORCH_CHECK(key_cache.dtype() == at::kBFloat16, "key_cache must be bfloat16");
-  TORCH_CHECK(value_cache.dtype() == at::kBFloat16,
-              "value_cache must be bfloat16");
-  TORCH_CHECK(block_ids.dtype() == at::kLong,
-              "block_ids must be int64 for the COTS scatter fast path");
-  TORCH_CHECK(block_offsets.dtype() == at::kLong,
-              "block_offsets must be int64 for the COTS scatter fast path");
-
-  TORCH_CHECK(key.dim() == 3 && value.dim() == 3,
-              "key/value must have shape [N, 4, 128]");
-  TORCH_CHECK(key.sizes() == value.sizes(), "key/value shapes must match");
-  TORCH_CHECK(key.size(1) == kQwenNumKVHeads && key.size(2) == kQwenHeadDim,
-              "key/value must have shape [N, 4, 128]");
-  TORCH_CHECK(key.stride(2) == 1 && value.stride(2) == 1,
-              "key/value head_dim must be contiguous");
-  TORCH_CHECK(key_cache.dim() == 4 && value_cache.dim() == 4,
-              "key/value caches must have shape [blocks, 4, block_size, 128]");
-  TORCH_CHECK(value_cache.sizes() == key_cache.sizes(),
-              "key/value cache shapes must match");
-  TORCH_CHECK(
-      key_cache.size(1) == kQwenNumKVHeads && key_cache.size(3) == kQwenHeadDim,
-      "key/value caches must have shape [blocks, 4, block_size, 128]");
-  TORCH_CHECK(key_cache.stride(3) == 1 && value_cache.stride(3) == 1,
-              "key/value cache head_dim must be contiguous");
-  TORCH_CHECK(block_ids.dim() == 1 && block_offsets.dim() == 1,
-              "block_ids/block_offsets must be 1D tensors");
-  TORCH_CHECK(block_ids.numel() == block_offsets.numel(),
-              "block_ids/block_offsets lengths must match");
-  TORCH_CHECK(key.size(0) >= block_ids.numel(),
-              "key/value must contain one row for each block id");
-
-  const int64_t n = block_ids.numel();
+void gqa_bf16_suffix_attention_scatter_unchecked_at(
+    const at::Tensor& query, const at::Tensor& key_cache,
+    const at::Tensor& value_cache, const at::Tensor& block_table,
+    const at::Tensor& seq_lens, double scale, at::Tensor& output,
+    at::Tensor& output_lse, const at::Tensor& scatter_key,
+    const at::Tensor& scatter_value, const at::Tensor& scatter_block_ids,
+    const at::Tensor& scatter_block_offsets) {
+#if VLLM_COTS_SUFFIX_ATTN_HAS_AVX2_FMA
+  const int64_t batch = query.size(0);
   const int64_t block_size = key_cache.size(2);
+  const int64_t num_blocks = key_cache.size(0);
+  const int64_t num_kv_heads = key_cache.size(1);
+  const int64_t heads_per_kv = query.size(1) / num_kv_heads;
+  const int64_t scatter_count = scatter_block_ids.numel();
+  TORCH_CHECK(scatter_count >= 0 && scatter_count <= batch,
+              "COTS suffix fused scatter count must be in [0, batch], got ",
+              scatter_count, " for batch ", batch);
+  TORCH_CHECK(scatter_block_offsets.numel() == scatter_count,
+              "COTS suffix fused scatter ids/offsets length mismatch");
+  TORCH_CHECK(scatter_key.dim() == 3 && scatter_value.dim() == 3,
+              "COTS suffix fused scatter K/V must be [N, num_kv_heads, 128]");
+  TORCH_CHECK(scatter_key.size(0) >= scatter_count &&
+                  scatter_value.size(0) >= scatter_count,
+              "COTS suffix fused scatter K/V row count is smaller than "
+              "scatter_count");
+  TORCH_CHECK(scatter_key.size(1) == num_kv_heads &&
+                  scatter_value.size(1) == num_kv_heads &&
+                  scatter_key.size(2) == kSupportedHeadDim &&
+                  scatter_value.size(2) == kSupportedHeadDim,
+              "COTS suffix fused scatter K/V shape must match KV heads and "
+              "head_dim=128");
+  TORCH_CHECK(scatter_key.dtype() == at::kBFloat16 &&
+                  scatter_value.dtype() == at::kBFloat16,
+              "COTS suffix fused scatter K/V must be BF16");
+  TORCH_CHECK(scatter_block_ids.dtype() == at::kLong &&
+                  scatter_block_offsets.dtype() == at::kLong,
+              "COTS suffix fused scatter block metadata must be int64");
+  TORCH_CHECK(scatter_block_ids.is_contiguous() &&
+                  scatter_block_offsets.is_contiguous(),
+              "COTS suffix fused scatter block metadata must be contiguous");
+
+  const auto* scatter_block_ids_ptr = scatter_block_ids.data_ptr<int64_t>();
+  const auto* scatter_block_offsets_ptr =
+      scatter_block_offsets.data_ptr<int64_t>();
+  for (int64_t i = 0; i < scatter_count; ++i) {
+    const int64_t block_id = scatter_block_ids_ptr[i];
+    const int64_t block_offset = scatter_block_offsets_ptr[i];
+    TORCH_CHECK(block_id >= 0 && block_id < num_blocks,
+                "COTS suffix fused scatter block id out of range");
+    TORCH_CHECK(block_offset >= 0 && block_offset < block_size,
+                "COTS suffix fused scatter block offset out of range");
+  }
+
+  const auto strides = SuffixAttentionStrides{
+      query.stride(0),      query.stride(1),       query.stride(2),
+      key_cache.stride(0),  key_cache.stride(1),   key_cache.stride(2),
+      key_cache.stride(3),  output.stride(0),      output.stride(1),
+      output.stride(2),     block_table.stride(0), block_table.stride(1),
+      output_lse.stride(0), output_lse.stride(1),
+  };
+  const SuffixScatterParams scatter{
+      reinterpret_cast<const uint16_t*>(scatter_key.data_ptr()),
+      reinterpret_cast<const uint16_t*>(scatter_value.data_ptr()),
+      scatter_block_ids_ptr,
+      scatter_block_offsets_ptr,
+      scatter_count,
+      scatter_key.stride(0),
+      scatter_key.stride(1),
+      scatter_key.stride(2),
+      scatter_value.stride(0),
+      scatter_value.stride(1),
+      scatter_value.stride(2),
+  };
+
+  const auto* q_ptr = reinterpret_cast<const uint16_t*>(query.data_ptr());
+  auto* k_ptr = reinterpret_cast<uint16_t*>(key_cache.data_ptr());
+  auto* v_ptr = reinterpret_cast<uint16_t*>(value_cache.data_ptr());
+  const auto* bt_ptr = block_table.data_ptr<int32_t>();
+  const auto* len_ptr = seq_lens.data_ptr<int32_t>();
+  auto* out_ptr = reinterpret_cast<uint16_t*>(output.data_ptr());
+  auto* lse_ptr = output_lse.data_ptr<float>();
+  const float scale_f = static_cast<float>(scale);
+
+  switch (heads_per_kv) {
+    case 1:
+      run_gqa_suffix_attention_groups<1>(
+          q_ptr, k_ptr, v_ptr, bt_ptr, len_ptr, out_ptr, lse_ptr, strides,
+          batch, block_size, num_blocks, num_kv_heads, scale_f, &scatter);
+      break;
+    case 2:
+      run_gqa_suffix_attention_groups<2>(
+          q_ptr, k_ptr, v_ptr, bt_ptr, len_ptr, out_ptr, lse_ptr, strides,
+          batch, block_size, num_blocks, num_kv_heads, scale_f, &scatter);
+      break;
+    case 3:
+      run_gqa_suffix_attention_groups<3>(
+          q_ptr, k_ptr, v_ptr, bt_ptr, len_ptr, out_ptr, lse_ptr, strides,
+          batch, block_size, num_blocks, num_kv_heads, scale_f, &scatter);
+      break;
+    case 4:
+      run_gqa_suffix_attention_groups<4>(
+          q_ptr, k_ptr, v_ptr, bt_ptr, len_ptr, out_ptr, lse_ptr, strides,
+          batch, block_size, num_blocks, num_kv_heads, scale_f, &scatter);
+      break;
+    case 5:
+      run_gqa_suffix_attention_groups<5>(
+          q_ptr, k_ptr, v_ptr, bt_ptr, len_ptr, out_ptr, lse_ptr, strides,
+          batch, block_size, num_blocks, num_kv_heads, scale_f, &scatter);
+      break;
+    case 6:
+      run_gqa_suffix_attention_groups<6>(
+          q_ptr, k_ptr, v_ptr, bt_ptr, len_ptr, out_ptr, lse_ptr, strides,
+          batch, block_size, num_blocks, num_kv_heads, scale_f, &scatter);
+      break;
+    case 7:
+      run_gqa_suffix_attention_groups<7>(
+          q_ptr, k_ptr, v_ptr, bt_ptr, len_ptr, out_ptr, lse_ptr, strides,
+          batch, block_size, num_blocks, num_kv_heads, scale_f, &scatter);
+      break;
+    case 8:
+      run_gqa_suffix_attention_groups<8>(
+          q_ptr, k_ptr, v_ptr, bt_ptr, len_ptr, out_ptr, lse_ptr, strides,
+          batch, block_size, num_blocks, num_kv_heads, scale_f, &scatter);
+      break;
+    default:
+      TORCH_CHECK(false, "unsupported COTS GQA heads_per_kv=", heads_per_kv);
+  }
+#else
+  TORCH_CHECK(false, "COTS suffix attention requires AVX2+FMA");
+#endif
+}
+
+void gqa_bf16_scatter_suffix_kv_unchecked_at(const at::Tensor& key,
+                                             const at::Tensor& value,
+                                             const at::Tensor& block_ids,
+                                             const at::Tensor& block_offsets,
+                                             at::Tensor& key_cache,
+                                             at::Tensor& value_cache) {
+  const int64_t n = block_ids.numel();
+  const int64_t num_kv_heads = key.size(1);
+  const int64_t head_dim = key.size(2);
   const auto* key_ptr = reinterpret_cast<const uint16_t*>(key.data_ptr());
   const auto* value_ptr = reinterpret_cast<const uint16_t*>(value.data_ptr());
   auto* key_cache_ptr = reinterpret_cast<uint16_t*>(key_cache.data_ptr());
@@ -518,11 +830,7 @@ void qwen_bf16_scatter_suffix_kv_at(const at::Tensor& key,
   for (int64_t i = 0; i < n; ++i) {
     const int64_t block_id = block_ids_ptr[i];
     const int64_t block_offset = block_offsets_ptr[i];
-    TORCH_CHECK(block_id >= 0 && block_id < key_cache.size(0),
-                "block_ids contains an out-of-range block id");
-    TORCH_CHECK(block_offset >= 0 && block_offset < block_size,
-                "block_offsets contains an out-of-range block offset");
-    for (int64_t h = 0; h < kQwenNumKVHeads; ++h) {
+    for (int64_t h = 0; h < num_kv_heads; ++h) {
       const uint16_t* src_key = key_ptr + i * key_b + h * key_h;
       const uint16_t* src_value = value_ptr + i * value_b + h * value_h;
       uint16_t* dst_key = key_cache_ptr + block_id * cache_block +
@@ -530,10 +838,80 @@ void qwen_bf16_scatter_suffix_kv_at(const at::Tensor& key,
       uint16_t* dst_value = value_cache_ptr + block_id * value_cache_block +
                             h * value_cache_head +
                             block_offset * value_cache_token;
-      std::memcpy(dst_key, src_key, kQwenHeadDim * sizeof(uint16_t));
-      std::memcpy(dst_value, src_value, kQwenHeadDim * sizeof(uint16_t));
+      std::memcpy(dst_key, src_key, head_dim * sizeof(uint16_t));
+      std::memcpy(dst_value, src_value, head_dim * sizeof(uint16_t));
     }
   }
+}
+
+void gqa_bf16_scatter_suffix_kv_at(const at::Tensor& key,
+                                   const at::Tensor& value,
+                                   const at::Tensor& block_ids,
+                                   const at::Tensor& block_offsets,
+                                   at::Tensor& key_cache,
+                                   at::Tensor& value_cache) {
+  TORCH_CHECK(key.device().is_cpu(), "key must be a CPU tensor");
+  TORCH_CHECK(value.device().is_cpu(), "value must be a CPU tensor");
+  TORCH_CHECK(block_ids.device().is_cpu(), "block_ids must be a CPU tensor");
+  TORCH_CHECK(block_offsets.device().is_cpu(),
+              "block_offsets must be a CPU tensor");
+  TORCH_CHECK(key_cache.device().is_cpu(), "key_cache must be a CPU tensor");
+  TORCH_CHECK(value_cache.device().is_cpu(),
+              "value_cache must be a CPU tensor");
+
+  TORCH_CHECK(key.dtype() == at::kBFloat16, "key must be bfloat16");
+  TORCH_CHECK(value.dtype() == at::kBFloat16, "value must be bfloat16");
+  TORCH_CHECK(key_cache.dtype() == at::kBFloat16, "key_cache must be bfloat16");
+  TORCH_CHECK(value_cache.dtype() == at::kBFloat16,
+              "value_cache must be bfloat16");
+  TORCH_CHECK(block_ids.dtype() == at::kLong,
+              "block_ids must be int64 for the COTS scatter fast path");
+  TORCH_CHECK(block_offsets.dtype() == at::kLong,
+              "block_offsets must be int64 for the COTS scatter fast path");
+
+  TORCH_CHECK(key.dim() == 3 && value.dim() == 3,
+              "key/value must have shape [N, num_kv_heads, 128]");
+  TORCH_CHECK(key.sizes() == value.sizes(), "key/value shapes must match");
+  const int64_t num_kv_heads = key.size(1);
+  const int64_t head_dim = key.size(2);
+  TORCH_CHECK(num_kv_heads > 0, "key/value must have at least one KV head");
+  TORCH_CHECK(head_dim == kSupportedHeadDim,
+              "COTS suffix KV scatter currently supports head_dim=128, got ",
+              head_dim);
+  TORCH_CHECK(key.stride(2) == 1 && value.stride(2) == 1,
+              "key/value head_dim must be contiguous");
+  TORCH_CHECK(key_cache.dim() == 4 && value_cache.dim() == 4,
+              "key/value caches must have shape [blocks, num_kv_heads, "
+              "block_size, 128]");
+  TORCH_CHECK(value_cache.sizes() == key_cache.sizes(),
+              "key/value cache shapes must match");
+  TORCH_CHECK(
+      key_cache.size(1) == num_kv_heads && key_cache.size(3) == head_dim,
+      "key/value cache shape must match key/value KV heads and head_dim");
+  TORCH_CHECK(key_cache.stride(3) == 1 && value_cache.stride(3) == 1,
+              "key/value cache head_dim must be contiguous");
+  TORCH_CHECK(block_ids.dim() == 1 && block_offsets.dim() == 1,
+              "block_ids/block_offsets must be 1D tensors");
+  TORCH_CHECK(block_ids.numel() == block_offsets.numel(),
+              "block_ids/block_offsets lengths must match");
+  TORCH_CHECK(key.size(0) >= block_ids.numel(),
+              "key/value must contain one row for each block id");
+
+  const int64_t n = block_ids.numel();
+  const int64_t block_size = key_cache.size(2);
+  const auto* block_ids_ptr = block_ids.data_ptr<int64_t>();
+  const auto* block_offsets_ptr = block_offsets.data_ptr<int64_t>();
+
+  for (int64_t i = 0; i < n; ++i) {
+    const int64_t block_id = block_ids_ptr[i];
+    const int64_t block_offset = block_offsets_ptr[i];
+    TORCH_CHECK(block_id >= 0 && block_id < key_cache.size(0),
+                "block_ids contains an out-of-range block id");
+    TORCH_CHECK(block_offset >= 0 && block_offset < block_size,
+                "block_offsets contains an out-of-range block offset");
+  }
+  gqa_bf16_scatter_suffix_kv_unchecked_at(key, value, block_ids, block_offsets,
+                                          key_cache, value_cache);
 }
 
 }  // namespace cots

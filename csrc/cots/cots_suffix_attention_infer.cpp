@@ -15,6 +15,7 @@
 #include <exception>
 #include <limits>
 #include <stdexcept>
+#include <thread>
 
 namespace vllm {
 namespace cots {
@@ -25,24 +26,45 @@ extern "C" void launch_cots_wait_done_kernel_diag(uint32_t*, uint32_t*,
                                                   int64_t*, int64_t*, int64_t*,
                                                   cudaStream_t);
 
-void qwen_bf16_suffix_attention_at(const at::Tensor& query,
-                                   const at::Tensor& key_cache,
-                                   const at::Tensor& value_cache,
-                                   const at::Tensor& block_table,
-                                   const at::Tensor& seq_lens, double scale,
-                                   at::Tensor& output, at::Tensor& output_lse);
-void qwen_bf16_scatter_suffix_kv_at(const at::Tensor& key,
-                                    const at::Tensor& value,
-                                    const at::Tensor& block_ids,
-                                    const at::Tensor& block_offsets,
-                                    at::Tensor& key_cache,
-                                    at::Tensor& value_cache);
+void gqa_bf16_suffix_attention_at(const at::Tensor& query,
+                                  const at::Tensor& key_cache,
+                                  const at::Tensor& value_cache,
+                                  const at::Tensor& block_table,
+                                  const at::Tensor& seq_lens, double scale,
+                                  at::Tensor& output, at::Tensor& output_lse);
+void gqa_bf16_suffix_attention_unchecked_at(const at::Tensor& query,
+                                            const at::Tensor& key_cache,
+                                            const at::Tensor& value_cache,
+                                            const at::Tensor& block_table,
+                                            const at::Tensor& seq_lens,
+                                            double scale, at::Tensor& output,
+                                            at::Tensor& output_lse);
+void gqa_bf16_suffix_attention_scatter_unchecked_at(
+    const at::Tensor& query, const at::Tensor& key_cache,
+    const at::Tensor& value_cache, const at::Tensor& block_table,
+    const at::Tensor& seq_lens, double scale, at::Tensor& output,
+    at::Tensor& output_lse, const at::Tensor& scatter_key,
+    const at::Tensor& scatter_value, const at::Tensor& scatter_block_ids,
+    const at::Tensor& scatter_block_offsets);
+void gqa_bf16_scatter_suffix_kv_at(const at::Tensor& key,
+                                   const at::Tensor& value,
+                                   const at::Tensor& block_ids,
+                                   const at::Tensor& block_offsets,
+                                   at::Tensor& key_cache,
+                                   at::Tensor& value_cache);
+void gqa_bf16_scatter_suffix_kv_unchecked_at(const at::Tensor& key,
+                                             const at::Tensor& value,
+                                             const at::Tensor& block_ids,
+                                             const at::Tensor& block_offsets,
+                                             at::Tensor& key_cache,
+                                             at::Tensor& value_cache);
 
 namespace {
 
-constexpr int64_t kQwenNumQHeads = 28;
-constexpr int64_t kQwenNumKVHeads = 4;
-constexpr int64_t kQwenHeadDim = 128;
+constexpr int32_t kMaxHeadsPerKV = 8;
+constexpr int32_t kSupportedHeadDim = 128;
+constexpr int32_t kFusedScatterMaxSuffixBlocks = 2;
+constexpr int kDefaultSuffixNumThreads = 24;
 
 namespace cots_suffix_diag {
 inline bool env_flag(const char* name) {
@@ -71,6 +93,23 @@ inline bool wait_kernel_diag_enabled() {
            env_flag("VLLM_COTS_SUFFIX_WAIT_KERNEL_DIAG");
   }();
   return enabled;
+}
+
+inline int suffix_num_threads() {
+  static const int threads = []() {
+    const char* v = std::getenv("VLLM_COTS_SUFFIX_NUM_THREADS");
+    if (v == nullptr || v[0] == '\0') {
+      const unsigned int hw_threads = std::thread::hardware_concurrency();
+      if (hw_threads == 0) return kDefaultSuffixNumThreads;
+      return static_cast<int>(std::min<unsigned int>(
+          hw_threads, static_cast<unsigned int>(kDefaultSuffixNumThreads)));
+    }
+    char* end = nullptr;
+    const long parsed = std::strtol(v, &end, 10);
+    if (end == v || *end != '\0' || parsed <= 0) return 0;
+    return static_cast<int>(std::min<long>(parsed, 1024));
+  }();
+  return threads;
 }
 }  // namespace cots_suffix_diag
 
@@ -162,6 +201,9 @@ struct CotsSuffixAttentionInfer::SubmittedTask {
 
   int32_t task_capacity = 0;
   int32_t query_capacity = 0;
+  int32_t num_q_heads = 0;
+  int32_t num_kv_heads = 0;
+  int32_t head_dim = 0;
   int64_t query_stride0 = 0;
   int64_t query_stride1 = 0;
   int64_t query_stride2 = 0;
@@ -203,17 +245,27 @@ CotsSuffixAttentionInfer::~CotsSuffixAttentionInfer() {
     for (int64_t i = 0; i < task_count_; ++i) {
       SuffixAttentionTask& t = tasks_[i];
       if (t.wait_kernel_sync_installed.load(std::memory_order_acquire)) {
-        if (t.host_req_slot != nullptr) {
-          cudaFreeHost(t.host_req_slot);
-          t.host_req_slot = nullptr;
+        if (wait_kernel_slots_host_ == nullptr) {
+          if (t.host_req_slot != nullptr) {
+            cudaFreeHost(t.host_req_slot);
+          }
+          if (t.host_done_slot != nullptr) {
+            cudaFreeHost(t.host_done_slot);
+          }
         }
-        if (t.host_done_slot != nullptr) {
-          cudaFreeHost(t.host_done_slot);
-          t.host_done_slot = nullptr;
-        }
+        t.host_req_slot = nullptr;
+        t.dev_req_slot = nullptr;
+        t.host_done_slot = nullptr;
+        t.dev_done_slot = nullptr;
         t.wait_kernel_sync_installed.store(false, std::memory_order_release);
       }
     }
+  }
+  if (wait_kernel_slots_host_ != nullptr) {
+    cudaFreeHost(wait_kernel_slots_host_);
+    wait_kernel_slots_host_ = nullptr;
+    wait_kernel_slots_dev_ = nullptr;
+    wait_kernel_slots_capacity_ = 0;
   }
   if (wait_kernel_spin_iters_host_ != nullptr) {
     cudaFreeHost(wait_kernel_spin_iters_host_);
@@ -244,6 +296,7 @@ void CotsSuffixAttentionInfer::install(int64_t n_tasks) {
 
 void CotsSuffixAttentionInfer::populate_task(
     int64_t task_id, uintptr_t query_ptr, int32_t query_capacity,
+    int32_t num_q_heads, int32_t num_kv_heads, int32_t head_dim,
     int64_t query_stride0, int64_t query_stride1, int64_t query_stride2,
     uintptr_t key_cache_ptr, int32_t num_cpu_blocks, int32_t block_size,
     uintptr_t value_cache_ptr, uintptr_t block_table_ptr,
@@ -257,6 +310,22 @@ void CotsSuffixAttentionInfer::populate_task(
               task_id, " out of range");
   TORCH_CHECK(query_capacity >= 0,
               "populate_task: query_capacity must be >= 0");
+  TORCH_CHECK(num_q_heads > 0, "populate_task: num_q_heads must be > 0, got ",
+              num_q_heads);
+  TORCH_CHECK(num_kv_heads > 0, "populate_task: num_kv_heads must be > 0, got ",
+              num_kv_heads);
+  TORCH_CHECK(head_dim == kSupportedHeadDim,
+              "populate_task: COTS suffix attention currently supports "
+              "head_dim=128, got ",
+              head_dim);
+  TORCH_CHECK(num_q_heads % num_kv_heads == 0,
+              "populate_task: num_q_heads must be divisible by num_kv_heads, "
+              "got ",
+              num_q_heads, " and ", num_kv_heads);
+  TORCH_CHECK(num_q_heads / num_kv_heads <= kMaxHeadsPerKV,
+              "populate_task: COTS suffix attention supports at most ",
+              kMaxHeadsPerKV, " query heads per KV head, got ",
+              num_q_heads / num_kv_heads);
   TORCH_CHECK(
       query_stride0 > 0 && query_stride1 > 0 && query_stride2 == 1,
       "populate_task: query strides must be positive with stride2=1, got ",
@@ -290,6 +359,9 @@ void CotsSuffixAttentionInfer::populate_task(
   SuffixAttentionTask& t = tasks_[task_id];
   t.query_ptr = reinterpret_cast<void*>(query_ptr);
   t.query_capacity = query_capacity;
+  t.num_q_heads = num_q_heads;
+  t.num_kv_heads = num_kv_heads;
+  t.head_dim = head_dim;
   t.query_stride0 = query_stride0;
   t.query_stride1 = query_stride1;
   t.query_stride2 = query_stride2;
@@ -316,6 +388,8 @@ void CotsSuffixAttentionInfer::populate_task(
 
 void CotsSuffixAttentionInfer::submit_prepared_on_stream(
     int64_t task_id, uintptr_t cuda_stream) {
+  const bool diag = cots_suffix_diag::counters_enabled();
+  const int64_t submit_t0 = diag ? now_ns() : 0;
   check_error();
   TORCH_CHECK(task_id >= 0 && task_id < task_count_,
               "submit_prepared_on_stream: task_id ", task_id, " out of range");
@@ -345,6 +419,9 @@ void CotsSuffixAttentionInfer::submit_prepared_on_stream(
   submitted->task_id = task_id;
   submitted->task_capacity = num_tokens;
   submitted->query_capacity = task->query_capacity;
+  submitted->num_q_heads = task->num_q_heads;
+  submitted->num_kv_heads = task->num_kv_heads;
+  submitted->head_dim = task->head_dim;
   submitted->query_ptr = task->query_ptr;
   submitted->query_stride0 = task->query_stride0;
   submitted->query_stride1 = task->query_stride1;
@@ -381,6 +458,7 @@ void CotsSuffixAttentionInfer::submit_prepared_on_stream(
     submitted->runtime_num_tokens = -1;
     submitted->runtime_scatter_count = -1;
 
+    const int64_t metadata_snapshot_t0 = diag ? now_ns() : 0;
     const int64_t block_table_elems =
         static_cast<int64_t>(submitted->query_capacity) *
         submitted->max_suffix_blocks;
@@ -402,9 +480,13 @@ void CotsSuffixAttentionInfer::submit_prepared_on_stream(
       submitted->scatter_block_offsets_snapshot.assign(
           scatter_offsets_src, scatter_offsets_src + submitted->scatter_count);
     }
+    if (diag) {
+      submit_metadata_snapshot_total_ns_.fetch_add(
+          now_ns() - metadata_snapshot_t0, std::memory_order_relaxed);
+    }
   }
 
-  if (cots_suffix_diag::counters_enabled()) {
+  if (diag) {
     submit_count_.fetch_add(1, std::memory_order_relaxed);
   }
 
@@ -417,8 +499,13 @@ void CotsSuffixAttentionInfer::submit_prepared_on_stream(
     callback_data = static_cast<void*>(submitted.release());
   }
 
+  const int64_t launch_t0 = diag ? now_ns() : 0;
   cudaError_t err =
       cudaLaunchHostFunc(stream, &DispatchCallback, callback_data);
+  if (diag) {
+    submit_launch_hostfunc_total_ns_.fetch_add(now_ns() - launch_t0,
+                                               std::memory_order_relaxed);
+  }
   if (err != cudaSuccess && !capture_submission) {
     delete static_cast<SubmittedTask*>(callback_data);
   }
@@ -427,6 +514,10 @@ void CotsSuffixAttentionInfer::submit_prepared_on_stream(
               cudaGetErrorString(err));
   if (capture_submission) {
     graph_submitted_tasks_.push_back(std::move(submitted));
+  }
+  if (diag) {
+    submit_prepare_total_ns_.fetch_add(now_ns() - submit_t0,
+                                       std::memory_order_relaxed);
   }
 }
 
@@ -487,38 +578,41 @@ void CotsSuffixAttentionInfer::install_wait_kernel_sync_for_task(
                                  "suffix_lagging_wait");
   }
 
-  void* host_req = nullptr;
-  void* host_done = nullptr;
-  cudaError_t e1 =
-      cudaHostAlloc(&host_req, sizeof(uint32_t), cudaHostAllocMapped);
-  TORCH_CHECK(e1 == cudaSuccess,
-              "install_wait_kernel_sync_for_task: cudaHostAlloc(req_slot) "
-              "failed: ",
-              cudaGetErrorString(e1));
-  cudaError_t e2 =
-      cudaHostAlloc(&host_done, sizeof(uint32_t), cudaHostAllocMapped);
-  if (e2 != cudaSuccess) {
-    cudaFreeHost(host_req);
-    TORCH_CHECK(false,
-                "install_wait_kernel_sync_for_task: "
-                "cudaHostAlloc(done_slot) failed: ",
-                cudaGetErrorString(e2));
-  }
-  *static_cast<uint32_t*>(host_req) = 0;
-  *static_cast<uint32_t*>(host_done) = 0;
+  if (wait_kernel_slots_host_ == nullptr) {
+    TORCH_CHECK(task_count_ > 0,
+                "install_wait_kernel_sync_for_task: task_count must be > 0");
+    const size_t slot_count = static_cast<size_t>(task_count_) * 2;
+    void* host_slots = nullptr;
+    cudaError_t e1 = cudaHostAlloc(&host_slots, slot_count * sizeof(uint32_t),
+                                   cudaHostAllocMapped);
+    TORCH_CHECK(e1 == cudaSuccess,
+                "install_wait_kernel_sync_for_task: cudaHostAlloc(slot_pool) "
+                "failed: ",
+                cudaGetErrorString(e1));
+    std::fill_n(static_cast<uint32_t*>(host_slots), slot_count, 0u);
 
-  void* dev_req = nullptr;
-  void* dev_done = nullptr;
-  cudaError_t e3 = cudaHostGetDevicePointer(&dev_req, host_req, 0);
-  cudaError_t e4 = cudaHostGetDevicePointer(&dev_done, host_done, 0);
-  if (e3 != cudaSuccess || e4 != cudaSuccess) {
-    cudaFreeHost(host_req);
-    cudaFreeHost(host_done);
-    TORCH_CHECK(false,
-                "install_wait_kernel_sync_for_task: "
-                "cudaHostGetDevicePointer failed: ",
-                cudaGetErrorString(e3 != cudaSuccess ? e3 : e4));
+    void* dev_slots = nullptr;
+    cudaError_t e2 = cudaHostGetDevicePointer(&dev_slots, host_slots, 0);
+    if (e2 != cudaSuccess) {
+      cudaFreeHost(host_slots);
+      TORCH_CHECK(false,
+                  "install_wait_kernel_sync_for_task: "
+                  "cudaHostGetDevicePointer(slot_pool) failed: ",
+                  cudaGetErrorString(e2));
+    }
+    wait_kernel_slots_host_ = static_cast<uint32_t*>(host_slots);
+    wait_kernel_slots_dev_ = static_cast<uint32_t*>(dev_slots);
+    wait_kernel_slots_capacity_ = task_count_;
   }
+  TORCH_CHECK(wait_kernel_slots_capacity_ >= task_count_,
+              "install_wait_kernel_sync_for_task: wait slot pool too small");
+
+  uint32_t* host_req = wait_kernel_slots_host_ + 2 * task_id;
+  uint32_t* host_done = host_req + 1;
+  uint32_t* dev_req = wait_kernel_slots_dev_ + 2 * task_id;
+  uint32_t* dev_done = dev_req + 1;
+  *host_req = 0;
+  *host_done = 0;
 
   task.host_req_slot = host_req;
   task.dev_req_slot = dev_req;
@@ -653,6 +747,8 @@ void CotsSuffixAttentionInfer::check_error() {
 
 void CotsSuffixAttentionInfer::DispatchCallback(void* user_data) {
   NvtxScope nvtx_scope("cots:suffix_dispatch_cb");
+  const bool diag = cots_suffix_diag::counters_enabled();
+  const int64_t callback_t0 = diag ? now_ns() : 0;
   SubmittedTask* raw_submitted = static_cast<SubmittedTask*>(user_data);
   std::shared_ptr<SubmittedTask> submitted =
       raw_submitted->owned_by_callback
@@ -661,37 +757,38 @@ void CotsSuffixAttentionInfer::DispatchCallback(void* user_data) {
                                            [](SubmittedTask*) {});
   CotsSuffixAttentionInfer* self = submitted->self;
   SuffixAttentionTask* sync_task = submitted->sync_task;
-  if (cots_suffix_diag::counters_enabled()) {
-    submitted->enqueue_time_ns = now_ns();
+  if (diag) {
     self->dispatch_cb_count_.fetch_add(1, std::memory_order_relaxed);
   }
+  const int64_t snapshot_t0 = diag ? now_ns() : 0;
   if (submitted->use_runtime_count_snapshot && submitted->snapshot_inputs) {
     // Eager submissions reach this callback only after the stream-ordered D2H
     // staging copies are complete. Snapshot Q/QKV here, not at submit time,
     // so the CPU worker owns stable inputs without racing incomplete copies or
     // later staging-buffer reuse.
     const auto* query_src = static_cast<const uint16_t*>(submitted->query_ptr);
-    const int64_t snapshot_heads = submitted->scatter_from_qkv
-                                       ? kQwenNumQHeads + 2 * kQwenNumKVHeads
-                                       : kQwenNumQHeads;
+    const int64_t snapshot_heads =
+        submitted->scatter_from_qkv
+            ? submitted->num_q_heads + 2 * submitted->num_kv_heads
+            : submitted->num_q_heads;
     std::vector<uint16_t>& query_dst = submitted->scatter_from_qkv
                                            ? submitted->qkv_snapshot
                                            : submitted->query_snapshot;
     query_dst.resize(static_cast<int64_t>(submitted->query_capacity) *
-                     snapshot_heads * kQwenHeadDim);
+                     snapshot_heads * submitted->head_dim);
     for (int64_t b = 0; b < submitted->query_capacity; ++b) {
       for (int64_t h = 0; h < snapshot_heads; ++h) {
         const uint16_t* src = query_src + b * submitted->query_stride0 +
                               h * submitted->query_stride1;
         uint16_t* dst =
-            query_dst.data() + (b * snapshot_heads + h) * kQwenHeadDim;
-        for (int64_t d = 0; d < kQwenHeadDim; ++d) {
+            query_dst.data() + (b * snapshot_heads + h) * submitted->head_dim;
+        for (int64_t d = 0; d < submitted->head_dim; ++d) {
           dst[d] = src[d * submitted->query_stride2];
         }
       }
     }
-    submitted->query_snapshot_stride0 = snapshot_heads * kQwenHeadDim;
-    submitted->query_snapshot_stride1 = kQwenHeadDim;
+    submitted->query_snapshot_stride0 = snapshot_heads * submitted->head_dim;
+    submitted->query_snapshot_stride1 = submitted->head_dim;
     submitted->query_snapshot_stride2 = 1;
 
     if (submitted->scatter_from_separate_kv && submitted->scatter_count > 0) {
@@ -700,10 +797,14 @@ void CotsSuffixAttentionInfer::DispatchCallback(void* user_data) {
       const auto* value_src =
           static_cast<const uint16_t*>(submitted->scatter_value_ptr);
       const int64_t kv_elems = static_cast<int64_t>(submitted->scatter_count) *
-                               kQwenNumKVHeads * kQwenHeadDim;
+                               submitted->num_kv_heads * submitted->head_dim;
       submitted->scatter_key_snapshot.assign(key_src, key_src + kv_elems);
       submitted->scatter_value_snapshot.assign(value_src, value_src + kv_elems);
     }
+  }
+  if (diag) {
+    self->dispatch_cb_snapshot_total_ns_.fetch_add(now_ns() - snapshot_t0,
+                                                   std::memory_order_relaxed);
   }
   const bool wait_kernel =
       sync_task->wait_kernel_sync_installed.load(std::memory_order_acquire);
@@ -711,11 +812,26 @@ void CotsSuffixAttentionInfer::DispatchCallback(void* user_data) {
     submitted->seq =
         sync_task->next_seq.fetch_add(1, std::memory_order_relaxed) + 1u;
   }
+  const int64_t enqueue_t0 = diag ? now_ns() : 0;
+  if (diag) {
+    submitted->enqueue_time_ns = enqueue_t0;
+  }
+  const uint32_t wait_seq = submitted->seq;
   self->task_queue_->enqueue(
-      [self, submitted] { self->RunTaskOnWorker(std::move(submitted)); });
+      [self, submitted = std::move(submitted)]() mutable {
+        self->RunTaskOnWorker(std::move(submitted));
+      });
+  if (diag) {
+    self->dispatch_cb_enqueue_total_ns_.fetch_add(now_ns() - enqueue_t0,
+                                                  std::memory_order_relaxed);
+  }
   if (wait_kernel) {
     std::atomic_thread_fence(std::memory_order_release);
-    *static_cast<volatile uint32_t*>(sync_task->host_req_slot) = submitted->seq;
+    *static_cast<volatile uint32_t*>(sync_task->host_req_slot) = wait_seq;
+  }
+  if (diag) {
+    self->dispatch_cb_total_ns_.fetch_add(now_ns() - callback_t0,
+                                          std::memory_order_relaxed);
   }
 }
 
@@ -774,9 +890,24 @@ void CotsSuffixAttentionInfer::RunTaskOnWorker(
 
   try {
     c10::InferenceMode g;
+    const int requested_threads = cots_suffix_diag::suffix_num_threads();
+    worker_requested_num_threads_.store(requested_threads,
+                                        std::memory_order_relaxed);
+    if (requested_threads > 0 &&
+        requested_threads != worker_current_num_threads_) {
+      at::set_num_threads(requested_threads);
+      worker_current_num_threads_ = requested_threads;
+    }
+    worker_observed_num_threads_.store(at::get_num_threads(),
+                                       std::memory_order_relaxed);
     const int32_t task_capacity = task->task_capacity;
+    const int32_t num_q_heads = task->num_q_heads;
+    const int32_t num_kv_heads = task->num_kv_heads;
+    const int32_t head_dim = task->head_dim;
     TORCH_CHECK(task_capacity > 0,
                 "suffix attention task capacity must be > 0");
+    TORCH_CHECK(num_q_heads > 0 && num_kv_heads > 0 && head_dim > 0,
+                "suffix attention task shape fields must be populated");
     TORCH_CHECK(task_capacity <= task->query_capacity,
                 "suffix attention task capacity exceeds query capacity");
 
@@ -810,10 +941,10 @@ void CotsSuffixAttentionInfer::RunTaskOnWorker(
       }
     }
 
-    auto output_all = Bf16View(task->output_ptr,
-                               {task_capacity, kQwenNumQHeads, kQwenHeadDim});
+    auto output_all =
+        Bf16View(task->output_ptr, {task_capacity, num_q_heads, head_dim});
     auto output_lse_all =
-        FloatView(task->output_lse_ptr, {kQwenNumQHeads, task_capacity});
+        FloatView(task->output_lse_ptr, {num_q_heads, task_capacity});
     if (batch == 0) {
       NvtxScope zero_live_scope("cots:suffix_zero_live");
       output_all.zero_();
@@ -839,15 +970,14 @@ void CotsSuffixAttentionInfer::RunTaskOnWorker(
         (task->qkv_snapshot.empty() && task->query_snapshot.empty())
             ? task->query_stride2
             : task->query_snapshot_stride2;
-    auto query =
-        Bf16StridedView(query_ptr, {batch, kQwenNumQHeads, kQwenHeadDim},
-                        {query_stride0, query_stride1, query_stride2});
-    auto key_cache =
-        Bf16View(task->key_cache_ptr, {task->num_cpu_blocks, kQwenNumKVHeads,
-                                       task->block_size, kQwenHeadDim});
-    auto value_cache =
-        Bf16View(task->value_cache_ptr, {task->num_cpu_blocks, kQwenNumKVHeads,
-                                         task->block_size, kQwenHeadDim});
+    auto query = Bf16StridedView(query_ptr, {batch, num_q_heads, head_dim},
+                                 {query_stride0, query_stride1, query_stride2});
+    auto key_cache = Bf16View(
+        task->key_cache_ptr,
+        {task->num_cpu_blocks, num_kv_heads, task->block_size, head_dim});
+    auto value_cache = Bf16View(
+        task->value_cache_ptr,
+        {task->num_cpu_blocks, num_kv_heads, task->block_size, head_dim});
     void* block_table_ptr =
         task->block_table_snapshot.empty()
             ? task->block_table_ptr
@@ -862,8 +992,16 @@ void CotsSuffixAttentionInfer::RunTaskOnWorker(
     auto output = output_all.narrow(0, 0, batch);
     auto output_lse = output_lse_all.narrow(1, 0, batch);
 
-    if ((task->scatter_from_qkv || task->scatter_from_separate_kv) &&
-        scatter_count > 0) {
+    at::Tensor scatter_key;
+    at::Tensor scatter_value;
+    at::Tensor scatter_block_ids;
+    at::Tensor scatter_block_offsets;
+    const bool has_scatter =
+        (task->scatter_from_qkv || task->scatter_from_separate_kv) &&
+        scatter_count > 0;
+    const bool fuse_scatter =
+        has_scatter && task->max_suffix_blocks <= kFusedScatterMaxSuffixBlocks;
+    if (has_scatter) {
       TORCH_CHECK(scatter_count <= batch,
                   "suffix scatter_count exceeds task batch");
       void* scatter_block_ids_ptr =
@@ -874,23 +1012,19 @@ void CotsSuffixAttentionInfer::RunTaskOnWorker(
           task->scatter_block_offsets_snapshot.empty()
               ? task->scatter_block_offsets_ptr
               : static_cast<void*>(task->scatter_block_offsets_snapshot.data());
-      auto scatter_block_ids = LongView(scatter_block_ids_ptr, {scatter_count});
-      auto scatter_block_offsets =
+      scatter_block_ids = LongView(scatter_block_ids_ptr, {scatter_count});
+      scatter_block_offsets =
           LongView(scatter_block_offsets_ptr, {scatter_count});
-      NvtxScope scatter_scope("cots:suffix_scatter");
       if (task->scatter_from_qkv) {
         auto* qkv_ptr = static_cast<uint16_t*>(query_ptr);
-        auto key =
-            Bf16StridedView(qkv_ptr + kQwenNumQHeads * query_stride1,
-                            {scatter_count, kQwenNumKVHeads, kQwenHeadDim},
+        scatter_key =
+            Bf16StridedView(qkv_ptr + num_q_heads * query_stride1,
+                            {scatter_count, num_kv_heads, head_dim},
                             {query_stride0, query_stride1, query_stride2});
-        auto value = Bf16StridedView(
-            qkv_ptr + (kQwenNumQHeads + kQwenNumKVHeads) * query_stride1,
-            {scatter_count, kQwenNumKVHeads, kQwenHeadDim},
+        scatter_value = Bf16StridedView(
+            qkv_ptr + (num_q_heads + num_kv_heads) * query_stride1,
+            {scatter_count, num_kv_heads, head_dim},
             {query_stride0, query_stride1, query_stride2});
-        qwen_bf16_scatter_suffix_kv_at(key, value, scatter_block_ids,
-                                       scatter_block_offsets, key_cache,
-                                       value_cache);
       } else {
         TORCH_CHECK(task->scatter_key_ptr != nullptr,
                     "suffix separate scatter key ptr is null");
@@ -904,20 +1038,41 @@ void CotsSuffixAttentionInfer::RunTaskOnWorker(
             task->scatter_value_snapshot.empty()
                 ? task->scatter_value_ptr
                 : static_cast<void*>(task->scatter_value_snapshot.data());
-        auto key = Bf16View(scatter_key_ptr,
-                            {scatter_count, kQwenNumKVHeads, kQwenHeadDim});
-        auto value = Bf16View(scatter_value_ptr,
-                              {scatter_count, kQwenNumKVHeads, kQwenHeadDim});
-        qwen_bf16_scatter_suffix_kv_at(key, value, scatter_block_ids,
-                                       scatter_block_offsets, key_cache,
-                                       value_cache);
+        scatter_key =
+            Bf16View(scatter_key_ptr, {scatter_count, num_kv_heads, head_dim});
+        scatter_value = Bf16View(scatter_value_ptr,
+                                 {scatter_count, num_kv_heads, head_dim});
+      }
+      if (!fuse_scatter) {
+        NvtxScope scatter_scope("cots:suffix_scatter");
+        const int64_t scatter_t0 = diag ? now_ns() : 0;
+        gqa_bf16_scatter_suffix_kv_unchecked_at(
+            scatter_key, scatter_value, scatter_block_ids,
+            scatter_block_offsets, key_cache, value_cache);
+        if (diag) {
+          worker_scatter_total_ns_.fetch_add(now_ns() - scatter_t0,
+                                             std::memory_order_relaxed);
+        }
       }
     }
 
     {
       NvtxScope attention_scope("cots:suffix_attention");
-      qwen_bf16_suffix_attention_at(query, key_cache, value_cache, block_table,
-                                    seq_lens, task->scale, output, output_lse);
+      const int64_t attention_t0 = diag ? now_ns() : 0;
+      if (fuse_scatter) {
+        gqa_bf16_suffix_attention_scatter_unchecked_at(
+            query, key_cache, value_cache, block_table, seq_lens, task->scale,
+            output, output_lse, scatter_key, scatter_value, scatter_block_ids,
+            scatter_block_offsets);
+      } else {
+        gqa_bf16_suffix_attention_unchecked_at(query, key_cache, value_cache,
+                                               block_table, seq_lens,
+                                               task->scale, output, output_lse);
+      }
+      if (diag) {
+        worker_attention_total_ns_.fetch_add(now_ns() - attention_t0,
+                                             std::memory_order_relaxed);
+      }
     }
 
     if (batch < task_capacity) {
@@ -942,19 +1097,38 @@ CotsSuffixAttentionInfer::get_counters() const {
     return a.load(std::memory_order_relaxed);
   };
   std::vector<std::pair<std::string, int64_t>> out;
-  out.reserve(24);
+  out.reserve(32);
   out.emplace_back("suffix_populate_count", load(populate_count_));
   out.emplace_back("suffix_submit_count", load(submit_count_));
+  out.emplace_back("suffix_submit_prepare_total_ns",
+                   load(submit_prepare_total_ns_));
+  out.emplace_back("suffix_submit_metadata_snapshot_total_ns",
+                   load(submit_metadata_snapshot_total_ns_));
+  out.emplace_back("suffix_submit_launch_hostfunc_total_ns",
+                   load(submit_launch_hostfunc_total_ns_));
   out.emplace_back("suffix_dispatch_cb_count", load(dispatch_cb_count_));
+  out.emplace_back("suffix_dispatch_cb_total_ns", load(dispatch_cb_total_ns_));
+  out.emplace_back("suffix_dispatch_cb_snapshot_total_ns",
+                   load(dispatch_cb_snapshot_total_ns_));
+  out.emplace_back("suffix_dispatch_cb_enqueue_total_ns",
+                   load(dispatch_cb_enqueue_total_ns_));
   out.emplace_back("suffix_legacy_sync_cb_count", load(legacy_sync_cb_count_));
   out.emplace_back("suffix_legacy_sync_cb_wait_total_ns",
                    load(legacy_sync_cb_wait_total_ns_));
   out.emplace_back("suffix_wait_kernel_launch_count",
                    load(wait_kernel_launch_count_));
   out.emplace_back("suffix_worker_run_count", load(worker_run_count_));
+  out.emplace_back("suffix_worker_requested_num_threads",
+                   load(worker_requested_num_threads_));
+  out.emplace_back("suffix_worker_observed_num_threads",
+                   load(worker_observed_num_threads_));
   out.emplace_back("suffix_worker_busy_total_ns", load(worker_busy_total_ns_));
   out.emplace_back("suffix_worker_queue_wait_total_ns",
                    load(worker_queue_wait_total_ns_));
+  out.emplace_back("suffix_worker_scatter_total_ns",
+                   load(worker_scatter_total_ns_));
+  out.emplace_back("suffix_worker_attention_total_ns",
+                   load(worker_attention_total_ns_));
   out.emplace_back("suffix_worker_capacity_rows", load(worker_capacity_rows_));
   out.emplace_back("suffix_worker_live_rows", load(worker_live_rows_));
   out.emplace_back("suffix_worker_padded_rows", load(worker_padded_rows_));
@@ -977,13 +1151,23 @@ CotsSuffixAttentionInfer::get_counters() const {
 void CotsSuffixAttentionInfer::reset_counters() {
   populate_count_.store(0, std::memory_order_relaxed);
   submit_count_.store(0, std::memory_order_relaxed);
+  submit_prepare_total_ns_.store(0, std::memory_order_relaxed);
+  submit_metadata_snapshot_total_ns_.store(0, std::memory_order_relaxed);
+  submit_launch_hostfunc_total_ns_.store(0, std::memory_order_relaxed);
   dispatch_cb_count_.store(0, std::memory_order_relaxed);
+  dispatch_cb_total_ns_.store(0, std::memory_order_relaxed);
+  dispatch_cb_snapshot_total_ns_.store(0, std::memory_order_relaxed);
+  dispatch_cb_enqueue_total_ns_.store(0, std::memory_order_relaxed);
   legacy_sync_cb_count_.store(0, std::memory_order_relaxed);
   legacy_sync_cb_wait_total_ns_.store(0, std::memory_order_relaxed);
   wait_kernel_launch_count_.store(0, std::memory_order_relaxed);
   worker_run_count_.store(0, std::memory_order_relaxed);
+  worker_requested_num_threads_.store(0, std::memory_order_relaxed);
+  worker_observed_num_threads_.store(0, std::memory_order_relaxed);
   worker_busy_total_ns_.store(0, std::memory_order_relaxed);
   worker_queue_wait_total_ns_.store(0, std::memory_order_relaxed);
+  worker_scatter_total_ns_.store(0, std::memory_order_relaxed);
+  worker_attention_total_ns_.store(0, std::memory_order_relaxed);
   worker_capacity_rows_.store(0, std::memory_order_relaxed);
   worker_live_rows_.store(0, std::memory_order_relaxed);
   worker_padded_rows_.store(0, std::memory_order_relaxed);

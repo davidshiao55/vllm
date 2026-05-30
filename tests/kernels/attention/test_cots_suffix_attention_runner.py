@@ -14,8 +14,8 @@ if not hasattr(_cots_C, "CotsSuffixAttentionInfer"):
     )
 
 from vllm._custom_ops import (  # noqa: E402
-    cots_qwen_bf16_scatter_suffix_kv,
-    cots_qwen_bf16_suffix_attention,
+    cots_gqa_bf16_scatter_suffix_kv,
+    cots_gqa_bf16_suffix_attention,
 )
 from vllm.v1.attention.backends.cots_hybrid_attention import (  # noqa: E402
     CotsPreparedNativeSuffixAttentionRunner,
@@ -27,7 +27,18 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_prepared_native_suffix_runner_matches_direct_kernel() -> None:
+MODEL_SHAPES = [
+    pytest.param(28, 4, 128, id="qwen2.5-7b"),
+    pytest.param(32, 8, 128, id="llama3-8b"),
+]
+
+
+@pytest.mark.parametrize(("num_q_heads", "num_kv_heads", "head_dim"), MODEL_SHAPES)
+def test_prepared_native_suffix_runner_matches_direct_kernel(
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> None:
     torch.manual_seed(2034)
     dtype = torch.bfloat16
     batch = 3
@@ -35,17 +46,18 @@ def test_prepared_native_suffix_runner_matches_direct_kernel() -> None:
     seq_lens = torch.tensor([1, 17, 31], dtype=torch.int32)
     max_blocks = max(math.ceil(int(v) / block_size) for v in seq_lens.tolist())
     num_blocks = batch * max_blocks
-    scale = 128**-0.5
+    scale = head_dim**-0.5
+    total_heads = num_q_heads + 2 * num_kv_heads
 
-    qkv = torch.randn(batch, 36, 128, dtype=dtype)
-    query = qkv[:, :28, :]
+    qkv = torch.randn(batch, total_heads, head_dim, dtype=dtype)
+    query = qkv[:, :num_q_heads, :]
     assert not query.is_contiguous()
-    assert query.stride() == (36 * 128, 128, 1)
-    key_cache = torch.randn(num_blocks, 4, block_size, 128, dtype=dtype)
+    assert query.stride() == (total_heads * head_dim, head_dim, 1)
+    key_cache = torch.randn(num_blocks, num_kv_heads, block_size, head_dim, dtype=dtype)
     value_cache = torch.randn_like(key_cache)
     block_table = torch.arange(num_blocks, dtype=torch.int32).reshape(batch, max_blocks)
     runner_out = torch.empty_like(query)
-    runner_lse = torch.empty(28, batch, dtype=torch.float32)
+    runner_lse = torch.empty(num_q_heads, batch, dtype=torch.float32)
     direct_out = torch.empty_like(query)
     direct_lse = torch.empty_like(runner_lse)
 
@@ -53,7 +65,7 @@ def test_prepared_native_suffix_runner_matches_direct_kernel() -> None:
     try:
         assert runner.wait_kernel_sync_installed(0)
         assert runner.wait_kernel_slots(0) == (0, 0)
-        runner.run_qwen_bf16_suffix_attention(
+        runner.run_gqa_bf16_suffix_attention(
             query=query,
             key_cache=key_cache,
             value_cache=value_cache,
@@ -70,7 +82,7 @@ def test_prepared_native_suffix_runner_matches_direct_kernel() -> None:
     finally:
         runner.close()
 
-    cots_qwen_bf16_suffix_attention(
+    cots_gqa_bf16_suffix_attention(
         query=query,
         key_cache=key_cache,
         value_cache=value_cache,
@@ -85,35 +97,43 @@ def test_prepared_native_suffix_runner_matches_direct_kernel() -> None:
     torch.testing.assert_close(runner_lse, direct_lse, atol=0, rtol=0)
 
 
-def test_prepared_native_suffix_runner_scatters_qkv_before_attention() -> None:
+@pytest.mark.parametrize(("num_q_heads", "num_kv_heads", "head_dim"), MODEL_SHAPES)
+def test_prepared_native_suffix_runner_scatters_qkv_before_attention(
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> None:
     torch.manual_seed(2035)
     dtype = torch.bfloat16
     batch = 3
     block_size = 16
     seq_lens = torch.tensor([1, 2, 3], dtype=torch.int32)
     num_blocks = 5
-    scale = 128**-0.5
+    scale = head_dim**-0.5
+    total_heads = num_q_heads + 2 * num_kv_heads
 
-    qkv = torch.randn(batch, 36, 128, dtype=dtype)
-    query = qkv[:, :28, :]
-    key_src = qkv[:, 28:32, :]
-    value_src = qkv[:, 32:36, :]
+    qkv = torch.randn(batch, total_heads, head_dim, dtype=dtype)
+    query = qkv[:, :num_q_heads, :]
+    key_src = qkv[:, num_q_heads : num_q_heads + num_kv_heads, :]
+    value_src = qkv[:, num_q_heads + num_kv_heads :, :]
     scatter_block_ids = torch.tensor([0, 2, 4], dtype=torch.long)
     scatter_block_offsets = torch.tensor([0, 1, 2], dtype=torch.long)
     block_table = scatter_block_ids.to(torch.int32).reshape(batch, 1)
 
-    runner_key_cache = torch.zeros(num_blocks, 4, block_size, 128, dtype=dtype)
+    runner_key_cache = torch.zeros(
+        num_blocks, num_kv_heads, block_size, head_dim, dtype=dtype
+    )
     runner_value_cache = torch.zeros_like(runner_key_cache)
     manual_key_cache = torch.zeros_like(runner_key_cache)
     manual_value_cache = torch.zeros_like(runner_key_cache)
     runner_out = torch.empty_like(query)
-    runner_lse = torch.empty(28, batch, dtype=torch.float32)
+    runner_lse = torch.empty(num_q_heads, batch, dtype=torch.float32)
     direct_out = torch.empty_like(query)
     direct_lse = torch.empty_like(runner_lse)
 
     runner = CotsPreparedNativeSuffixAttentionRunner(num_tasks=1)
     try:
-        runner.run_qwen_bf16_suffix_attention(
+        runner.run_gqa_bf16_suffix_attention(
             query=query,
             key_cache=runner_key_cache,
             value_cache=runner_value_cache,
@@ -132,7 +152,7 @@ def test_prepared_native_suffix_runner_scatters_qkv_before_attention() -> None:
     finally:
         runner.close()
 
-    cots_qwen_bf16_scatter_suffix_kv(
+    cots_gqa_bf16_scatter_suffix_kv(
         key_src,
         value_src,
         scatter_block_ids,
@@ -140,7 +160,88 @@ def test_prepared_native_suffix_runner_scatters_qkv_before_attention() -> None:
         manual_key_cache,
         manual_value_cache,
     )
-    cots_qwen_bf16_suffix_attention(
+    cots_gqa_bf16_suffix_attention(
+        query=query,
+        key_cache=manual_key_cache,
+        value_cache=manual_value_cache,
+        block_table=block_table,
+        seq_lens=seq_lens,
+        scale=scale,
+        output=direct_out,
+        output_lse=direct_lse,
+    )
+
+    torch.testing.assert_close(runner_key_cache, manual_key_cache, atol=0, rtol=0)
+    torch.testing.assert_close(runner_value_cache, manual_value_cache, atol=0, rtol=0)
+    torch.testing.assert_close(runner_out, direct_out, atol=0, rtol=0)
+    torch.testing.assert_close(runner_lse, direct_lse, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(("num_q_heads", "num_kv_heads", "head_dim"), MODEL_SHAPES)
+def test_prepared_native_suffix_runner_scatters_qkv_two_suffix_blocks(
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> None:
+    torch.manual_seed(2042)
+    dtype = torch.bfloat16
+    batch = 2
+    block_size = 16
+    max_blocks = 2
+    num_blocks = batch * max_blocks
+    seq_lens = torch.tensor([17, 18], dtype=torch.int32)
+    scale = head_dim**-0.5
+    total_heads = num_q_heads + 2 * num_kv_heads
+
+    qkv = torch.randn(batch, total_heads, head_dim, dtype=dtype)
+    query = qkv[:, :num_q_heads, :]
+    key_src = qkv[:, num_q_heads : num_q_heads + num_kv_heads, :]
+    value_src = qkv[:, num_q_heads + num_kv_heads :, :]
+    block_table = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+    scatter_block_ids = torch.tensor([1, 3], dtype=torch.long)
+    scatter_block_offsets = torch.tensor([0, 1], dtype=torch.long)
+
+    runner_key_cache = torch.randn(
+        num_blocks, num_kv_heads, block_size, head_dim, dtype=dtype
+    )
+    runner_value_cache = torch.randn_like(runner_key_cache)
+    manual_key_cache = runner_key_cache.clone()
+    manual_value_cache = runner_value_cache.clone()
+    runner_out = torch.empty_like(query)
+    runner_lse = torch.empty(num_q_heads, batch, dtype=torch.float32)
+    direct_out = torch.empty_like(query)
+    direct_lse = torch.empty_like(runner_lse)
+
+    runner = CotsPreparedNativeSuffixAttentionRunner(num_tasks=1)
+    try:
+        runner.run_gqa_bf16_suffix_attention(
+            query=query,
+            key_cache=runner_key_cache,
+            value_cache=runner_value_cache,
+            block_table=block_table,
+            seq_lens=seq_lens,
+            scale=scale,
+            output=runner_out,
+            output_lse=runner_lse,
+            cuda_anchor=torch.empty(1, device="cuda"),
+            task_id=0,
+            scatter_block_ids=scatter_block_ids,
+            scatter_block_offsets=scatter_block_offsets,
+            scatter_from_qkv=True,
+        )
+        torch.accelerator.synchronize()
+    finally:
+        runner.close()
+
+    cots_gqa_bf16_scatter_suffix_kv(
+        key_src,
+        value_src,
+        scatter_block_ids,
+        scatter_block_offsets,
+        manual_key_cache,
+        manual_value_cache,
+    )
+    cots_gqa_bf16_suffix_attention(
         query=query,
         key_cache=manual_key_cache,
         value_cache=manual_value_cache,
@@ -183,7 +284,7 @@ def test_prepared_native_suffix_runner_cudagraph_replay_uses_updated_qkv() -> No
 
     runner = CotsPreparedNativeSuffixAttentionRunner(num_tasks=1)
     try:
-        runner.run_qwen_bf16_suffix_attention(
+        runner.run_gqa_bf16_suffix_attention(
             query=query,
             key_cache=runner_key_cache,
             value_cache=runner_value_cache,
@@ -202,7 +303,7 @@ def test_prepared_native_suffix_runner_cudagraph_replay_uses_updated_qkv() -> No
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            runner.run_qwen_bf16_suffix_attention(
+            runner.run_gqa_bf16_suffix_attention(
                 query=query,
                 key_cache=runner_key_cache,
                 value_cache=runner_value_cache,
@@ -227,7 +328,7 @@ def test_prepared_native_suffix_runner_cudagraph_replay_uses_updated_qkv() -> No
     finally:
         runner.close()
 
-    cots_qwen_bf16_scatter_suffix_kv(
+    cots_gqa_bf16_scatter_suffix_kv(
         qkv[:, 28:32, :],
         qkv[:, 32:36, :],
         scatter_block_ids,
@@ -235,7 +336,7 @@ def test_prepared_native_suffix_runner_cudagraph_replay_uses_updated_qkv() -> No
         manual_key_cache,
         manual_value_cache,
     )
-    cots_qwen_bf16_suffix_attention(
+    cots_gqa_bf16_suffix_attention(
         query=query,
         key_cache=manual_key_cache,
         value_cache=manual_value_cache,
@@ -281,7 +382,7 @@ def test_prepared_native_suffix_runner_cudagraph_replay_uses_updated_separate_kv
 
     runner = CotsPreparedNativeSuffixAttentionRunner(num_tasks=1)
     try:
-        runner.run_qwen_bf16_suffix_attention(
+        runner.run_gqa_bf16_suffix_attention(
             query=query,
             key_cache=runner_key_cache,
             value_cache=runner_value_cache,
@@ -302,7 +403,7 @@ def test_prepared_native_suffix_runner_cudagraph_replay_uses_updated_separate_kv
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            runner.run_qwen_bf16_suffix_attention(
+            runner.run_gqa_bf16_suffix_attention(
                 query=query,
                 key_cache=runner_key_cache,
                 value_cache=runner_value_cache,
@@ -336,7 +437,7 @@ def test_prepared_native_suffix_runner_cudagraph_replay_uses_updated_separate_kv
 
         manual_key_cache.zero_()
         manual_value_cache.zero_()
-        cots_qwen_bf16_scatter_suffix_kv(
+        cots_gqa_bf16_scatter_suffix_kv(
             key1,
             value1,
             scatter_block_ids,
@@ -344,7 +445,7 @@ def test_prepared_native_suffix_runner_cudagraph_replay_uses_updated_separate_kv
             manual_key_cache,
             manual_value_cache,
         )
-        cots_qwen_bf16_suffix_attention(
+        cots_gqa_bf16_suffix_attention(
             query1,
             manual_key_cache,
             manual_value_cache,
@@ -374,7 +475,7 @@ def test_prepared_native_suffix_runner_cudagraph_replay_uses_updated_separate_kv
     finally:
         runner.close()
 
-    cots_qwen_bf16_scatter_suffix_kv(
+    cots_gqa_bf16_scatter_suffix_kv(
         key2,
         value2,
         scatter_block_ids,
@@ -382,7 +483,7 @@ def test_prepared_native_suffix_runner_cudagraph_replay_uses_updated_separate_kv
         manual_key_cache,
         manual_value_cache,
     )
-    cots_qwen_bf16_suffix_attention(
+    cots_gqa_bf16_suffix_attention(
         query2,
         manual_key_cache,
         manual_value_cache,
@@ -427,7 +528,7 @@ def test_prepared_native_suffix_runner_cudagraph_replay_uses_live_counts() -> No
 
     runner = CotsPreparedNativeSuffixAttentionRunner(num_tasks=1)
     try:
-        runner.run_qwen_bf16_suffix_attention(
+        runner.run_gqa_bf16_suffix_attention(
             query=query,
             key_cache=runner_key_cache,
             value_cache=runner_value_cache,
@@ -448,7 +549,7 @@ def test_prepared_native_suffix_runner_cudagraph_replay_uses_live_counts() -> No
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            runner.run_qwen_bf16_suffix_attention(
+            runner.run_gqa_bf16_suffix_attention(
                 query=query,
                 key_cache=runner_key_cache,
                 value_cache=runner_value_cache,
@@ -481,7 +582,7 @@ def test_prepared_native_suffix_runner_cudagraph_replay_uses_live_counts() -> No
         graph.replay()
         torch.accelerator.synchronize()
 
-        cots_qwen_bf16_scatter_suffix_kv(
+        cots_gqa_bf16_scatter_suffix_kv(
             key1[:live],
             value1[:live],
             scatter_block_ids[:live],
@@ -489,7 +590,7 @@ def test_prepared_native_suffix_runner_cudagraph_replay_uses_live_counts() -> No
             manual_key_cache,
             manual_value_cache,
         )
-        cots_qwen_bf16_suffix_attention(
+        cots_gqa_bf16_suffix_attention(
             query1[:live],
             manual_key_cache,
             manual_value_cache,
