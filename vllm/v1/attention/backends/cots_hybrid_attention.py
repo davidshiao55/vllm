@@ -186,7 +186,7 @@ def _source_indices_for_device(
     return source_indices.to(device=device, non_blocking=True)
 
 
-class CotsPreparedNativeSuffixAttentionRunner:
+class NativeCotsSuffixAttentionRunner:
     """Prepared host-callback runner for CPU suffix attention.
 
     Python owns the stable CPU query/KV metadata; the CPU suffix attention task
@@ -201,18 +201,18 @@ class CotsPreparedNativeSuffixAttentionRunner:
             from vllm import _cots_C
         except ImportError as e:
             raise RuntimeError(
-                "CotsPreparedNativeSuffixAttentionRunner requires the "
+                "NativeCotsSuffixAttentionRunner requires the "
                 "`vllm._cots_C` extension. Rebuild vLLM before enabling "
                 "COTS hybrid KV."
             ) from e
         from vllm.v1.attention.backends import cots_suffix_attention_ops
 
         self._ops = cots_suffix_attention_ops
-        self._runner_id = cots_suffix_attention_ops.register_suffix_infer(
-            _cots_C.CotsSuffixAttentionInfer()
+        self._runner_id = cots_suffix_attention_ops.register_suffix_attention_runner(
+            _cots_C.CotsSuffixAttentionTaskRunner()
         )
         self._num_tasks = int(num_tasks)
-        cots_suffix_attention_ops.install_suffix_infer(
+        cots_suffix_attention_ops.install_suffix_attention_runner(
             self._runner_id, n_tasks=self._num_tasks
         )
         cots_suffix_attention_ops.install_suffix_wait_kernel_sync(
@@ -235,7 +235,7 @@ class CotsPreparedNativeSuffixAttentionRunner:
         self._ops.reset_suffix_counters(self._runner_id)
 
     def set_runtime_counts(self, num_tokens: int, scatter_count: int) -> None:
-        self._ops.set_suffix_runtime_counts(
+        self._ops.set_suffix_attention_runtime_counts(
             self._runner_id, int(num_tokens), int(scatter_count)
         )
 
@@ -424,10 +424,10 @@ class CotsPreparedNativeSuffixAttentionRunner:
             scatter_key_ptr = int(scatter_key_cpu.data_ptr())
             scatter_value_ptr = int(scatter_value_cpu.data_ptr())
 
-        infer = self._ops.lookup_suffix_infer(
+        suffix_runner = self._ops.lookup_suffix_attention_runner(
             self._runner_id, "cots_prepared_suffix_attention"
         )
-        infer.populate_task(
+        suffix_runner.populate_task(
             int(task_id),
             int(query.data_ptr()),
             int(query.shape[0]),
@@ -494,15 +494,15 @@ class CotsPreparedNativeSuffixAttentionRunner:
         try:
             if torch.cuda.is_available() and torch.cuda.is_initialized():
                 torch.cuda.current_stream().synchronize()
-            self._ops.sync_suffix_infer_blocking(self._runner_id)
+            self._ops.sync_suffix_attention_runner_blocking(self._runner_id)
         finally:
-            self._ops.unregister_suffix_infer(self._runner_id)
+            self._ops.unregister_suffix_attention_runner(self._runner_id)
             self._owns_registry_entry = False
 
     def __del__(self) -> None:
         try:
             if getattr(self, "_owns_registry_entry", False):
-                self._ops.unregister_suffix_infer(self._runner_id)
+                self._ops.unregister_suffix_attention_runner(self._runner_id)
                 self._owns_registry_entry = False
         except Exception:
             pass

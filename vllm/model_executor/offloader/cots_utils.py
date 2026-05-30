@@ -80,7 +80,7 @@ def _has_pinned_host_storage(t: torch.Tensor) -> bool:
     captured path — that fix is the schema change (§1c.20: drop
     `y_pinned` from `cots_submit_gemm.mutates_args`, anchor
     `cots_sync_then_uva` on `x_gpu` instead). This helper is the
-    safety belt for direct callers (`PythonCotsRunner.wait_and_uva`)
+    safety belt for direct callers (`PythonCotsWeightRunner.wait_and_uva`)
     that still legitimately pass pinned tensors and views thereof.
     """
     if t.device.type != "cpu":
@@ -99,7 +99,7 @@ def _uva_copy_trusted_host_into_gpu(
 ) -> None:
     """§1c.20: same as `uva_copy_into_gpu` minus the page-locked
     storage assertion. Used ONLY by `cots_sync_then_uva`'s impl —
-    the source tensor came from `CotsCpuInfer::y_pinned_view`, which
+    the source tensor came from `CotsWeightTaskRunner::y_pinned_view`, which
     builds an `at::from_blob` view over a slab pointer that was
     populated at install time from a real `torch.empty(...,
     pin_memory=True)` allocation. The storage IS page-locked by
@@ -108,7 +108,7 @@ def _uva_copy_trusted_host_into_gpu(
 
     Inlined rather than calling `uva_copy_into_gpu(...)` so that the
     public helper's strict pinned check stays intact for direct
-    callers (`PythonCotsRunner.wait_and_uva` and friends), and so
+    callers (`PythonCotsWeightRunner.wait_and_uva` and friends), and so
     `is_pinned()`/storage-level checks aren't pointless work on the
     captured-graph hot path.
     """
@@ -288,5 +288,5 @@ def _complement(idx: torch.Tensor, n: int) -> torch.Tensor:
 # One handle per offloaded Linear. Owns the GPU weight slice (replaces
 # param.data), the CPU weight slice (`w_cpu`, pinned), the CUDA index
 # tensors, and the wrapped weight_loader closure. No execution — operators
-# read state from the handle and submit work via a `CpuTaskRunner`.
+# read state from the handle and submit work via a COTS runner.
 # ---------------------------------------------------------------------------

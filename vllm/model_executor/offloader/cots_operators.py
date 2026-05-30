@@ -11,8 +11,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from vllm.model_executor.offloader.cots_runners import (
-    NativeCotsRunner,
-    PythonCotsRunner,
+    NativeCotsWeightRunner,
+    PythonCotsWeightRunner,
 )
 from vllm.model_executor.offloader.cots_storage import CotsLinearHandle
 
@@ -56,7 +56,7 @@ class CotsQKVOp:
     def __init__(
         self,
         handle: CotsLinearHandle,
-        runner: PythonCotsRunner | NativeCotsRunner,
+        runner: PythonCotsWeightRunner | NativeCotsWeightRunner,
         offloader: CotsOffloader,
         original_quant_method,
     ):
@@ -144,7 +144,7 @@ class CotsQKVOp:
             # pointer. Python (eager kill-switch) keeps the original
             # x_in/y_out flow because it isn't traced by Inductor.
             y_dst = offloader._y_gpu[: num_tokens * n_cpu].view(num_tokens, n_cpu)
-            if isinstance(self._runner, NativeCotsRunner):
+            if isinstance(self._runner, NativeCotsWeightRunner):
                 self._runner.submit_with_d2h(x, h.layer_idx, "qkv")
             else:
                 assert offloader._x_pinned is not None
@@ -189,7 +189,7 @@ class CotsQKVOp:
             # y_pinned_view; python stashes it on submit. The
             # captured-graph custom op sees only CUDA tensors +
             # scalars.
-            if isinstance(self._runner, NativeCotsRunner):
+            if isinstance(self._runner, NativeCotsWeightRunner):
                 self._runner.wait_and_uva(y_dst, gpu_a, gpu_b, x, h.layer_idx, "qkv")
             else:
                 self._runner.wait_and_uva(y_dst, gpu_a, gpu_b, x, desc)
@@ -225,7 +225,7 @@ class CotsSwiGLUMLPOp:
         gate_up_handle: CotsLinearHandle,
         down_handle: CotsLinearHandle,
         act_fn: nn.Module,
-        runner: PythonCotsRunner | NativeCotsRunner,
+        runner: PythonCotsWeightRunner | NativeCotsWeightRunner,
         offloader: CotsOffloader,
         qualified_name: str,
     ):
@@ -310,7 +310,7 @@ class CotsSwiGLUMLPOp:
             y2_gpu = offloader._y_gpu[: num_tokens * self._out_dim].view(
                 num_tokens, self._out_dim
             )
-            if isinstance(self._runner, NativeCotsRunner):
+            if isinstance(self._runner, NativeCotsWeightRunner):
                 self._runner.submit_with_d2h(x, gu_h.layer_idx, "mlp_block")
             else:
                 assert offloader._x_pinned is not None
@@ -373,7 +373,7 @@ class CotsSwiGLUMLPOp:
             # §1c.20: y_pinned (y2_pinned) is intentionally not
             # passed; native uses y_pinned_view via the slab pointer
             # and python stashes y_pinned at submit time.
-            if isinstance(self._runner, NativeCotsRunner):
+            if isinstance(self._runner, NativeCotsWeightRunner):
                 self._runner.wait_and_uva(
                     y2_gpu, gpu_a, gpu_b, x, gu_h.layer_idx, "mlp_block"
                 )

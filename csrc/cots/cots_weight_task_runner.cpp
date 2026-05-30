@@ -1,20 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
-// Phase 1c — native CPU runner implementation.
+// Phase 1c — native weight task runner implementation.
 
-#include "cots_cpu_infer.h"
+#include "cots_weight_task_runner.h"
+
+#include "cots_common.h"
 
 #include <ATen/ops/linear.h>
 #include <c10/core/InferenceMode.h>
-#include <nvtx3/nvToolsExt.h>
 #include <pthread.h>
 #include <sched.h>
 #include <torch/torch.h>
 
 #include <algorithm>
-#include <chrono>
-#include <cstdlib>
 #include <exception>
 #include <stdexcept>
 #include <utility>
@@ -47,22 +46,11 @@ constexpr int kMaxCpus = 64;
 
 // §1c.24 instrumentation gates. `VLLM_COTS_DIAG=1` remains a legacy
 // alias for all diagnostics; the split flags let benchmark runs enable
-// NVTX, counters, or the diagnostic wait kernel independently.
+// counters or the diagnostic wait kernel independently. NVTX is shared across
+// COTS runners via NvtxScope in cots_common.h.
 namespace cots_diag {
-inline bool env_flag(const char* name) {
-  const char* v = std::getenv(name);
-  return v != nullptr && v[0] == '1' && v[1] == '\0';
-}
-
 inline bool legacy_enabled() {
   static const bool enabled = []() { return env_flag("VLLM_COTS_DIAG"); }();
-  return enabled;
-}
-
-inline bool nvtx_enabled() {
-  static const bool enabled = []() {
-    return legacy_enabled() || env_flag("VLLM_COTS_NVTX");
-  }();
   return enabled;
 }
 
@@ -81,23 +69,6 @@ inline bool wait_kernel_diag_enabled() {
 }
 }  // namespace cots_diag
 
-struct NvtxScope {
-  explicit NvtxScope(const char* name) {
-    if (cots_diag::nvtx_enabled()) nvtxRangePushA(name);
-  }
-  ~NvtxScope() {
-    if (cots_diag::nvtx_enabled()) nvtxRangePop();
-  }
-  NvtxScope(const NvtxScope&) = delete;
-  NvtxScope& operator=(const NvtxScope&) = delete;
-};
-
-inline int64_t now_ns() {
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(
-             std::chrono::steady_clock::now().time_since_epoch())
-      .count();
-}
-
 // Phase 1c is bfloat16-locked (see header comment + cpu_dtype literal in
 // `vllm/config/offload.py`). Centralizing the dtype here keeps the slab
 // struct lean and avoids any int-enum dance over pybind.
@@ -112,12 +83,13 @@ at::Tensor ContigCpuViewFromBlob(void* ptr, int64_t rows, int64_t cols) {
 
 }  // namespace
 
-CotsCpuInfer::CotsCpuInfer() : task_queue_(std::make_unique<TaskQueue>()) {
-  sync_args_.infer = static_cast<void*>(this);
+CotsWeightTaskRunner::CotsWeightTaskRunner()
+    : task_queue_(std::make_unique<TaskQueue>()) {
+  sync_args_.runner = static_cast<void*>(this);
   sync_args_.allow_n_pending = 0;
 }
 
-CotsCpuInfer::~CotsCpuInfer() {
+CotsWeightTaskRunner::~CotsWeightTaskRunner() {
   // Drain before destructing the queue so any in-flight task completes.
   if (task_queue_) {
     task_queue_->sync(0);
@@ -158,11 +130,11 @@ CotsCpuInfer::~CotsCpuInfer() {
   }
 }
 
-void CotsCpuInfer::install(int64_t n_slabs, int64_t max_num_tokens) {
+void CotsWeightTaskRunner::install(int64_t n_slabs, int64_t max_num_tokens) {
   TORCH_CHECK(n_slabs >= 0, "install: n_slabs must be >= 0, got ", n_slabs);
   TORCH_CHECK(!slabs_,
-              "install: CotsCpuInfer already installed; call once per "
-              "CotsCpuInfer instance");
+              "install: CotsWeightTaskRunner already installed; call once per "
+              "CotsWeightTaskRunner instance");
 
   // Sized-once heap array. Address-stable for the lifetime of *this so
   // captured CUDA graphs can record &slabs_[id] as host-callback userData.
@@ -177,7 +149,7 @@ void CotsCpuInfer::install(int64_t n_slabs, int64_t max_num_tokens) {
   max_num_tokens_ = max_num_tokens;
 }
 
-void CotsCpuInfer::check_error() {
+void CotsWeightTaskRunner::check_error() {
   if (!has_error_.load(std::memory_order_acquire)) return;
   std::lock_guard<std::mutex> lock(error_mtx_);
   std::string msg = std::move(last_error_msg_);
@@ -188,25 +160,24 @@ void CotsCpuInfer::check_error() {
   throw std::runtime_error(msg);
 }
 
-int32_t CotsCpuInfer::slab_bucket_capacity_tokens(int64_t task_id) const {
+int32_t CotsWeightTaskRunner::slab_bucket_capacity_tokens(
+    int64_t task_id) const {
   TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
               "slab_bucket_capacity_tokens: task_id ", task_id,
               " out of range");
   return slabs_[task_id].bucket_capacity_tokens;
 }
 
-int32_t CotsCpuInfer::slab_num_tokens(int64_t task_id) const {
+int32_t CotsWeightTaskRunner::slab_num_tokens(int64_t task_id) const {
   TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
               "slab_num_tokens: task_id ", task_id, " out of range");
   return slabs_[task_id].num_tokens.load(std::memory_order_acquire);
 }
 
-void CotsCpuInfer::populate_slab_qkv(int64_t task_id, int32_t n_threads,
-                                     int32_t bucket_capacity_tokens,
-                                     uintptr_t x_pinned_ptr, int32_t in_dim,
-                                     uintptr_t y_pinned_ptr,
-                                     int32_t cpu_out_dim, uintptr_t w_cpu_ptr,
-                                     int32_t w_cpu_rows) {
+void CotsWeightTaskRunner::populate_slab_qkv(
+    int64_t task_id, int32_t n_threads, int32_t bucket_capacity_tokens,
+    uintptr_t x_pinned_ptr, int32_t in_dim, uintptr_t y_pinned_ptr,
+    int32_t cpu_out_dim, uintptr_t w_cpu_ptr, int32_t w_cpu_rows) {
   check_error();
   TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
               "populate_slab_qkv: task_id ", task_id, " out of range");
@@ -225,14 +196,12 @@ void CotsCpuInfer::populate_slab_qkv(int64_t task_id, int32_t n_threads,
   s.w_cpu_rows = w_cpu_rows;
 }
 
-void CotsCpuInfer::populate_slab_mlp(int64_t task_id, int32_t n_threads,
-                                     int32_t bucket_capacity_tokens,
-                                     uintptr_t x_pinned_ptr, int32_t in_dim,
-                                     uintptr_t y_pinned_ptr,
-                                     int32_t cpu_out_dim, uintptr_t w_gate_ptr,
-                                     int32_t w_gate_rows, uintptr_t w_up_ptr,
-                                     int32_t w_up_rows, uintptr_t w_down_ptr,
-                                     int32_t w_down_rows, int32_t w_down_cols) {
+void CotsWeightTaskRunner::populate_slab_mlp(
+    int64_t task_id, int32_t n_threads, int32_t bucket_capacity_tokens,
+    uintptr_t x_pinned_ptr, int32_t in_dim, uintptr_t y_pinned_ptr,
+    int32_t cpu_out_dim, uintptr_t w_gate_ptr, int32_t w_gate_rows,
+    uintptr_t w_up_ptr, int32_t w_up_rows, uintptr_t w_down_ptr,
+    int32_t w_down_rows, int32_t w_down_cols) {
   check_error();
   TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
               "populate_slab_mlp: task_id ", task_id, " out of range");
@@ -256,11 +225,9 @@ void CotsCpuInfer::populate_slab_mlp(int64_t task_id, int32_t n_threads,
   s.w_down_cols = w_down_cols;
 }
 
-void CotsCpuInfer::populate_slab_dryrun(int64_t task_id,
-                                        int32_t bucket_capacity_tokens,
-                                        uintptr_t x_pinned_ptr, int32_t in_dim,
-                                        uintptr_t y_pinned_ptr,
-                                        int32_t cpu_out_dim) {
+void CotsWeightTaskRunner::populate_slab_dryrun(
+    int64_t task_id, int32_t bucket_capacity_tokens, uintptr_t x_pinned_ptr,
+    int32_t in_dim, uintptr_t y_pinned_ptr, int32_t cpu_out_dim) {
   check_error();
   TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
               "populate_slab_dryrun: task_id ", task_id, " out of range");
@@ -278,10 +245,11 @@ void CotsCpuInfer::populate_slab_dryrun(int64_t task_id,
   s.cpu_out_dim = cpu_out_dim;
 }
 
-void CotsCpuInfer::submit_on_stream(int64_t task_id, int32_t num_tokens,
-                                    uintptr_t x_gpu_ptr, int64_t x_cols,
-                                    int64_t x_stride0, int64_t x_stride1,
-                                    uintptr_t cuda_stream) {
+void CotsWeightTaskRunner::submit_on_stream(int64_t task_id, int32_t num_tokens,
+                                            uintptr_t x_gpu_ptr, int64_t x_cols,
+                                            int64_t x_stride0,
+                                            int64_t x_stride1,
+                                            uintptr_t cuda_stream) {
   NvtxScope nvtx_scope("cots:submit_on_stream");
   // Surface any prior worker error BEFORE queueing more work.
   check_error();
@@ -414,36 +382,37 @@ void CotsCpuInfer::submit_on_stream(int64_t task_id, int32_t num_tokens,
                 "): ", cudaGetErrorString(copy_err));
   }
   NvtxScope launch_scope("cots:launch_dispatch_cb");
-  cudaError_t err = cudaLaunchHostFunc(stream, &CotsCpuInfer::DispatchCallback,
-                                       static_cast<void*>(slab));
+  cudaError_t err =
+      cudaLaunchHostFunc(stream, &CotsWeightTaskRunner::DispatchCallback,
+                         static_cast<void*>(slab));
   TORCH_CHECK(
       err == cudaSuccess,
       "cudaLaunchHostFunc(DispatchCallback) failed: ", cudaGetErrorString(err));
 }
 
-void CotsCpuInfer::sync_on_stream(uintptr_t cuda_stream) {
+void CotsWeightTaskRunner::sync_on_stream(uintptr_t cuda_stream) {
   NvtxScope nvtx_scope("cots:sync_on_stream");
   check_error();
   // sync_args_ is a stable member of *this; safe to take its address as
   // userData for cudaLaunchHostFunc, including across CUDA graph replays.
   cudaError_t err = cudaLaunchHostFunc(
-      reinterpret_cast<cudaStream_t>(cuda_stream), &CotsCpuInfer::SyncCallback,
-      static_cast<void*>(&sync_args_));
+      reinterpret_cast<cudaStream_t>(cuda_stream),
+      &CotsWeightTaskRunner::SyncCallback, static_cast<void*>(&sync_args_));
   TORCH_CHECK(err == cudaSuccess, "cudaLaunchHostFunc(SyncCallback) failed: ",
               cudaGetErrorString(err));
 }
 
-void CotsCpuInfer::sync_or_wait_on_stream(int64_t task_id,
-                                          uintptr_t cuda_stream) {
+void CotsWeightTaskRunner::sync_or_wait_on_stream(int64_t task_id,
+                                                  uintptr_t cuda_stream) {
   // §1c.29 commit 2 — unified entry. Per-slab branch: if wait-kernel sync is
   // installed for this task, the captured node is the wait kernel
   // (reads the worker-published done_slot=seq). Otherwise the
-  // captured node stays the legacy SyncCallback host_fn that
+  // captured node stays the host-callback SyncCallback node that
   // blocks the driver thread on TaskQueue::sync(0). Both
   // mechanisms can coexist within the same offloader / same
-  // CotsCpuInfer instance — the branch is per-slab, not per-
+  // CotsWeightTaskRunner instance — the branch is per-slab, not per-
   // runner — but in practice the offloader sets the flag for ALL
-  // slabs at install time (cots_capture_sync_mode="wait_kernel" is binary at
+  // slabs at install time (weight_capture_sync_mode="wait_kernel" is binary at
   // the runner level) so the branch is uniform across a single
   // offloader's slabs.
   TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
@@ -471,7 +440,8 @@ void CotsCpuInfer::sync_or_wait_on_stream(int64_t task_id,
   }
 }
 
-bool CotsCpuInfer::wait_kernel_sync_installed_for_task(int64_t task_id) const {
+bool CotsWeightTaskRunner::wait_kernel_sync_installed_for_task(
+    int64_t task_id) const {
   TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
               "wait_kernel_sync_installed_for_task: task_id ", task_id,
               " out of range");
@@ -479,13 +449,13 @@ bool CotsCpuInfer::wait_kernel_sync_installed_for_task(int64_t task_id) const {
       std::memory_order_acquire);
 }
 
-void CotsCpuInfer::sync_blocking() {
+void CotsWeightTaskRunner::sync_blocking() {
   task_queue_->sync(0);
   // Surface any worker error that fired while we were waiting.
   check_error();
 }
 
-void CotsCpuInfer::set_worker_affinity(uint64_t cpu_set) {
+void CotsWeightTaskRunner::set_worker_affinity(uint64_t cpu_set) {
   if (cpu_set == 0) {
     return;  // No-op; leave kernel default. (Stage 4 fills this out.)
   }
@@ -521,7 +491,7 @@ void CotsCpuInfer::set_worker_affinity(uint64_t cpu_set) {
   });
 }
 
-std::string CotsCpuInfer::take_error() {
+std::string CotsWeightTaskRunner::take_error() {
   std::lock_guard<std::mutex> lock(error_mtx_);
   std::string msg = std::move(last_error_msg_);
   last_error_msg_.clear();
@@ -529,8 +499,8 @@ std::string CotsCpuInfer::take_error() {
   return msg;
 }
 
-void CotsCpuInfer::run_at_linear_inline(at::Tensor x, at::Tensor w,
-                                        at::Tensor y_out) {
+void CotsWeightTaskRunner::run_at_linear_inline(at::Tensor x, at::Tensor w,
+                                                at::Tensor y_out) {
   // Stage 1 microbench helper: directly drive `at::linear` from C++.
   // No TaskQueue, no host callback. Lets the test compare wall-clock
   // against Python `F.linear` on bit-identical tensors and catch the
@@ -541,8 +511,9 @@ void CotsCpuInfer::run_at_linear_inline(at::Tensor x, at::Tensor w,
   y_out.copy_(at::linear(x, w));
 }
 
-void CotsCpuInfer::run_bf16_gemm_transposed_inline(at::Tensor x, at::Tensor w,
-                                                   at::Tensor y_out) {
+void CotsWeightTaskRunner::run_bf16_gemm_transposed_inline(at::Tensor x,
+                                                           at::Tensor w,
+                                                           at::Tensor y_out) {
   // Correctness/diagnostic helper: drive the custom BF16
   // row-major-weight GEMM kernel (csrc/cots/bf16_gemm_transposed.cpp)
   // inline. No TaskQueue, no host callback. The wrapped function does
@@ -553,38 +524,41 @@ void CotsCpuInfer::run_bf16_gemm_transposed_inline(at::Tensor x, at::Tensor w,
   bf16_gemm_transposed_at(x, w, y_out);
 }
 
-void CotsCpuInfer::run_bf16_gemm_natural_inline(at::Tensor x, at::Tensor w,
-                                                at::Tensor y_out) {
+void CotsWeightTaskRunner::run_bf16_gemm_natural_inline(at::Tensor x,
+                                                        at::Tensor w,
+                                                        at::Tensor y_out) {
   // Stage 7-D probe — sibling kernel for the natural (N, K) row-major
   // BF16 GEMM layout. Same harness pattern as the Path H helper above.
   c10::InferenceMode g;
   bf16_gemm_natural_at(x, w, y_out);
 }
 
-at::Tensor CotsCpuInfer::y_pinned_view(int64_t task_id,
-                                       int32_t num_tokens) const {
+at::Tensor CotsWeightTaskRunner::y_pinned_view(int64_t task_id,
+                                               int32_t num_tokens) const {
   // §1c.20: build an `at::from_blob` CPU tensor view over the slab's
   // pinned output buffer. Used by `cots_sync_then_uva`'s impl on the
   // captured-graph hot path so the CPU output tensor is NEVER a
   // custom-op argument visible to Inductor.
   if (task_id < 0 || task_id >= slab_count_) {
-    throw std::out_of_range(
-        "CotsCpuInfer::y_pinned_view: task_id=" + std::to_string(task_id) +
-        " out of range [0, " + std::to_string(slab_count_) + ")");
+    throw std::out_of_range("CotsWeightTaskRunner::y_pinned_view: task_id=" +
+                            std::to_string(task_id) + " out of range [0, " +
+                            std::to_string(slab_count_) + ")");
   }
   const TaskSlab& slab = slabs_[task_id];
   if (slab.y_pinned_ptr == nullptr) {
     throw std::runtime_error(
-        "CotsCpuInfer::y_pinned_view: slab.y_pinned_ptr is null at task_id=" +
+        "CotsWeightTaskRunner::y_pinned_view: slab.y_pinned_ptr is null at "
+        "task_id=" +
         std::to_string(task_id) + " (slab not populated?)");
   }
   if (num_tokens < 0) {
-    throw std::invalid_argument("CotsCpuInfer::y_pinned_view: num_tokens=" +
-                                std::to_string(num_tokens) + " < 0");
+    throw std::invalid_argument(
+        "CotsWeightTaskRunner::y_pinned_view: num_tokens=" +
+        std::to_string(num_tokens) + " < 0");
   }
   if (max_num_tokens_ != 0 && num_tokens > max_num_tokens_) {
     throw std::invalid_argument(
-        "CotsCpuInfer::y_pinned_view: num_tokens=" +
+        "CotsWeightTaskRunner::y_pinned_view: num_tokens=" +
         std::to_string(num_tokens) +
         " exceeds max_num_tokens=" + std::to_string(max_num_tokens_) +
         " (would read past the pinned buffer's tail)");
@@ -615,10 +589,10 @@ at::Tensor CotsCpuInfer::y_pinned_view(int64_t task_id,
 // Submit-side host callback. Runs on the CUDA driver thread; must NOT
 // block (CUDA stream is paused while we run). Just enqueues to the
 // TaskQueue worker.
-void CotsCpuInfer::DispatchCallback(void* user_data) {
+void CotsWeightTaskRunner::DispatchCallback(void* user_data) {
   NvtxScope nvtx_scope("cots:dispatch_cb");
   TaskSlab* slab = static_cast<TaskSlab*>(user_data);
-  CotsCpuInfer* self = static_cast<CotsCpuInfer*>(slab->self);
+  CotsWeightTaskRunner* self = static_cast<CotsWeightTaskRunner*>(slab->self);
   // §1c.24 attribution: stamp enqueue time so the worker can later
   // compute queue_wait = worker_start - enqueue_time. Gated together
   // with the NVTX scopes by VLLM_COTS_DIAG=1; in production-default
@@ -665,10 +639,10 @@ void CotsCpuInfer::DispatchCallback(void* user_data) {
 
 // Sync-side host callback. Blocks the CUDA driver thread until the
 // TaskQueue drains. The user_data is `&self->sync_args_` (stable member).
-void CotsCpuInfer::SyncCallback(void* user_data) {
+void CotsWeightTaskRunner::SyncCallback(void* user_data) {
   NvtxScope nvtx_scope("cots:sync_cb_wait");
   SyncArgs* args = static_cast<SyncArgs*>(user_data);
-  CotsCpuInfer* self = static_cast<CotsCpuInfer*>(args->infer);
+  CotsWeightTaskRunner* self = static_cast<CotsWeightTaskRunner*>(args->runner);
   // §1c.24 attribution: time the sync wait — distinguishes "driver
   // blocked waiting for the worker" from "driver doing other work
   // then unblocking immediately". Same VLLM_COTS_DIAG gate as the
@@ -687,7 +661,7 @@ void CotsCpuInfer::SyncCallback(void* user_data) {
 
 // --- worker-thread task body ----------------------------------------------
 
-void CotsCpuInfer::RunSlabOnWorker(TaskSlab* slab, uint32_t seq) {
+void CotsWeightTaskRunner::RunSlabOnWorker(TaskSlab* slab, uint32_t seq) {
   // §1c.24 attribution: stamp worker start + queue wait, gated by
   // VLLM_COTS_DIAG. Production-default leaves worker_t0 at 0 (the
   // worker_busy_total_ns add at the end is also gated). NVTX scope
@@ -734,17 +708,17 @@ void CotsCpuInfer::RunSlabOnWorker(TaskSlab* slab, uint32_t seq) {
     last_observed_num_threads_.store(at::get_num_threads(),
                                      std::memory_order_release);
 
-    // §1c.21: prefer runtime_num_tokens_ (live unpadded count, set
-    // OUT OF GRAPH by `set_runtime_num_tokens` before each captured
-    // replay) over `slab->num_tokens` (captured bucket capacity).
-    // Sentinel 0 → fall back to slab capacity.
+    // §1c.21: prefer live_num_tokens override (stored in runtime_num_tokens_,
+    // set OUT OF GRAPH by `set_live_num_tokens` before each captured replay)
+    // over `slab->num_tokens` (captured bucket capacity). Sentinel 0 → fall
+    // back to slab capacity.
     //
     // §1c.31 (commit-3-real fix): the override is a CAP, not a
     // required row count. If it exceeds slab capacity, clamp to
     // slab_cap and bump worker_clamp_override_count_ for
     // observability. Pinned-buffer reads past slab_cap rows is UB,
     // so the clamp is the safe behavior. This commonly happens in
-    // eager mode where set_runtime_num_tokens() applies globally to
+    // eager mode where set_live_num_tokens() applies globally to
     // whatever slab fires next, regardless of which bucket sized
     // that slab (e.g., B=4 prefill at input_len=8 → 32 tokens, but
     // an MLP slab keyed by the smallest bucket has capacity 8).
@@ -910,7 +884,8 @@ void CotsCpuInfer::RunSlabOnWorker(TaskSlab* slab, uint32_t seq) {
 
 // --- §1c.21 live-token override ---------------------------------------
 
-void CotsCpuInfer::note_uva_request(int32_t num_tokens, int32_t cpu_out_dim) {
+void CotsWeightTaskRunner::note_uva_request(int32_t num_tokens,
+                                            int32_t cpu_out_dim) {
   // §1c.22 bookkeeping. Diag-gated (§1c.34 cleanup C) —
   // measurement-only path; no functional dependency.
   if (num_tokens <= 0 || cpu_out_dim <= 0) return;
@@ -922,27 +897,27 @@ void CotsCpuInfer::note_uva_request(int32_t num_tokens, int32_t cpu_out_dim) {
   uva_record_count_.fetch_add(1, std::memory_order_relaxed);
 }
 
-void CotsCpuInfer::set_runtime_num_tokens(int32_t n) {
-  TORCH_CHECK(n >= 0, "set_runtime_num_tokens: n=", n,
+void CotsWeightTaskRunner::set_live_num_tokens(int32_t n) {
+  TORCH_CHECK(n >= 0, "set_live_num_tokens: n=", n,
               " < 0; pass 0 to clear the override.");
   // Release store: the worker's acquire load in RunSlabOnWorker pairs
   // with this. The caller's responsibility is to set this BEFORE the
   // captured graph replay begins (i.e., from CotsOffloader.on_dispatch
   // outside the captured region). This store
   // is FUNCTIONAL (drives the worker's effective_n) and must stay
-  // always-on; the runtime_set_calls / runtime_last_value counters
+  // always-on; the live_set_calls / live_last_value counters
   // alongside are diagnostic only and diag-gated (§1c.34 cleanup C).
   runtime_num_tokens_.store(n, std::memory_order_release);
   if (cots_diag::counters_enabled()) {
-    runtime_set_calls_.fetch_add(1, std::memory_order_relaxed);
-    runtime_last_value_.store(n, std::memory_order_relaxed);
+    live_set_calls_.fetch_add(1, std::memory_order_relaxed);
+    live_last_value_.store(n, std::memory_order_relaxed);
   }
 }
 
 // --- §1c.21 perf-investigation counters --------------------------------
 
-std::vector<std::pair<std::string, int64_t>> CotsCpuInfer::get_counters()
-    const {
+std::vector<std::pair<std::string, int64_t>>
+CotsWeightTaskRunner::get_counters() const {
   std::vector<std::pair<std::string, int64_t>> out;
   out.reserve(40);
   auto load = [](const std::atomic<int64_t>& a) {
@@ -976,8 +951,8 @@ std::vector<std::pair<std::string, int64_t>> CotsCpuInfer::get_counters()
   // re-executes). Apples-to-apples with worker_*_live_bytes.
   out.emplace_back("d2h_replay_bucket_bytes", load(d2h_replay_bucket_bytes_));
   out.emplace_back("uva_replay_bucket_bytes", load(uva_replay_bucket_bytes_));
-  out.emplace_back("runtime_set_calls", load(runtime_set_calls_));
-  out.emplace_back("runtime_last_value", load(runtime_last_value_));
+  out.emplace_back("live_set_calls", load(live_set_calls_));
+  out.emplace_back("live_last_value", load(live_last_value_));
   for (int i = 0; i < 8; ++i) {
     out.emplace_back(std::string("worker_eff_n_") + kBinNames[i],
                      load(worker_effective_n_hist_[i]));
@@ -1017,7 +992,7 @@ std::vector<std::pair<std::string, int64_t>> CotsCpuInfer::get_counters()
   return out;
 }
 
-void CotsCpuInfer::reset_counters() {
+void CotsWeightTaskRunner::reset_counters() {
   submit_count_qkv_.store(0, std::memory_order_relaxed);
   submit_count_mlp_.store(0, std::memory_order_relaxed);
   submit_count_dryrun_.store(0, std::memory_order_relaxed);
@@ -1030,8 +1005,8 @@ void CotsCpuInfer::reset_counters() {
   d2h_2d_count_.store(0, std::memory_order_relaxed);
   d2h_record_bytes_1d_.store(0, std::memory_order_relaxed);
   d2h_record_bytes_2d_.store(0, std::memory_order_relaxed);
-  runtime_set_calls_.store(0, std::memory_order_relaxed);
-  runtime_last_value_.store(0, std::memory_order_relaxed);
+  live_set_calls_.store(0, std::memory_order_relaxed);
+  live_last_value_.store(0, std::memory_order_relaxed);
   for (int i = 0; i < 8; ++i) {
     worker_effective_n_hist_[i].store(0, std::memory_order_relaxed);
   }
@@ -1058,41 +1033,8 @@ void CotsCpuInfer::reset_counters() {
 }
 
 // §1c.29 wait-kernel sync — install per-slab host-mapped pinned slots.
-// Forward declarations of the launchers in cots_wait_done_kernel.cu
-// so we can call them from this C++ TU without a header pulling
-// in CUDA-specific symbols.
-extern "C" void launch_cots_wait_done_kernel_production(uint32_t*, uint32_t*,
-                                                        cudaStream_t);
-extern "C" void launch_cots_wait_done_kernel_diag(uint32_t*, uint32_t*,
-                                                  int64_t*, int64_t*, int64_t*,
-                                                  cudaStream_t);
-
-// §1c.29 helper: lazily allocate the diag counter cells the
-// first time install_wait_kernel_sync_for_task is called. Host-mapped pinned
-// int64_t each so the GPU kernel can atomicAdd directly. Reads
-// in get_counters/reset_counters use the host pointer.
-static void ensure_wait_kernel_diag_cell(int64_t** host_ptr, int64_t** dev_ptr,
-                                         const char* name) {
-  if (*host_ptr != nullptr) return;
-  void* hp = nullptr;
-  cudaError_t e = cudaHostAlloc(&hp, sizeof(int64_t), cudaHostAllocMapped);
-  TORCH_CHECK(e == cudaSuccess,
-              "install_wait_kernel_sync_for_task: cudaHostAlloc(", name,
-              ") failed: ", cudaGetErrorString(e));
-  *static_cast<int64_t*>(hp) = 0;
-  void* dp = nullptr;
-  cudaError_t e2 = cudaHostGetDevicePointer(&dp, hp, 0);
-  if (e2 != cudaSuccess) {
-    cudaFreeHost(hp);
-    TORCH_CHECK(false,
-                "install_wait_kernel_sync_for_task: cudaHostGetDevicePointer(",
-                name, ") failed: ", cudaGetErrorString(e2));
-  }
-  *host_ptr = static_cast<int64_t*>(hp);
-  *dev_ptr = static_cast<int64_t*>(dp);
-}
-
-void CotsCpuInfer::install_wait_kernel_sync_for_task(int64_t task_id) {
+// Shared wait-kernel diagnostics and launch checks live in cots_common.h.
+void CotsWeightTaskRunner::install_wait_kernel_sync_for_task(int64_t task_id) {
   check_error();
   TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
               "install_wait_kernel_sync_for_task: task_id ", task_id,
@@ -1113,14 +1055,15 @@ void CotsCpuInfer::install_wait_kernel_sync_for_task(int64_t task_id) {
   // and the production launcher (which doesn't take counter ptrs)
   // is used instead.
   if (cots_diag::wait_kernel_diag_enabled()) {
-    ensure_wait_kernel_diag_cell(&wait_kernel_immediate_resume_host_,
-                                 &wait_kernel_immediate_resume_dev_,
-                                 "m3_immediate_resume");
-    ensure_wait_kernel_diag_cell(&wait_kernel_lagging_wait_host_,
-                                 &wait_kernel_lagging_wait_dev_,
-                                 "m3_lagging_wait");
-    ensure_wait_kernel_diag_cell(&wait_kernel_spin_iters_host_,
-                                 &wait_kernel_spin_iters_dev_, "m3_spin_iters");
+    ensure_mapped_i64_cell(
+        &wait_kernel_immediate_resume_host_, &wait_kernel_immediate_resume_dev_,
+        "install_wait_kernel_sync_for_task", "wait_kernel_immediate_resume");
+    ensure_mapped_i64_cell(
+        &wait_kernel_lagging_wait_host_, &wait_kernel_lagging_wait_dev_,
+        "install_wait_kernel_sync_for_task", "wait_kernel_lagging_wait");
+    ensure_mapped_i64_cell(
+        &wait_kernel_spin_iters_host_, &wait_kernel_spin_iters_dev_,
+        "install_wait_kernel_sync_for_task", "wait_kernel_spin_iters");
   }
   // Allocate one uint32_t per slot, host-mapped pinned. We keep
   // host_*_ptr (CPU-visible) and dev_*_ptr (GPU-visible — same
@@ -1167,14 +1110,14 @@ void CotsCpuInfer::install_wait_kernel_sync_for_task(int64_t task_id) {
   s.wait_kernel_sync_installed.store(true, std::memory_order_release);
 }
 
-void CotsCpuInfer::wait_kernel_sync_on_stream(int64_t task_id,
-                                              uintptr_t cuda_stream) {
+void CotsWeightTaskRunner::wait_kernel_sync_on_stream(int64_t task_id,
+                                                      uintptr_t cuda_stream) {
   check_error();
   wait_kernel_sync_on_stream_no_check(task_id, cuda_stream);
 }
 
-void CotsCpuInfer::wait_kernel_sync_on_stream_no_check(int64_t task_id,
-                                                       uintptr_t cuda_stream) {
+void CotsWeightTaskRunner::wait_kernel_sync_on_stream_no_check(
+    int64_t task_id, uintptr_t cuda_stream) {
   // §1c.29 commit 2 review-fix — DO NOT call check_error() here.
   // This launcher is used by `sync_or_wait_on_stream` on the
   // captured-graph hot path; if a prior worker task set
@@ -1191,39 +1134,15 @@ void CotsCpuInfer::wait_kernel_sync_on_stream_no_check(int64_t task_id,
       "wait_kernel_sync_on_stream: wait-kernel sync not installed for task_id=",
       task_id, "; call install_wait_kernel_sync_for_task first");
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
-  if (cots_diag::wait_kernel_diag_enabled()) {
-    // Diag counter cells are lazy-allocated by
-    // install_wait_kernel_sync_for_task, so they must exist by now (we already
-    // passed the wait_kernel_sync_installed gate above).
-    TORCH_CHECK(
-        wait_kernel_immediate_resume_dev_ != nullptr &&
-            wait_kernel_lagging_wait_dev_ != nullptr &&
-            wait_kernel_spin_iters_dev_ != nullptr,
-        "wait_kernel_sync_on_stream: diag mode active but diag counter "
-        "cells not allocated (logic bug — install_wait_kernel_sync_for_task "
-        "should have allocated them)");
-    launch_cots_wait_done_kernel_diag(static_cast<uint32_t*>(s.dev_req_slot),
-                                      static_cast<uint32_t*>(s.dev_done_slot),
-                                      wait_kernel_spin_iters_dev_,
-                                      wait_kernel_immediate_resume_dev_,
-                                      wait_kernel_lagging_wait_dev_, stream);
-  } else {
-    launch_cots_wait_done_kernel_production(
-        static_cast<uint32_t*>(s.dev_req_slot),
-        static_cast<uint32_t*>(s.dev_done_slot), stream);
-  }
-  // §1c.29 commit 1 review-fix-2: surface launch errors here, not
-  // at the next stream sync. cudaGetLastError catches sync errors
-  // (invalid kernel config, bad stream, etc.); async kernel-runtime
-  // errors will still surface at the next sync, but this gives a
-  // tight blame-line for any launch-config bug in commit 2.
-  cudaError_t le = cudaGetLastError();
-  TORCH_CHECK(le == cudaSuccess,
-              "wait_kernel_sync_on_stream: kernel launch failed: ",
-              cudaGetErrorString(le));
+  launch_wait_done_kernel(
+      static_cast<uint32_t*>(s.dev_req_slot),
+      static_cast<uint32_t*>(s.dev_done_slot),
+      cots_diag::wait_kernel_diag_enabled(), wait_kernel_spin_iters_dev_,
+      wait_kernel_immediate_resume_dev_, wait_kernel_lagging_wait_dev_, stream,
+      "wait_kernel_sync_on_stream");
 }
 
-uint32_t CotsCpuInfer::wait_kernel_get_req_slot(int64_t task_id) const {
+uint32_t CotsWeightTaskRunner::wait_kernel_get_req_slot(int64_t task_id) const {
   TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
               "wait_kernel_get_req_slot: task_id out of range");
   const TaskSlab& s = slabs_[task_id];
@@ -1234,7 +1153,8 @@ uint32_t CotsCpuInfer::wait_kernel_get_req_slot(int64_t task_id) const {
   return *static_cast<volatile uint32_t*>(s.host_req_slot);
 }
 
-uint32_t CotsCpuInfer::wait_kernel_get_done_slot(int64_t task_id) const {
+uint32_t CotsWeightTaskRunner::wait_kernel_get_done_slot(
+    int64_t task_id) const {
   TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
               "wait_kernel_get_done_slot: task_id out of range");
   const TaskSlab& s = slabs_[task_id];
@@ -1245,7 +1165,8 @@ uint32_t CotsCpuInfer::wait_kernel_get_done_slot(int64_t task_id) const {
   return *static_cast<volatile uint32_t*>(s.host_done_slot);
 }
 
-void CotsCpuInfer::wait_kernel_set_req_slot(int64_t task_id, uint32_t value) {
+void CotsWeightTaskRunner::wait_kernel_set_req_slot(int64_t task_id,
+                                                    uint32_t value) {
   TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
               "wait_kernel_set_req_slot: task_id out of range");
   TaskSlab& s = slabs_[task_id];
@@ -1258,7 +1179,8 @@ void CotsCpuInfer::wait_kernel_set_req_slot(int64_t task_id, uint32_t value) {
   std::atomic_thread_fence(std::memory_order_release);
 }
 
-void CotsCpuInfer::wait_kernel_set_done_slot(int64_t task_id, uint32_t value) {
+void CotsWeightTaskRunner::wait_kernel_set_done_slot(int64_t task_id,
+                                                     uint32_t value) {
   TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
               "wait_kernel_set_done_slot: task_id out of range");
   TaskSlab& s = slabs_[task_id];

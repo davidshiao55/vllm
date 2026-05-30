@@ -74,8 +74,8 @@ void TaskQueue::Worker() {
         // Task body is responsible for its own try/catch; if it throws,
         // we still need to decrement pending and notify cv_ so that
         // sync() doesn't deadlock. The slab dispatcher in
-        // cots_cpu_infer.cpp wraps every task in try/catch and stores
-        // the error into CotsCpuInfer state instead of letting it
+        // cots_weight_task_runner.cpp wraps every task in try/catch and stores
+        // the error into CotsWeightTaskRunner state instead of letting it
         // propagate here.
         next->task();
       }

@@ -8,8 +8,8 @@
 // attention work itself is launched through cudaLaunchHostFunc so a later graph
 // path can replay CPU suffix work instead of running it only at capture time.
 
-#ifndef VLLM_COTS_SUFFIX_ATTENTION_INFER_H_
-#define VLLM_COTS_SUFFIX_ATTENTION_INFER_H_
+#ifndef VLLM_COTS_SUFFIX_ATTENTION_TASK_RUNNER_H_
+#define VLLM_COTS_SUFFIX_ATTENTION_TASK_RUNNER_H_
 
 #include <ATen/ATen.h>
 #include <cuda_runtime_api.h>
@@ -76,13 +76,14 @@ struct alignas(64) SuffixAttentionTask {
   double scale = 0.0;
 };
 
-class CotsSuffixAttentionInfer {
+class CotsSuffixAttentionTaskRunner {
  public:
-  CotsSuffixAttentionInfer();
-  ~CotsSuffixAttentionInfer();
+  CotsSuffixAttentionTaskRunner();
+  ~CotsSuffixAttentionTaskRunner();
 
-  CotsSuffixAttentionInfer(const CotsSuffixAttentionInfer&) = delete;
-  CotsSuffixAttentionInfer& operator=(const CotsSuffixAttentionInfer&) = delete;
+  CotsSuffixAttentionTaskRunner(const CotsSuffixAttentionTaskRunner&) = delete;
+  CotsSuffixAttentionTaskRunner& operator=(
+      const CotsSuffixAttentionTaskRunner&) = delete;
 
   void install(int64_t n_tasks);
 
@@ -121,7 +122,7 @@ class CotsSuffixAttentionInfer {
 
  private:
   struct SyncArgs {
-    void* infer = nullptr;
+    void* runner = nullptr;
     size_t allow_n_pending = 0;
   };
 
@@ -159,8 +160,8 @@ class CotsSuffixAttentionInfer {
   std::atomic<int64_t> dispatch_cb_total_ns_{0};
   std::atomic<int64_t> dispatch_cb_snapshot_total_ns_{0};
   std::atomic<int64_t> dispatch_cb_enqueue_total_ns_{0};
-  std::atomic<int64_t> legacy_sync_cb_count_{0};
-  std::atomic<int64_t> legacy_sync_cb_wait_total_ns_{0};
+  std::atomic<int64_t> host_callback_sync_count_{0};
+  std::atomic<int64_t> host_callback_sync_wait_total_ns_{0};
   std::atomic<int64_t> wait_kernel_launch_count_{0};
   std::atomic<int64_t> worker_run_count_{0};
   std::atomic<int64_t> worker_requested_num_threads_{0};
@@ -196,4 +197,4 @@ class CotsSuffixAttentionInfer {
 }  // namespace cots
 }  // namespace vllm
 
-#endif  // VLLM_COTS_SUFFIX_ATTENTION_INFER_H_
+#endif  // VLLM_COTS_SUFFIX_ATTENTION_TASK_RUNNER_H_

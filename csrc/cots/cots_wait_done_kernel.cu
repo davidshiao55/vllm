@@ -3,7 +3,7 @@
 //
 // §1c.29 wait-kernel sync — captured wait kernel that replaces the
 // `cudaLaunchHostFunc(sync_cb)` node in the COTS captured graph
-// when `cots_capture_sync_mode="wait_kernel"`. Compiled as CUDA so nvcc
+// when `weight_capture_sync_mode="wait_kernel"`. Compiled as CUDA so nvcc
 // handles `__global__` and PTX inline asm; rest of `_cots_C`
 // stays as plain C++ host code under the same target language.
 //
@@ -75,7 +75,7 @@ __global__ void cots_wait_done_kernel_diag(volatile uint32_t* req_slot,
 
 }  // namespace
 
-// C-linkage launcher entry points — called from cots_cpu_infer.cpp
+// C-linkage launcher entry points — called from cots_weight_task_runner.cpp
 // (compiled as C++ host code under the same target). Hide the
 // `<<<>>>` syntax + kernel symbols behind plain functions so the
 // .cpp file doesn't need to be CUDA.

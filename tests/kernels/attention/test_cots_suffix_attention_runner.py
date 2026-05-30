@@ -7,9 +7,9 @@ import pytest
 import torch
 
 _cots_C = pytest.importorskip("vllm._cots_C")
-if not hasattr(_cots_C, "CotsSuffixAttentionInfer"):
+if not hasattr(_cots_C, "CotsSuffixAttentionTaskRunner"):
     pytest.skip(
-        "CotsSuffixAttentionInfer is not built; rebuild vLLM for this test",
+        "CotsSuffixAttentionTaskRunner is not built; rebuild vLLM for this test",
         allow_module_level=True,
     )
 
@@ -18,7 +18,7 @@ from vllm._custom_ops import (  # noqa: E402
     cots_gqa_bf16_suffix_attention,
 )
 from vllm.v1.attention.backends.cots_hybrid_attention import (  # noqa: E402
-    CotsPreparedNativeSuffixAttentionRunner,
+    NativeCotsSuffixAttentionRunner,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -61,7 +61,7 @@ def test_prepared_native_suffix_runner_matches_direct_kernel(
     direct_out = torch.empty_like(query)
     direct_lse = torch.empty_like(runner_lse)
 
-    runner = CotsPreparedNativeSuffixAttentionRunner(num_tasks=1)
+    runner = NativeCotsSuffixAttentionRunner(num_tasks=1)
     try:
         assert runner.wait_kernel_sync_installed(0)
         assert runner.wait_kernel_slots(0) == (0, 0)
@@ -131,7 +131,7 @@ def test_prepared_native_suffix_runner_scatters_qkv_before_attention(
     direct_out = torch.empty_like(query)
     direct_lse = torch.empty_like(runner_lse)
 
-    runner = CotsPreparedNativeSuffixAttentionRunner(num_tasks=1)
+    runner = NativeCotsSuffixAttentionRunner(num_tasks=1)
     try:
         runner.run_gqa_bf16_suffix_attention(
             query=query,
@@ -212,7 +212,7 @@ def test_prepared_native_suffix_runner_scatters_qkv_two_suffix_blocks(
     direct_out = torch.empty_like(query)
     direct_lse = torch.empty_like(runner_lse)
 
-    runner = CotsPreparedNativeSuffixAttentionRunner(num_tasks=1)
+    runner = NativeCotsSuffixAttentionRunner(num_tasks=1)
     try:
         runner.run_gqa_bf16_suffix_attention(
             query=query,
@@ -282,7 +282,7 @@ def test_prepared_native_suffix_runner_cudagraph_replay_uses_updated_qkv() -> No
     direct_lse = torch.empty_like(runner_lse)
     anchor = torch.empty(1, device="cuda")
 
-    runner = CotsPreparedNativeSuffixAttentionRunner(num_tasks=1)
+    runner = NativeCotsSuffixAttentionRunner(num_tasks=1)
     try:
         runner.run_gqa_bf16_suffix_attention(
             query=query,
@@ -380,7 +380,7 @@ def test_prepared_native_suffix_runner_cudagraph_replay_uses_updated_separate_kv
     direct_lse = torch.empty_like(runner_lse)
     anchor = torch.empty(1, device="cuda")
 
-    runner = CotsPreparedNativeSuffixAttentionRunner(num_tasks=1)
+    runner = NativeCotsSuffixAttentionRunner(num_tasks=1)
     try:
         runner.run_gqa_bf16_suffix_attention(
             query=query,
@@ -526,7 +526,7 @@ def test_prepared_native_suffix_runner_cudagraph_replay_uses_live_counts() -> No
     direct_lse = torch.empty(28, live, dtype=torch.float32)
     anchor = torch.empty(1, device="cuda")
 
-    runner = CotsPreparedNativeSuffixAttentionRunner(num_tasks=1)
+    runner = NativeCotsSuffixAttentionRunner(num_tasks=1)
     try:
         runner.run_gqa_bf16_suffix_attention(
             query=query,

@@ -507,7 +507,7 @@ void bf16_gemm_transposed(const uint16_t* x, const uint16_t* w, uint16_t* y,
 
 // at::Tensor entry. Validates dtype + contiguity then dispatches
 // to the raw-pointer kernel. Designed to be called from
-// CotsCpuInfer's MLP-block worker for the transposed-storage path
+// CotsWeightTaskRunner's MLP-block worker for the transposed-storage path
 // (Stage 7-C). Caller passes:
 //   * x: (M, K) BF16, row-major contiguous.
 //   * w: (K, N) BF16, row-major contiguous (this is the

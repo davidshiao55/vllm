@@ -7,9 +7,9 @@ import pytest
 import torch
 
 _cots_C = pytest.importorskip("vllm._cots_C")
-if not hasattr(_cots_C, "CotsSuffixAttentionInfer"):
+if not hasattr(_cots_C, "CotsSuffixAttentionTaskRunner"):
     pytest.skip(
-        "CotsSuffixAttentionInfer is not built; rebuild vLLM",
+        "CotsSuffixAttentionTaskRunner is not built; rebuild vLLM",
         allow_module_level=True,
     )
 

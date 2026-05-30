@@ -210,23 +210,24 @@ class CotsOffloadConfig:
     diagnostic for measuring the COTS control-plane floor."""
 
     auto_graph_split: bool = Field(default=True)
-    """When COTS runs with CUDA graphs (`enforce_eager=False`) on the native
-    runner, default to the measured fast graph policy: piecewise CUDA graphs,
-    COTS submit/sync split points, and `wait_kernel` sync. Disable this with
-    `--no-cots-auto-graph-split` to reproduce legacy full-capture or
-    host-callback capture experiments explicitly."""
+    """When COTS runs with CUDA graphs (`enforce_eager=False`), default to
+    the measured fast graph policy.
 
-    cots_capture_sync_mode: Literal["host_callback", "wait_kernel"] = "host_callback"
-    """Sync-side mechanism for the captured-replay path
-    (formerly "M3" — pre-§1c.34 boolean
-    `cots_m3_wait_kernel=True` was removed in favor of this
-    enum; no backward-compat alias).
+    Phase 1 weight offload uses piecewise CUDA graphs, COTS weight
+    submit/sync split points, and `wait_kernel` weight sync. Phase 2 hybrid KV
+    uses piecewise CUDA graphs through the normal attention split points and
+    does not add Phase 1 weight split points unless weight offload is also
+    active. Disable this with `--no-cots-auto-graph-split` to reproduce
+    full-capture or host-callback weight-capture experiments explicitly."""
+
+    weight_capture_sync_mode: Literal["host_callback", "wait_kernel"] = "host_callback"
+    """Phase 1 weight-offload sync mechanism for the captured-replay path.
 
     * `"host_callback"` (field default / eager fallback): the
       captured graph node is `cudaLaunchHostFunc(SyncCallback)`
       which blocks the CUDA driver thread on
-      `TaskQueue::sync(0)`. This is the legacy / measured-baseline
-      mechanism. With `auto_graph_split=True`, native COTS graph
+      `TaskQueue::sync(0)`. This is the host-callback measured-baseline
+      mechanism. With `auto_graph_split=True`, native COTS weight graph
       mode upgrades this to `"wait_kernel"` unless explicitly
       opting out of the auto graph policy.
     * `"wait_kernel"`: the captured node
@@ -246,10 +247,10 @@ class CotsOffloadConfig:
       as a captured node.
     * Requires CUDA + `_cots_C` extension built.
 
-    Phase 2 production guidance after the capture-gap grid: native
-    COTS graph mode defaults to the split-graph + wait-kernel path
-    because it beat native eager and legacy full capture on the
-    focused Qwen2.5-7B workload grid. The legacy full-capture modes
+    This knob controls only the Phase 1 weight runner. Phase 2 hybrid KV
+    suffix attention has its own prepared suffix runner and wait-kernel sync
+    path; graph mode for hybrid KV uses piecewise attention boundaries, not
+    the Phase 1 weight custom-op split points. Full-capture weight modes
     remain available by disabling `auto_graph_split`.
     """
 

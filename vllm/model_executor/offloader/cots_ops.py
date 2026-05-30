@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Custom ops for the COTS native CPU runner — Phase 1c.
+"""Custom ops for the COTS native weight task runner.
 
 Mirrors `prefetch_ops.py`'s pattern: registers two ops via
 `direct_register_custom_op` (which lands them under `torch.ops.vllm.*`),
@@ -28,7 +28,7 @@ fix (see `phase1c_findings.md §1c.20` / §1c.35):
       `gpu_anchor_a/_b` pin sync AFTER each independent GPU GEMM.
       `submit_anchor` (read-only, == x_gpu) pins sync AFTER submit.
       The impl reaches the slab's pinned output via
-      `CotsCpuInfer.y_pinned_view(task_id, bucket)`.
+      `CotsWeightTaskRunner.y_pinned_view(task_id, bucket)`.
 
 Both ops accept ONLY CUDA tensors and scalar ids — no CPU tensor
 arguments. Inductor's functionalization on captured graphs
@@ -38,8 +38,8 @@ rejects with cudaErrorStreamCaptureUnsupported), so the design
 keeps pinned-buffer addresses entirely on the C++ side.
 
 §1c.19 split (see `phase1c_findings.md §1c.19`): the registry stores
-the `CotsCpuInfer` pybind handle DIRECTLY by runner_id, NOT a
-`NativeCotsRunner` instance. The compile-visible runner is a thin
+the `CotsWeightTaskRunner` pybind handle DIRECTLY by runner_id, NOT a
+`NativeCotsWeightRunner` instance. The compile-visible runner is a thin
 facade with only pickleable state (runner_id, task_id map, flags);
 the unpicklable C++ handle lives here. Custom op impls and the
 offloader's install/teardown helpers all dereference the registry.
@@ -60,14 +60,14 @@ if TYPE_CHECKING:
     # non-CUDA builds.
     from vllm import _cots_C  # noqa: F401
 
-# Module-private infer registry. Strong refs (NOT weak) — the registry
-# IS the storage for the `CotsCpuInfer` instance. NativeCotsRunner's
+# Module-private runner registry. Strong refs (NOT weak) — the registry
+# IS the storage for the `CotsWeightTaskRunner` instance. NativeCotsWeightRunner's
 # `__del__` / `close()` is the only thing that removes entries; if a
 # runner is GC'd without close() the __del__ unregisters there.
-_COTS_INFER: dict[int, Any] = {}
-_COTS_ACTIVE_DISPATCH: dict[int, tuple[int, int]] = {}
-_COTS_TASK_ID_FOR: dict[int, dict[tuple[int, int, str], int]] = {}
-_NEXT_RUNNER_ID = itertools.count(1)
+_COTS_WEIGHT_RUNNERS: dict[int, Any] = {}
+_COTS_WEIGHT_ACTIVE_DISPATCH: dict[int, tuple[int, int]] = {}
+_COTS_WEIGHT_TASK_ID_FOR: dict[int, dict[tuple[int, int, str], int]] = {}
+_NEXT_WEIGHT_RUNNER_ID = itertools.count(1)
 
 _OP_KIND_TO_CODE: dict[str, int] = {
     "qkv": 1,
@@ -84,31 +84,31 @@ def op_kind_code(op_kind: str) -> int:
         raise ValueError(f"unknown COTS op_kind {op_kind!r}") from e
 
 
-def _register_infer(infer: Any) -> int:
-    """Register a `CotsCpuInfer` instance and return a fresh runner_id.
+def register_weight_runner(runner: Any) -> int:
+    """Register a `CotsWeightTaskRunner` instance and return a fresh runner_id.
     The registry takes ownership of the strong reference; the caller
     should retain only the runner_id. See §1c.19 for the rationale."""
-    rid = next(_NEXT_RUNNER_ID)
-    _COTS_INFER[rid] = infer
+    rid = next(_NEXT_WEIGHT_RUNNER_ID)
+    _COTS_WEIGHT_RUNNERS[rid] = runner
     return rid
 
 
-def _unregister_infer(runner_id: int) -> None:
+def unregister_weight_runner(runner_id: int) -> None:
     """Drop the registry entry for a runner. Idempotent."""
-    _COTS_INFER.pop(runner_id, None)
-    _COTS_ACTIVE_DISPATCH.pop(runner_id, None)
-    _COTS_TASK_ID_FOR.pop(runner_id, None)
+    _COTS_WEIGHT_RUNNERS.pop(runner_id, None)
+    _COTS_WEIGHT_ACTIVE_DISPATCH.pop(runner_id, None)
+    _COTS_WEIGHT_TASK_ID_FOR.pop(runner_id, None)
 
 
-def register_task_id_map(
+def register_weight_task_id_map(
     runner_id: int,
     task_id_for: dict[tuple[int, int, str], int],
 ) -> None:
     """Publish the install-time slab map used by custom op dispatch."""
-    _COTS_TASK_ID_FOR[int(runner_id)] = dict(task_id_for)
+    _COTS_WEIGHT_TASK_ID_FOR[int(runner_id)] = dict(task_id_for)
 
 
-def set_active_dispatch_state(
+def set_active_weight_dispatch_state(
     runner_id: int,
     *,
     bucket: int,
@@ -129,7 +129,7 @@ def set_active_dispatch_state(
         raise ValueError(
             f"active COTS dispatch live_num_tokens must be >= 0, got {live_num_tokens}"
         )
-    _COTS_ACTIVE_DISPATCH[int(runner_id)] = (bucket, live_num_tokens)
+    _COTS_WEIGHT_ACTIVE_DISPATCH[int(runner_id)] = (bucket, live_num_tokens)
 
 
 def _resolve_task_for_dispatch(
@@ -140,7 +140,7 @@ def _resolve_task_for_dispatch(
 ) -> tuple[int, int, int]:
     """Resolve active dispatch state to a concrete C++ slab task."""
     runner_id = int(runner_id)
-    state = _COTS_ACTIVE_DISPATCH.get(runner_id)
+    state = _COTS_WEIGHT_ACTIVE_DISPATCH.get(runner_id)
     if state is None:
         raise RuntimeError(
             f"{op_name}: no active COTS dispatch state for runner_id={runner_id}. "
@@ -154,11 +154,11 @@ def _resolve_task_for_dispatch(
         raise RuntimeError(
             f"{op_name}: unknown op_kind_code={op_kind_code} for runner_id={runner_id}"
         ) from e
-    task_id_for = _COTS_TASK_ID_FOR.get(runner_id)
+    task_id_for = _COTS_WEIGHT_TASK_ID_FOR.get(runner_id)
     if task_id_for is None:
         raise RuntimeError(
             f"{op_name}: runner_id={runner_id} has no task_id map; "
-            "NativeCotsRunner.install() must complete before dispatch."
+            "NativeCotsWeightRunner.install() must complete before dispatch."
         )
     key = (int(layer_idx), int(bucket), op_kind)
     task_id = task_id_for.get(key)
@@ -194,18 +194,18 @@ def _bounded_transfer_rows(bucket: int, tensor_rows: int, op_name: str) -> int:
     return rows
 
 
-def _lookup_infer(runner_id: int, op_name: str) -> Any:
-    """Resolve runner_id → `CotsCpuInfer` instance. Raises a clear
+def lookup_weight_runner(runner_id: int, op_name: str) -> Any:
+    """Resolve runner_id → `CotsWeightTaskRunner` instance. Raises a clear
     error if the runner was already torn down."""
-    infer = _COTS_INFER.get(runner_id)
-    if infer is None:
+    runner = _COTS_WEIGHT_RUNNERS.get(runner_id)
+    if runner is None:
         raise RuntimeError(
             f"{op_name}: runner_id={runner_id} not in registry "
-            f"(known ids: {list(_COTS_INFER.keys())}). The owning "
-            f"NativeCotsRunner was likely torn down before its "
+            f"(known ids: {list(_COTS_WEIGHT_RUNNERS.keys())}). The owning "
+            f"NativeCotsWeightRunner was likely torn down before its "
             f"in-flight ops drained."
         )
-    return infer
+    return runner
 
 
 # Offloader-side install/teardown helpers. These all run OUTSIDE the
@@ -214,14 +214,14 @@ def _lookup_infer(runner_id: int, op_name: str) -> Any:
 # the handle on its `__dict__`.
 
 
-def install_infer(
+def install_weight_runner(
     runner_id: int,
     n_slabs: int,
     max_num_tokens: int,
 ) -> None:
     """Allocate the C++ slab pool. Called once at offloader post_init."""
-    infer = _lookup_infer(runner_id, "install_infer")
-    infer.install(
+    runner = lookup_weight_runner(runner_id, "install_weight_runner")
+    runner.install(
         n_slabs=int(n_slabs),
         max_num_tokens=int(max_num_tokens),
     )
@@ -234,11 +234,11 @@ def populate_slab_via_spec(
     *,
     dry_run: bool,
 ) -> None:
-    """Populate slot `task_id` via the spec's `populate(infer, ...)`
+    """Populate slot `task_id` via the spec's `populate(runner, ...)`
     method. The spec carries the per-op pointer + stride layout (QKV
-    vs MLP vs dryrun); the helper just hands it the resolved infer."""
-    infer = _lookup_infer(runner_id, "populate_slab_via_spec")
-    spec.populate(infer, task_id, dry_run=dry_run)
+    vs MLP vs dryrun); the helper just hands it the resolved runner handle."""
+    runner = lookup_weight_runner(runner_id, "populate_slab_via_spec")
+    spec.populate(runner, task_id, dry_run=dry_run)
 
 
 def install_wait_kernel_sync_for_all_tasks(
@@ -248,7 +248,7 @@ def install_wait_kernel_sync_for_all_tasks(
     """§1c.29 commit 2: install wait-kernel sync (host-mapped pinned req/done
     slots, lazy diag-counter alloc when VLLM_COTS_DIAG=1) for
     every slab in the pool. Called from `CotsOffloader.post_init`
-    only when `cots_capture_sync_mode="wait_kernel"`.
+    only when `weight_capture_sync_mode="wait_kernel"`.
 
     Idempotent only at the offloader level — calling
     `install_wait_kernel_sync_for_task` twice for the same task_id raises
@@ -256,31 +256,31 @@ def install_wait_kernel_sync_for_all_tasks(
     holds a single `_wait_kernel_sync_installed` flag to make sure this helper
     runs once per offloader.
     """
-    infer = _lookup_infer(runner_id, "install_wait_kernel_sync_for_all_tasks")
+    runner = lookup_weight_runner(runner_id, "install_wait_kernel_sync_for_all_tasks")
     for tid in range(int(n_slabs)):
-        infer.install_wait_kernel_sync_for_task(int(tid))
+        runner.install_wait_kernel_sync_for_task(int(tid))
 
 
 def set_worker_affinity(runner_id: int, mask: int) -> None:
     """Pin the worker thread to a CPU set (uint64 bitmask). One-shot
     call from `CotsOffloader.post_init` after install."""
-    infer = _lookup_infer(runner_id, "set_worker_affinity")
-    infer.set_worker_affinity(int(mask))
+    runner = lookup_weight_runner(runner_id, "set_worker_affinity")
+    runner.set_worker_affinity(int(mask))
 
 
 def reset_all_counters() -> None:
-    """§1c.22: zero every CotsCpuInfer counter currently in the
+    """§1c.22: zero every CotsWeightTaskRunner counter currently in the
     registry. Used as the env-gated post-cudagraph-capture hook
     (`VLLM_COTS_RESET_COUNTERS_AFTER_CUDAGRAPH_CAPTURE=1`) so the
     byte-accounting bench artifact reflects ONLY the measured
     replay, not capture-time activity."""
     import contextlib
 
-    for infer in _COTS_INFER.values():
-        # Best-effort — a stale infer shouldn't break the reset
+    for runner in _COTS_WEIGHT_RUNNERS.values():
+        # Best-effort — a stale runner shouldn't break the reset
         # for the rest.
         with contextlib.suppress(Exception):
-            infer.reset_counters()
+            runner.reset_counters()
 
 
 def set_live_num_tokens(runner_id: int, n: int) -> None:
@@ -291,28 +291,23 @@ def set_live_num_tokens(runner_id: int, n: int) -> None:
     the worker reads this value on the next host-callback fire and
     avoids CPU GEMM work for padded rows.
     """
-    infer = _COTS_INFER.get(runner_id)
-    if infer is None:
+    runner = _COTS_WEIGHT_RUNNERS.get(runner_id)
+    if runner is None:
         # Best-effort: a stale runner_id call here shouldn't crash —
         # just skip. The next custom-op call will surface the missing
         # registry entry with a clearer error.
         return
-    infer.set_runtime_num_tokens(int(n))
-
-
-def set_runtime_num_tokens(runner_id: int, n: int) -> None:
-    """Legacy alias for `set_live_num_tokens`."""
-    set_live_num_tokens(runner_id, n)
+    runner.set_live_num_tokens(int(n))
 
 
 def sync_blocking(runner_id: int) -> None:
     """Drain any in-flight worker task synchronously. Called from
-    `NativeCotsRunner.close()`."""
-    infer = _COTS_INFER.get(runner_id)
-    if infer is None:
+    `NativeCotsWeightRunner.close()`."""
+    runner = _COTS_WEIGHT_RUNNERS.get(runner_id)
+    if runner is None:
         # Already torn down — nothing to drain.
         return
-    infer.sync_blocking()
+    runner.sync_blocking()
 
 
 # --- vllm.cots_submit_gemm -------------------------------------------------
@@ -393,7 +388,7 @@ def _cots_submit_gemm_impl(
             f"row-strided inputs (stride(0) > shape[1]) the C++ D2H uses "
             f"cudaMemcpy2DAsync."
         )
-    infer = _lookup_infer(runner_id, "cots_submit_gemm")
+    runner = lookup_weight_runner(runner_id, "cots_submit_gemm")
     stream = torch.cuda.current_stream().cuda_stream
     # §1c.24: NVTX scope so the nsys timeline can attribute the
     # Python-side dispatch boundary separately from the C++ submit
@@ -403,9 +398,9 @@ def _cots_submit_gemm_impl(
         torch.cuda.nvtx.range_push("cots:py_submit_gemm")
     try:
         # Pass shape/stride so the C++ D2H can dispatch the right
-        # cudaMemcpy* variant — see CotsCpuInfer::submit_on_stream for
+        # cudaMemcpy* variant — see CotsWeightTaskRunner::submit_on_stream for
         # the 1D-vs-2D branch.
-        infer.submit_on_stream(
+        runner.submit_on_stream(
             task_id,
             num_transfer_rows,
             x_gpu.data_ptr(),
@@ -467,21 +462,21 @@ def _cots_sync_then_uva_impl(
     num_transfer_rows = _bounded_transfer_rows(
         bucket, int(y_gpu.shape[0]), "cots_sync_then_uva"
     )
-    infer = _lookup_infer(runner_id, "cots_sync_then_uva")
+    runner = lookup_weight_runner(runner_id, "cots_sync_then_uva")
     stream = torch.cuda.current_stream().cuda_stream
     if _COTS_NVTX_ENABLED:
         torch.cuda.nvtx.range_push("cots:py_sync_then_uva")
     try:
         # C++ side branches per-slab on `wait_kernel_sync_installed`.
-        # With `cots_capture_sync_mode="wait_kernel"`, the captured
+        # With `weight_capture_sync_mode="wait_kernel"`, the captured
         # node is the wait kernel reading the worker-published
-        # `done_slot=seq`. Otherwise it is the legacy SyncCallback
-        # host_fn that blocks the driver thread on TaskQueue::sync(0).
-        infer.sync_or_wait_on_stream(task_id, stream)
+        # `done_slot=seq`. Otherwise it is the host-callback SyncCallback
+        # node that blocks the driver thread on TaskQueue::sync(0).
+        runner.sync_or_wait_on_stream(task_id, stream)
         # Build the CPU view over the slab pointer locally — never escapes
         # back to Python in a way Inductor would see.
-        y_pinned = infer.y_pinned_view(task_id, num_transfer_rows)
-        infer.note_uva_request(num_transfer_rows, y_pinned.shape[1])
+        y_pinned = runner.y_pinned_view(task_id, num_transfer_rows)
+        runner.note_uva_request(num_transfer_rows, y_pinned.shape[1])
         # Lazy import to avoid a top-level circular import (cots.py imports
         # this module via cots_ops and we'd loop on `from .cots import ...`).
         from vllm.model_executor.offloader.cots import (

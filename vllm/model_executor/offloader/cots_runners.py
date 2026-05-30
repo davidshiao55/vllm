@@ -21,10 +21,10 @@ if TYPE_CHECKING:
     from vllm.config import CotsOffloadConfig
 
 
-class NativeSlabSpec:
+class NativeWeightSlabSpec:
     """Builder record for one C++ TaskSlab. The offloader builds a list
     of these at `post_init` (one per (layer_idx, bucket, op_kind) with
-    n_cpu_compute > 0); `NativeCotsRunner.install` walks the list and
+    n_cpu_compute > 0); `NativeCotsWeightRunner.install` walks the list and
     calls the right `populate_slab_*` per record.
 
     All weight pointers passed to populate_slab_* must be POST-narrow
@@ -36,7 +36,7 @@ class NativeSlabSpec:
     `dry_run=True` overrides the op_kind to dryrun_noop on every slab so
     the host-callback round-trip is exercised end-to-end without real
     CPU GEMM (used by the Stage 2 substrate gate, mirrors
-    PythonCotsRunner's dry_run path).
+    PythonCotsWeightRunner's dry_run path).
     """
 
     op_descriptor: tuple[int, int, str]
@@ -46,7 +46,7 @@ class NativeSlabSpec:
 
     def populate(
         self,
-        infer: object,
+        runner_handle: object,
         task_id: int,
         *,
         dry_run: bool,
@@ -54,7 +54,7 @@ class NativeSlabSpec:
         raise NotImplementedError
 
 
-class _NativeSlabSpecQkv(NativeSlabSpec):
+class _NativeWeightSlabSpecQkv(NativeWeightSlabSpec):
     def __init__(
         self,
         op_descriptor: tuple[int, int, str],
@@ -76,7 +76,7 @@ class _NativeSlabSpecQkv(NativeSlabSpec):
         self.w_cpu_ptr = w_cpu_ptr
         self.w_cpu_rows = w_cpu_rows
 
-    def populate(self, infer: object, task_id: int, *, dry_run: bool) -> None:
+    def populate(self, runner_handle: object, task_id: int, *, dry_run: bool) -> None:
         # §1c.22 review-fix: bucket_capacity_tokens is the descriptor
         # bucket (op_descriptor[1]). Stable for the slab's lifetime;
         # what replay-time byte counters use to attribute bucket-sized
@@ -89,7 +89,7 @@ class _NativeSlabSpecQkv(NativeSlabSpec):
             # (for y_pinned_view in sync) so both captured-graph
             # paths resolve at task_id even though the worker skips
             # the GEMM.
-            infer.populate_slab_dryrun(  # type: ignore[attr-defined]
+            runner_handle.populate_slab_dryrun(  # type: ignore[attr-defined]
                 task_id=task_id,
                 bucket_capacity_tokens=bucket_capacity_tokens,
                 x_pinned_ptr=self.x_pinned_ptr,
@@ -98,7 +98,7 @@ class _NativeSlabSpecQkv(NativeSlabSpec):
                 cpu_out_dim=self.cpu_out_dim,
             )
             return
-        infer.populate_slab_qkv(  # type: ignore[attr-defined]
+        runner_handle.populate_slab_qkv(  # type: ignore[attr-defined]
             task_id=task_id,
             n_threads=self.n_threads,
             bucket_capacity_tokens=bucket_capacity_tokens,
@@ -111,7 +111,7 @@ class _NativeSlabSpecQkv(NativeSlabSpec):
         )
 
 
-class _NativeSlabSpecMlp(NativeSlabSpec):
+class _NativeWeightSlabSpecMlp(NativeWeightSlabSpec):
     def __init__(
         self,
         op_descriptor: tuple[int, int, str],
@@ -143,8 +143,8 @@ class _NativeSlabSpecMlp(NativeSlabSpec):
         self.w_down_rows = w_down_rows
         self.w_down_cols = w_down_cols
 
-    def populate(self, infer: object, task_id: int, *, dry_run: bool) -> None:
-        # §1c.22 review-fix: see _NativeSlabSpecQkv.populate.
+    def populate(self, runner_handle: object, task_id: int, *, dry_run: bool) -> None:
+        # §1c.22 review-fix: see _NativeWeightSlabSpecQkv.populate.
         bucket_capacity_tokens = int(self.op_descriptor[1])
         if dry_run:
             # §1c.20: dryrun must pass x_pinned_ptr + in_dim (for the
@@ -152,7 +152,7 @@ class _NativeSlabSpecMlp(NativeSlabSpec):
             # (for y_pinned_view in sync) so both captured-graph
             # paths resolve at task_id even though the worker skips
             # the GEMM.
-            infer.populate_slab_dryrun(  # type: ignore[attr-defined]
+            runner_handle.populate_slab_dryrun(  # type: ignore[attr-defined]
                 task_id=task_id,
                 bucket_capacity_tokens=bucket_capacity_tokens,
                 x_pinned_ptr=self.x_pinned_ptr,
@@ -161,7 +161,7 @@ class _NativeSlabSpecMlp(NativeSlabSpec):
                 cpu_out_dim=self.cpu_out_dim,
             )
             return
-        infer.populate_slab_mlp(  # type: ignore[attr-defined]
+        runner_handle.populate_slab_mlp(  # type: ignore[attr-defined]
             task_id=task_id,
             n_threads=self.n_threads,
             bucket_capacity_tokens=bucket_capacity_tokens,
@@ -179,13 +179,13 @@ class _NativeSlabSpecMlp(NativeSlabSpec):
         )
 
 
-PyCotsCallback = Callable[[torch.cuda.Event, torch.Tensor, torch.Tensor], None]
+PyCotsWeightCallback = Callable[[torch.cuda.Event, torch.Tensor, torch.Tensor], None]
 
 
-class PythonCotsRunner:
+class PythonCotsWeightRunner:
     """Phase 1a/1b-shaped CPU task runner — the kill-switch path under
     `CotsOffloadConfig.cpu_runner = "python"`. Same execution semantics
-    as the original `CpuTaskRunner` (single-worker `ThreadPoolExecutor`
+    as the original Python prototype (single-worker `ThreadPoolExecutor`
     + `future.result()`), but the operator-facing API is now the Phase
     1c uniform facade so operators can use `submit_with_d2h(x, x_pinned,
     y_pinned, op_descriptor)` without branching on runner type.
@@ -205,18 +205,18 @@ class PythonCotsRunner:
         self._future: Future | None = None
         # §1c.20 facade: y_pinned is stashed at submit time so
         # wait_and_uva doesn't need to take it as a parameter.
-        # NativeCotsRunner reaches y_pinned via the slab pointer; for
+        # NativeCotsWeightRunner reaches y_pinned via the slab pointer; for
         # facade symmetry the eager Python runner uses this stashed
         # reference, so no Python-side caller has to pass y_pinned
         # through to wait_and_uva.
         self._pending_y_pinned: torch.Tensor | None = None
         self._dry_run = dry_run
-        self._callbacks: dict[tuple[int, int, str], PyCotsCallback] = {}
+        self._callbacks: dict[tuple[int, int, str], PyCotsWeightCallback] = {}
         self._installed = False
 
     def install(
         self,
-        callbacks: dict[tuple[int, int, str], PyCotsCallback],
+        callbacks: dict[tuple[int, int, str], PyCotsWeightCallback],
     ) -> None:
         """Register the per-(layer, bucket, op_kind) work closures.
 
@@ -230,12 +230,12 @@ class PythonCotsRunner:
         §1c.19: this method intentionally does NOT take a
         `bucket_for_fallback` callable. Operators are required to
         resolve `op_descriptor[1]` to a non-None int before calling
-        `submit_with_d2h` (matches the NativeCotsRunner contract so
+        `submit_with_d2h` (matches the NativeCotsWeightRunner contract so
         operators don't branch on runner type).
         """
         if self._installed:
             raise RuntimeError(
-                "PythonCotsRunner.install() called twice on the same instance"
+                "PythonCotsWeightRunner.install() called twice on the same instance"
             )
         self._callbacks = dict(callbacks)
         self._installed = True
@@ -255,7 +255,7 @@ class PythonCotsRunner:
         under `cpu_runner='python'`); Inductor isn't involved, so the
         facade keeps `x_pinned` / `y_pinned` as Python parameters
         without any of the captured-graph materialization concerns
-        that drove NativeCotsRunner to the slab-pointer-first design.
+        that drove NativeCotsWeightRunner to the slab-pointer-first design.
 
         §1c.19: `op_descriptor[1]` MUST be a resolved int. Operators
         run `offloader._bucket_for(num_tokens)` themselves before
@@ -264,18 +264,18 @@ class PythonCotsRunner:
         """
         layer_idx, bucket, op_kind = op_descriptor
         assert isinstance(bucket, int), (
-            "PythonCotsRunner.submit_with_d2h: op_descriptor[1] must be "
+            "PythonCotsWeightRunner.submit_with_d2h: op_descriptor[1] must be "
             "a resolved int bucket. See phase1c_findings.md §1c.19."
         )
         x_pinned.copy_(x_gpu, non_blocking=True)
         event = torch.cuda.Event()
         event.record()
         if self._dry_run:
-            cb: PyCotsCallback = _cpu_dryrun_noop
+            cb: PyCotsWeightCallback = _cpu_dryrun_noop
         else:
             cb = self._callbacks[(layer_idx, bucket, op_kind)]
         # §1c.20: stash y_pinned so wait_and_uva doesn't need it as a
-        # parameter (matches the NativeCotsRunner facade where
+        # parameter (matches the NativeCotsWeightRunner facade where
         # y_pinned isn't part of the wait_and_uva signature).
         self._pending_y_pinned = y_pinned
         self._future = _get_executor().submit(cb, event, x_pinned, y_pinned)
@@ -291,10 +291,10 @@ class PythonCotsRunner:
         """Drain the worker and copy the pinned result into the GPU
         buffer via the SM-issued UVA kernel. `gpu_anchor_a` /
         `gpu_anchor_b` / `submit_anchor` / `op_descriptor` are accepted
-        for API symmetry with NativeCotsRunner
+        for API symmetry with NativeCotsWeightRunner
         — they're the barrier-installing anchors that pin the
         `cots_sync_then_uva` custom op AFTER each independent GPU GEMM
-        under graph capture. Under PythonCotsRunner we're eager-only
+        under graph capture. Under PythonCotsWeightRunner we're eager-only
         (no graph capture), so the anchors are unused; but accepting
         them lets operators call both runners with one signature.
         """
@@ -319,12 +319,8 @@ class PythonCotsRunner:
             self._future = None
 
 
-# Backwards-compat alias for any external code that imported the old name.
-CpuTaskRunner = PythonCotsRunner
-
-
-class NativeCotsRunner:
-    """Phase 1c production runner. Wraps the C++ `CotsCpuInfer` via the
+class NativeCotsWeightRunner:
+    """Phase 1c production runner. Wraps the C++ `CotsWeightTaskRunner` via the
     `vllm._cots_C` extension; dispatches CPU work through
     `cudaLaunchHostFunc` so the forward pass is graph-capturable.
 
@@ -338,8 +334,8 @@ class NativeCotsRunner:
     on `x_gpu` and `gpu_anchor_a/_b`.
 
     Multi-engine safety: each instance allocates a `runner_id` and
-    the underlying `CotsCpuInfer` pybind handle is owned by the
-    `cots_ops._COTS_INFER` strong-ref registry (§1c.19 split — was a
+    the underlying `CotsWeightTaskRunner` pybind handle is owned by the
+    `cots_ops._COTS_WEIGHT_RUNNERS` strong-ref registry (§1c.19 split — was a
     `_COTS_RUNNERS` weak map prior). The runner facade itself only
     holds the integer id + picklable state, so PyTorch's AOT compile
     guard cache can serialize it. Two offloaders (FastTTS gen + ver)
@@ -377,12 +373,12 @@ class NativeCotsRunner:
         # to the pybind handle is on the cots_ops registry, NOT on this
         # runner's `__dict__` (§1c.19): if the handle were stored on
         # `self`, Dynamo's guard serialization would walk it and try to
-        # pickle a `CotsCpuInfer`, which is unpicklable.
+        # pickle a `CotsWeightTaskRunner`, which is unpicklable.
         try:
             from vllm import _cots_C
         except ImportError as e:
             raise RuntimeError(
-                "NativeCotsRunner requires the `vllm._cots_C` extension, "
+                "NativeCotsWeightRunner requires the `vllm._cots_C` extension, "
                 "which builds only on CUDA targets. Either select "
                 "`cpu_runner='python'` or rebuild vLLM with CUDA support."
             ) from e
@@ -392,26 +388,28 @@ class NativeCotsRunner:
         # registry's strong reference is now the SOLE owner. The local
         # variable goes out of scope at the end of __init__, so nothing
         # in `self.__dict__` references it.
-        self._runner_id: int = cots_ops._register_infer(_cots_C.CotsCpuInfer())
+        self._runner_id: int = cots_ops.register_weight_runner(
+            _cots_C.CotsWeightTaskRunner()
+        )
         self._dry_run: bool = bool(dry_run)
         # Stage 3 will populate this from CotsOffloader._build_slab_table.
         # Format: {(layer_idx, bucket, op_kind): task_id}.
         self._task_id_for: dict[tuple[int, int, str], int] = {}
         self._installed: bool = False
-        # §1c.19 ownership flag. Multiple `NativeCotsRunner` instances
+        # §1c.19 ownership flag. Multiple `NativeCotsWeightRunner` instances
         # can share the same `_runner_id` after a pickle round-trip
         # (PyTorch's AOT guard cache pickles + unpickles the runner as
         # part of guard serialization). Only the ORIGINAL constructor
         # owns the registry entry — the unpickled copy is non-owning.
         # `close()` and `__del__` no-op for non-owners so GC of a
-        # guard-cache copy can't unregister the live runner's infer.
+        # guard-cache copy can't unregister the live runner handle.
         # See `__getstate__` / `__setstate__` below for the pickle
         # path that flips this to False.
-        self._owns_infer_registry_entry: bool = True
+        self._owns_runner_registry_entry: bool = True
 
     def install(
         self,
-        slab_specs: list[NativeSlabSpec],
+        slab_specs: list[NativeWeightSlabSpec],
         max_num_tokens: int,
     ) -> None:
         """Allocate the C++ slab pool, populate slabs, and build the
@@ -419,12 +417,12 @@ class NativeCotsRunner:
         `post_init` after the dispatch table + handle weight views are
         known.
 
-        `slab_specs` is a list (ordering = task_id) of NativeSlabSpec
+        `slab_specs` is a list (ordering = task_id) of NativeWeightSlabSpec
         records — one per (layer_idx, bucket, op_kind) where there is
         actual CPU work (n_cpu_compute > 0). Under `dry_run=True` the
         offloader passes specs with op_kind='dryrun_noop' so the
         runtime path exercises the full host-callback round-trip but
-        skips real GEMM (mirrors Phase 1a/1b's PythonCotsRunner dry_run
+        skips real GEMM (mirrors Phase 1a/1b's PythonCotsWeightRunner dry_run
         diagnostic, see phase1a_findings.md §1.14).
 
         §1c.35: native operators do not pass descriptor buckets at
@@ -436,10 +434,10 @@ class NativeCotsRunner:
 
         if self._installed:
             raise RuntimeError(
-                "NativeCotsRunner.install() called twice on the same instance"
+                "NativeCotsWeightRunner.install() called twice on the same instance"
             )
         n_slabs = len(slab_specs)
-        cots_ops.install_infer(
+        cots_ops.install_weight_runner(
             self._runner_id,
             n_slabs=n_slabs,
             max_num_tokens=max_num_tokens,
@@ -449,7 +447,7 @@ class NativeCotsRunner:
             cots_ops.populate_slab_via_spec(
                 self._runner_id, spec, tid, dry_run=self._dry_run
             )
-        cots_ops.register_task_id_map(self._runner_id, self._task_id_for)
+        cots_ops.register_weight_task_id_map(self._runner_id, self._task_id_for)
         self._installed = True
         # Cache n_slabs so wait-kernel installation does not have to
         # re-walk task_id_for. Set last so any populate-time error
@@ -460,7 +458,7 @@ class NativeCotsRunner:
         """§1c.29 commit 2: install host-mapped pinned req/done
         slots for every slab in the pool. Must be called AFTER
         `install()` and only when the offloader's feature flag
-        `cots_capture_sync_mode="wait_kernel"`.
+        `weight_capture_sync_mode="wait_kernel"`.
 
         After this returns, every slab's `wait_kernel_sync_installed=True`, the
         captured `dispatch_cb` writes `req_slot=seq` per dispatch,
@@ -472,8 +470,9 @@ class NativeCotsRunner:
 
         if not self._installed:
             raise RuntimeError(
-                "NativeCotsRunner.install_wait_kernel_sync() called before install(); "
-                "wait-kernel sync needs the slab pool to exist first"
+                "NativeCotsWeightRunner.install_wait_kernel_sync() called "
+                "before install(); wait-kernel sync needs the slab pool to "
+                "exist first"
             )
         cots_ops.install_wait_kernel_sync_for_all_tasks(
             self._runner_id,
@@ -484,7 +483,7 @@ class NativeCotsRunner:
         """Publish OOG dispatch state for native custom-op resolution."""
         from vllm.model_executor.offloader import cots_ops
 
-        cots_ops.set_active_dispatch_state(
+        cots_ops.set_active_weight_dispatch_state(
             self._runner_id,
             bucket=int(bucket),
             live_num_tokens=int(live_num_tokens),
@@ -555,7 +554,7 @@ class NativeCotsRunner:
         slice/view chain into the captured graph and materialize it
         via a GPU intermediate + blocking GPU→CPU copy that CUDA
         Graph capture rejects. The impl reaches the worker's pinned
-        output via `CotsCpuInfer.y_pinned_view(task_id, bucket)`.
+        output via `CotsWeightTaskRunner.y_pinned_view(task_id, bucket)`.
         Task id and bucket are resolved from OOG dispatch state inside
         the custom-op impl, not passed as compile-visible scalars.
         """
@@ -581,14 +580,14 @@ class NativeCotsRunner:
         Mark the pickled state non-owning so the unpickled copy's
         `close()` and `__del__` no-op."""
         state = self.__dict__.copy()
-        state["_owns_infer_registry_entry"] = False
+        state["_owns_runner_registry_entry"] = False
         return state
 
     def __setstate__(self, state: dict) -> None:
         self.__dict__.update(state)
         # Defensive: in case a state dict from a future pickle didn't
         # carry the flag, default to non-owning.
-        self.__dict__.setdefault("_owns_infer_registry_entry", False)
+        self.__dict__.setdefault("_owns_runner_registry_entry", False)
 
     def close(self) -> None:
         """Drain any in-flight worker task and drop the registry entry.
@@ -597,24 +596,24 @@ class NativeCotsRunner:
         never has to dereference the pybind handle directly (see
         §1c.19).
 
-        No-ops for non-owning copies (`_owns_infer_registry_entry` is
+        No-ops for non-owning copies (`_owns_runner_registry_entry` is
         False after `__setstate__`). The original constructor is the
         sole owner; only IT may drain or unregister.
         """
-        if not getattr(self, "_owns_infer_registry_entry", False):
+        if not getattr(self, "_owns_runner_registry_entry", False):
             return
         from vllm.model_executor.offloader import cots_ops
 
         try:
             # The CPU task queue can be idle while stream-ordered COTS custom
             # ops are still unwinding. Drain CUDA first so callbacks/UVA glue
-            # cannot race with dropping the pybind infer from the registry.
+            # cannot race with dropping the pybind runner handle from the registry.
             if torch.cuda.is_available() and torch.cuda.is_initialized():
                 torch.cuda.current_stream().synchronize()
             cots_ops.sync_blocking(self._runner_id)
         finally:
-            cots_ops._unregister_infer(self._runner_id)
-            self._owns_infer_registry_entry = False
+            cots_ops.unregister_weight_runner(self._runner_id)
+            self._owns_runner_registry_entry = False
 
     def __del__(self) -> None:
         # Best-effort registry cleanup if the user forgot to call close().
@@ -640,28 +639,30 @@ class NativeCotsRunner:
         # registry module too — interpreter shutdown can already have
         # cleared it.
         try:  # noqa: SIM105
-            if getattr(self, "_owns_infer_registry_entry", False):
+            if getattr(self, "_owns_runner_registry_entry", False):
                 from vllm.model_executor.offloader import cots_ops
 
-                cots_ops._unregister_infer(self._runner_id)
-                self._owns_infer_registry_entry = False
+                cots_ops.unregister_weight_runner(self._runner_id)
+                self._owns_runner_registry_entry = False
         except Exception:  # noqa: BLE001
             pass
 
 
-def _make_runner(config: CotsOffloadConfig) -> PythonCotsRunner | NativeCotsRunner:
+def _make_runner(
+    config: CotsOffloadConfig,
+) -> PythonCotsWeightRunner | NativeCotsWeightRunner:
     """Construct the offloader's single runner per `config.cpu_runner`.
 
     One runner per offloader (not per operator) — see plan §design-decision
     4 "One offloader-owned runner shared across all operators". This
-    moves the Phase 1a/1b pattern of fresh `CpuTaskRunner()` per op
-    (cots.py:1752 and :1807 in the legacy code) onto a single shared
+    moves the Phase 1a/1b pattern of fresh Python runner instances per op
+    (cots.py:1752 and :1807 in the earlier layout) onto a single shared
     instance, which is the structural prerequisite for the native
     runner's per-offloader slab pool + runner_id.
     """
     # CotsOffloadConfig.cpu_runner now defaults to "native" (Stage 5
     # production path). The fallback here intentionally stays "python"
-    # for legacy config shims that lack the field entirely — those
+    # for hand-rolled test configs that lack the field entirely — those
     # have never been exercised under the native runner's slab/install
     # path, so silently routing them through native would surface
     # untested code paths at the operator call site. New config
@@ -670,9 +671,9 @@ def _make_runner(config: CotsOffloadConfig) -> PythonCotsRunner | NativeCotsRunn
     cpu_runner = getattr(config, "cpu_runner", "python")
     dry_run = bool(getattr(config, "dry_run", False))
     if cpu_runner == "python":
-        return PythonCotsRunner(dry_run=dry_run)
+        return PythonCotsWeightRunner(dry_run=dry_run)
     if cpu_runner == "native":
-        return NativeCotsRunner(dry_run=dry_run)
+        return NativeCotsWeightRunner(dry_run=dry_run)
     raise ValueError(
         f"Unknown cpu_runner={cpu_runner!r}; expected 'native' or 'python'"
     )
@@ -710,5 +711,5 @@ def _cpu_dryrun_noop(
 #
 # Operators encapsulate the forward semantics for each block of the model
 # we offload. They consume `CotsLinearHandle`s for storage and a
-# `CpuTaskRunner` for execution.
+# PythonCotsWeightRunner for execution.
 # ---------------------------------------------------------------------------

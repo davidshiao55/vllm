@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
-// Phase 1c native CPU runner for COTS. Adapted from KTransformers
-// `kt-kernel/cpu_backend/cpuinfer.h` with WorkerPool removed (oneDNN/ATen
-// own intra-op threading) and a slab-based task dispatch added.
+// Phase 1c native weight task runner for COTS. Adapted from the KTransformers
+// CPU backend with WorkerPool removed (oneDNN/ATen own intra-op threading) and
+// a slab-based task dispatch added.
 //
 // See David/Docs/implementation_roadmap.md Phase 1c, the approved plan
 // at /root/.claude/plans/pleaes-implement-phase1c-in-quizzical-mist.md,
 // and David/Docs/phase1a_findings.md §1.14 for the substrate motivation.
 
-#ifndef VLLM_COTS_CPU_INFER_H_
-#define VLLM_COTS_CPU_INFER_H_
+#ifndef VLLM_COTS_WEIGHT_TASK_RUNNER_H_
+#define VLLM_COTS_WEIGHT_TASK_RUNNER_H_
 
 #include <ATen/ATen.h>
 #include <c10/core/ScalarType.h>
@@ -30,7 +30,7 @@ namespace vllm {
 namespace cots {
 
 // Per-(layer, bucket, op_kind) task slab. Address-stable for the lifetime
-// of CotsCpuInfer (slabs_ is reserve()'d once at install time and never
+// of CotsWeightTaskRunner (slabs_ is reserve()'d once at install time and never
 // resized) so that captured CUDA graphs can record &slabs_[id] as their
 // host-callback userData.
 //
@@ -49,10 +49,10 @@ struct alignas(64) TaskSlab {
 
   // Self-pointer pattern preserved from kt-kernel (the host callback writes
   // it before calling into the dispatcher, which lets the static dispatcher
-  // recover the owning CotsCpuInfer*). For our reserve-once design the
+  // recover the owning CotsWeightTaskRunner*). For our reserve-once design the
   // pointer is in fact set once at install time and never rewritten, but we
-  // keep the field at the standard cpuinfer offset for parity with debug
-  // tooling.
+  // keep the field at the original KTransformers self-pointer offset for parity
+  // with debug tooling.
   void* self = nullptr;
 
   int32_t op_kind = kDryrunNoop;
@@ -132,23 +132,23 @@ struct alignas(64) TaskSlab {
   int32_t w_down_cols = 0;  // = N (out_dim)
 };
 
-// Static sync-callback userData — owned as a stable member of CotsCpuInfer
-// so its address is valid across CUDA graph replays.
+// Static sync-callback userData — owned as a stable member of
+// CotsWeightTaskRunner so its address is valid across CUDA graph replays.
 struct SyncArgs {
-  void* infer = nullptr;
+  void* runner = nullptr;
   size_t allow_n_pending = 0;
 };
 
-class CotsCpuInfer {
+class CotsWeightTaskRunner {
  public:
-  CotsCpuInfer();
-  ~CotsCpuInfer();
+  CotsWeightTaskRunner();
+  ~CotsWeightTaskRunner();
 
-  CotsCpuInfer(const CotsCpuInfer&) = delete;
-  CotsCpuInfer& operator=(const CotsCpuInfer&) = delete;
+  CotsWeightTaskRunner(const CotsWeightTaskRunner&) = delete;
+  CotsWeightTaskRunner& operator=(const CotsWeightTaskRunner&) = delete;
 
   // Reserves N slabs, sized once. After install(), slabs_.size() ==
-  // n_slabs is invariant for the lifetime of this CotsCpuInfer.
+  // n_slabs is invariant for the lifetime of this CotsWeightTaskRunner.
   // `max_num_tokens` is the upper bound on per-call num_tokens; it
   // gates submit/run-side bounds checks against the pinned x/y
   // buffers. Subsequent populate_slab calls only mutate the
@@ -225,7 +225,7 @@ class CotsCpuInfer {
   // based on `slab.wait_kernel_sync_installed`: when wait-kernel sync is
   // installed for this task (offloader called
   // `install_wait_kernel_sync_for_task` in post_init under
-  // `cots_capture_sync_mode="wait_kernel"`), the captured graph node is the
+  // `weight_capture_sync_mode="wait_kernel"`), the captured graph node is the
   // wait-kernel sync reading the worker-published `done_slot=seq`. Otherwise
   // the captured node is the legacy `cudaLaunchHostFunc(SyncCallback)` blocking
   // the driver thread on `TaskQueue::sync(0)`. The Python side
@@ -291,7 +291,7 @@ class CotsCpuInfer {
   // `bucket_capacity_tokens` and the mutable `num_tokens` for a
   // given slab. The pair lets test_bucket_capacity_immutable assert
   // that `bucket_capacity_tokens` does NOT change when
-  // `runtime_num_tokens` or `slab.num_tokens` is mutated.
+  // `live_num_tokens` or `slab.num_tokens` is mutated.
   int32_t slab_bucket_capacity_tokens(int64_t task_id) const;
   int32_t slab_num_tokens(int64_t task_id) const;
 
@@ -342,7 +342,7 @@ class CotsCpuInfer {
   // graph input that Inductor would materialize via a CPU↔GPU
   // shuffle. Shape: {num_tokens, slab.cpu_out_dim}, dtype bfloat16,
   // contiguous. Caller must NOT outlive the slab (i.e., this
-  // CotsCpuInfer instance).
+  // CotsWeightTaskRunner instance).
   at::Tensor y_pinned_view(int64_t task_id, int32_t num_tokens) const;
 
   // §1c.21 fix — live unpadded token count plumbed through OUT OF
@@ -373,7 +373,7 @@ class CotsCpuInfer {
   // Wasted PCIe / Triton bandwidth is a §1c.22 follow-up; the
   // dominant cost the counter data showed was CPU GEMM work, which
   // this fix collapses.
-  void set_runtime_num_tokens(int32_t n);
+  void set_live_num_tokens(int32_t n);
 
   // §1c.22: invoked from `cots_sync_then_uva`'s Python impl to
   // record the captured Triton kernel's bucket-sized H2D request
@@ -460,9 +460,9 @@ class CotsCpuInfer {
 
   // §1c.21 live-token override. Sentinel 0 = unset; positive values
   // override slab->num_tokens for row-count arithmetic in the
-  // worker. Updated OUT OF GRAPH by set_runtime_num_tokens() before
+  // worker. Updated OUT OF GRAPH by set_live_num_tokens() before
   // each captured replay; read on the worker thread via acquire
-  // load. See header comment on set_runtime_num_tokens.
+  // load. See header comment on set_live_num_tokens.
   std::atomic<int32_t> runtime_num_tokens_{0};
 
   // Worker exception surfacing (see has_error / take_error above).
@@ -512,17 +512,17 @@ class CotsCpuInfer {
   std::atomic<int64_t> uva_replay_bucket_bytes_{0};
 
   // §1c.21 fix-validation counters: distinct from the submit-time
-  // num_tokens histogram. `runtime_set_calls_` counts how often
-  // `set_runtime_num_tokens` was called (proves the plumb-through
-  // is reaching C++); `runtime_last_value_` is the most recent
+  // num_tokens histogram. `live_set_calls_` counts how often
+  // `set_live_num_tokens` was called (proves the plumb-through
+  // is reaching C++); `live_last_value_` is the most recent
   // value (proves what's being pushed); `worker_effective_n_hist_`
   // bins what the worker actually used after the
   // `effective_n = override > 0 ? override : slab.num_tokens`
   // resolution. If submit-time histogram is dominated by `nt_gt_64`
   // but `worker_effective_n_hist` shows mostly `nt_le_1`, the
   // worker is correctly using the override.
-  std::atomic<int64_t> runtime_set_calls_{0};
-  std::atomic<int64_t> runtime_last_value_{0};
+  std::atomic<int64_t> live_set_calls_{0};
+  std::atomic<int64_t> live_last_value_{0};
   std::array<std::atomic<int64_t>, 8> worker_effective_n_hist_{};
 
   // §1c.22 byte accounting — bucket-sized captured copies vs
@@ -569,7 +569,7 @@ class CotsCpuInfer {
   // it up. Distinct from `sync_cb_wait_total_ns_` (the driver
   // thread's wait inside SyncCallback).
   std::atomic<int64_t> worker_queue_wait_total_ns_{0};
-  // §1c.31: counts replays where `runtime_num_tokens > slab.num_tokens`
+  // §1c.31: counts replays where `live_num_tokens > slab.num_tokens`
   // — the global live-token override was set for a larger row count
   // than this slab's bucket can hold. The worker clamps to slab
   // capacity rather than reading past the pinned buffer's tail. Most
@@ -604,4 +604,4 @@ class CotsCpuInfer {
 }  // namespace cots
 }  // namespace vllm
 
-#endif  // VLLM_COTS_CPU_INFER_H_
+#endif  // VLLM_COTS_WEIGHT_TASK_RUNNER_H_

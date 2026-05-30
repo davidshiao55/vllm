@@ -1003,27 +1003,26 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
 endif()
 
 #
-# _cots_C extension (Phase 1c — COTS native CPU runner)
+# _cots_C extension (COTS native weight/suffix task runners)
 #
-# Pure CXX extension: no CUDA kernels, only the CUDA Runtime API
-# (cudaLaunchHostFunc) for host-callback dispatch. Exposes a stateful
-# pybind11 class (CotsCpuInfer), so we intentionally do NOT use USE_SABI 3
+# CUDA-targeted extension: host-side task runners plus the tiny wait kernel.
+# Exposes stateful pybind11 classes, so we intentionally do NOT use USE_SABI 3
 # — the existing stable-ABI extensions in this repo register torch ops via
-# REGISTER_EXTENSION (csrc/core/registration.h) rather than a pybind class
+# REGISTER_EXTENSION (csrc/core/registration.h) rather than pybind classes
 # with state. Standard Python ABI is the safe path.
 #
-# CUDA-only: the host-callback design depends on `cudaLaunchHostFunc`,
-# which is a CUDA Runtime API; ROCm/HIP have a different host-callback
-# story and are out of Phase 1c scope. Gate the whole extension on
-# VLLM_GPU_LANG == "CUDA" so ROCm builds skip it cleanly. See
+# CUDA-only: host dispatch uses `cudaLaunchHostFunc` and wait-kernel
+# sync uses a small CUDA kernel. ROCm/HIP have different host-callback
+# and stream-wait APIs and are out of current thesis scope. Gate the whole
+# extension on VLLM_GPU_LANG == "CUDA" so ROCm builds skip it cleanly. See
 # David/Docs/implementation_roadmap.md Phase 1c and the approved plan
 # at /root/.claude/plans/pleaes-implement-phase1c-in-quizzical-mist.md.
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
   set(VLLM_COTS_EXT_SRC
     "csrc/cots/task_queue.cpp"
-    "csrc/cots/cots_cpu_infer.cpp"
-    "csrc/cots/cots_suffix_attention_infer.cpp"
+    "csrc/cots/cots_weight_task_runner.cpp"
+    "csrc/cots/cots_suffix_attention_task_runner.cpp"
     "csrc/cots/cots_torch_bindings.cpp"
     # Stage 7 — custom BF16 GEMM kernel for the row-major-weight
     # layout (oneDNN has no AVX2 fast path for this layout; see
@@ -1040,8 +1039,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     "csrc/cots/bf16_gemm_natural.cpp"
     # CPU MLP block fast path: gate/up/SwiGLU into BF16 scratch, then down.
     "csrc/cots/bf16_mlp_gate_up_silu.cpp"
-    # Phase 2 CPU suffix attention prototype: Qwen2.5-7B BF16 decode
-    # attention with q_per_kv=7, output+LSE for online-softmax merge.
+    # Phase 2 CPU suffix attention kernel: BF16 grouped-query decode
+    # attention with output+LSE for online-softmax merge.
     "csrc/cots/cpu_suffix_attention.cpp"
     # §1c.29 wait kernel — compiled as CUDA so nvcc handles
     # the __global__ kernel and PTX inline asm. The other
@@ -1049,7 +1048,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     # transparently when LANGUAGE=CUDA.
     "csrc/cots/cots_wait_done_kernel.cu")
 
-  # §1c.29: per-source gencode flags for the M3 .cu file. The
+  # §1c.29: per-source gencode flags for the wait-kernel .cu file. The
   # PTX `nanosleep` instruction requires sm_70+; without the
   # gencode flags nvcc defaults to sm_50 (cmake's default) and
   # fails. Mirrors the pattern used by other CUDA targets in

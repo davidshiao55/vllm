@@ -1426,25 +1426,30 @@ class VllmConfig:
 
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             logger.info_once(
-                "COTS graph mode is defaulting to PIECEWISE CUDA graphs "
-                "because COTS CPU-side runtime work is safer at graph split "
-                "boundaries than inside legacy full capture. Use "
-                "--no-cots-auto-graph-split to keep the configured "
+                "COTS graph mode is defaulting to PIECEWISE CUDA graphs. "
+                "Phase 1 weight offload needs COTS weight submit/sync work "
+                "at graph boundaries, and Phase 2 hybrid KV relies on the "
+                "normal attention piecewise boundary for suffix attention. "
+                "Use --no-cots-auto-graph-split to keep the configured "
                 "cudagraph_mode."
             )
             self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
 
         if (
             has_native_weight_graph
-            and cots_config.cots_capture_sync_mode == "host_callback"
+            and cots_config.weight_capture_sync_mode == "host_callback"
         ):
             logger.info_once(
-                "COTS graph mode is defaulting cots_capture_sync_mode to "
-                "wait_kernel. Use --no-cots-auto-graph-split to keep the "
-                "legacy host_callback capture path."
+                "COTS graph mode is defaulting weight_capture_sync_mode to "
+                "wait_kernel for the Phase 1 weight runner. Use "
+                "--no-cots-auto-graph-split to keep the legacy host_callback "
+                "weight capture path."
             )
-            cots_config.cots_capture_sync_mode = "wait_kernel"
+            cots_config.weight_capture_sync_mode = "wait_kernel"
 
+        # Only Phase 1 weight offload adds COTS custom-op split points.
+        # Phase 2 hybrid KV is captured through the regular attention piecewise
+        # boundary; its prepared suffix submit/sync ops live inside that piece.
         return (
             CompilationConfig.cots_splitting_ops() if has_native_weight_graph else None
         )

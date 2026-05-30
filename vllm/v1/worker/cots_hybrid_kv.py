@@ -22,7 +22,7 @@ import torch
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.cots_hybrid_attention import (
     CotsHybridDecodeMetadata,
-    CotsPreparedNativeSuffixAttentionRunner,
+    NativeCotsSuffixAttentionRunner,
 )
 from vllm.v1.metrics.stats import CotsHybridKVStats
 
@@ -283,7 +283,7 @@ class CotsHybridKVStore:
         self._suffix_attention_tasks_per_layer = (
             self._num_staging_slots * self._max_num_reqs + 1
         )
-        self._suffix_attention_runner = CotsPreparedNativeSuffixAttentionRunner(
+        self._suffix_attention_runner = NativeCotsSuffixAttentionRunner(
             num_tasks=len(self.layer_names) * self._suffix_attention_tasks_per_layer
         )
         self._suffix_counter_stats_enabled = (

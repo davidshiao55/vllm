@@ -286,7 +286,7 @@ def test_cots_auto_graph_split_defaults():
     )
 
     assert config.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
-    assert config.offload_config.cots.cots_capture_sync_mode == "wait_kernel"
+    assert config.offload_config.cots.weight_capture_sync_mode == "wait_kernel"
     for op in CompilationConfig.cots_splitting_ops():
         assert op in config.compilation_config.splitting_ops
 
@@ -304,7 +304,7 @@ def test_cots_auto_graph_split_can_be_disabled():
     )
 
     assert config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
-    assert config.offload_config.cots.cots_capture_sync_mode == "host_callback"
+    assert config.offload_config.cots.weight_capture_sync_mode == "host_callback"
     for op in CompilationConfig.cots_splitting_ops():
         assert op not in config.compilation_config.splitting_ops
 
@@ -327,7 +327,8 @@ def test_cots_hybrid_kv_config_is_derived_and_graph_piecewise():
         ),
     )
     assert graph_config.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
-    assert graph_config.offload_config.cots.cots_capture_sync_mode == "host_callback"
+    assert graph_config.compilation_config.splitting_ops_contain_attention()
+    assert graph_config.offload_config.cots.weight_capture_sync_mode == "host_callback"
     for op in CompilationConfig.cots_splitting_ops():
         assert op not in graph_config.compilation_config.splitting_ops
 
@@ -337,6 +338,28 @@ def test_cots_hybrid_kv_config_is_derived_and_graph_piecewise():
             scheduler_config=SchedulerConfig.default_factory(async_scheduling=True),
             compilation_config=CompilationConfig(cudagraph_mode=CUDAGraphMode.NONE),
         )
+
+
+def test_cots_weight_and_hybrid_kv_graph_policy_combines_boundaries():
+    cots = CotsOffloadConfig(
+        f_cpu_store=0.05,
+        kv_split_blocks=128,
+        kv_cpu_pool_bytes=1 << 30,
+    )
+
+    config = VllmConfig(
+        offload_config=OffloadConfig(offload_backend="cots", cots=cots),
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE,
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        ),
+    )
+
+    assert config.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
+    assert config.compilation_config.splitting_ops_contain_attention()
+    assert config.offload_config.cots.weight_capture_sync_mode == "wait_kernel"
+    for op in CompilationConfig.cots_splitting_ops():
+        assert op in config.compilation_config.splitting_ops
 
 
 def test_cots_hybrid_kv_rejects_unsupported_runtime_modes():

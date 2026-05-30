@@ -109,21 +109,12 @@ class BaseOffloader(ABC):
         """
         pass
 
-    def set_runtime_num_tokens(self, actual_num_tokens: int) -> None:  # noqa: B027
-        """Legacy alias for `set_live_num_tokens`.
-
-        Kept for older cudagraph/offloader call sites and direct tests
-        that still use the original §1c.21 name.
-        """
-        self.set_live_num_tokens(actual_num_tokens)
-
     def on_dispatch(self, info: ForwardDispatchInfo) -> None:
         """Single OOG entry point for all per-forward dispatch state.
 
         Called before scheduler, profile dummy, warmup, CUDA Graph
-        capture, or CUDA Graph replay forwards. Default impl delegates
-        to the legacy per-piece methods so existing offloaders keep
-        working unchanged.
+        capture, or CUDA Graph replay forwards. Default impl delegates to the
+        per-piece hooks so existing offloaders keep working unchanged.
         """
         self.prepare_before_forward(info.batch_descriptor.num_tokens)
         self.sync_prev_onload()

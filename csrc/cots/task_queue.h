@@ -38,8 +38,9 @@ class TaskQueue {
   void enqueue(std::function<void()> task);
 
   // Block calling thread until `pending` <= allow_n_pending, OR queue is
-  // shutting down. Used both by Python `infer.sync()` (no stream) and by
-  // the CUDA host callback in CotsCpuInfer::sync() (CUDA driver thread).
+  // shutting down. Used both by Python `runner.sync()` (no stream) and by
+  // the CUDA host callback in CotsWeightTaskRunner::sync() (CUDA driver
+  // thread).
   void sync(size_t allow_n_pending);
 
  private:

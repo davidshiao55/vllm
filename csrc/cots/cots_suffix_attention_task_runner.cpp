@@ -3,14 +3,14 @@
 //
 // Phase 2 native runner for prepared CPU suffix attention tasks.
 
-#include "cots_suffix_attention_infer.h"
+#include "cots_suffix_attention_task_runner.h"
+
+#include "cots_common.h"
 
 #include <c10/core/InferenceMode.h>
-#include <nvtx3/nvToolsExt.h>
 #include <torch/torch.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cstdlib>
 #include <exception>
 #include <limits>
@@ -19,12 +19,6 @@
 
 namespace vllm {
 namespace cots {
-
-extern "C" void launch_cots_wait_done_kernel_production(uint32_t*, uint32_t*,
-                                                        cudaStream_t);
-extern "C" void launch_cots_wait_done_kernel_diag(uint32_t*, uint32_t*,
-                                                  int64_t*, int64_t*, int64_t*,
-                                                  cudaStream_t);
 
 void gqa_bf16_suffix_attention_at(const at::Tensor& query,
                                   const at::Tensor& key_cache,
@@ -67,18 +61,6 @@ constexpr int32_t kFusedScatterMaxSuffixBlocks = 2;
 constexpr int kDefaultSuffixNumThreads = 24;
 
 namespace cots_suffix_diag {
-inline bool env_flag(const char* name) {
-  const char* v = std::getenv(name);
-  return v != nullptr && v[0] == '1' && v[1] == '\0';
-}
-
-inline bool nvtx_enabled() {
-  static const bool enabled = []() {
-    return env_flag("VLLM_COTS_DIAG") || env_flag("VLLM_COTS_NVTX");
-  }();
-  return enabled;
-}
-
 inline bool counters_enabled() {
   static const bool enabled = []() {
     return env_flag("VLLM_COTS_DIAG") || env_flag("VLLM_COTS_SUFFIX_COUNTERS");
@@ -113,44 +95,6 @@ inline int suffix_num_threads() {
 }
 }  // namespace cots_suffix_diag
 
-struct NvtxScope {
-  explicit NvtxScope(const char* name) {
-    if (cots_suffix_diag::nvtx_enabled()) nvtxRangePushA(name);
-  }
-  ~NvtxScope() {
-    if (cots_suffix_diag::nvtx_enabled()) nvtxRangePop();
-  }
-  NvtxScope(const NvtxScope&) = delete;
-  NvtxScope& operator=(const NvtxScope&) = delete;
-};
-
-inline int64_t now_ns() {
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(
-             std::chrono::steady_clock::now().time_since_epoch())
-      .count();
-}
-
-void ensure_wait_kernel_diag_cell(int64_t** host_ptr, int64_t** dev_ptr,
-                                  const char* name) {
-  if (*host_ptr != nullptr) return;
-  void* hp = nullptr;
-  cudaError_t e = cudaHostAlloc(&hp, sizeof(int64_t), cudaHostAllocMapped);
-  TORCH_CHECK(e == cudaSuccess,
-              "install_wait_kernel_sync_for_task: cudaHostAlloc(", name,
-              ") failed: ", cudaGetErrorString(e));
-  *static_cast<int64_t*>(hp) = 0;
-  void* dp = nullptr;
-  cudaError_t e2 = cudaHostGetDevicePointer(&dp, hp, 0);
-  if (e2 != cudaSuccess) {
-    cudaFreeHost(hp);
-    TORCH_CHECK(false,
-                "install_wait_kernel_sync_for_task: cudaHostGetDevicePointer(",
-                name, ") failed: ", cudaGetErrorString(e2));
-  }
-  *host_ptr = static_cast<int64_t*>(hp);
-  *dev_ptr = static_cast<int64_t*>(dp);
-}
-
 at::Tensor Bf16View(void* ptr, at::IntArrayRef sizes) {
   auto opts = at::TensorOptions().dtype(at::kBFloat16).device(at::kCPU);
   return at::from_blob(ptr, sizes, opts);
@@ -179,8 +123,8 @@ at::Tensor FloatView(void* ptr, at::IntArrayRef sizes) {
 
 }  // namespace
 
-struct CotsSuffixAttentionInfer::SubmittedTask {
-  CotsSuffixAttentionInfer* self = nullptr;
+struct CotsSuffixAttentionTaskRunner::SubmittedTask {
+  CotsSuffixAttentionTaskRunner* self = nullptr;
   SuffixAttentionTask* sync_task = nullptr;
   bool owned_by_callback = true;
   int64_t task_id = -1;
@@ -231,13 +175,13 @@ struct CotsSuffixAttentionInfer::SubmittedTask {
   double scale = 0.0;
 };
 
-CotsSuffixAttentionInfer::CotsSuffixAttentionInfer()
+CotsSuffixAttentionTaskRunner::CotsSuffixAttentionTaskRunner()
     : task_queue_(std::make_unique<TaskQueue>()) {
-  sync_args_.infer = static_cast<void*>(this);
+  sync_args_.runner = static_cast<void*>(this);
   sync_args_.allow_n_pending = 0;
 }
 
-CotsSuffixAttentionInfer::~CotsSuffixAttentionInfer() {
+CotsSuffixAttentionTaskRunner::~CotsSuffixAttentionTaskRunner() {
   if (task_queue_) {
     task_queue_->sync(0);
   }
@@ -281,9 +225,10 @@ CotsSuffixAttentionInfer::~CotsSuffixAttentionInfer() {
   }
 }
 
-void CotsSuffixAttentionInfer::install(int64_t n_tasks) {
+void CotsSuffixAttentionTaskRunner::install(int64_t n_tasks) {
   TORCH_CHECK(n_tasks >= 0, "install: n_tasks must be >= 0, got ", n_tasks);
-  TORCH_CHECK(!tasks_, "install: CotsSuffixAttentionInfer already installed");
+  TORCH_CHECK(!tasks_,
+              "install: CotsSuffixAttentionTaskRunner already installed");
   if (n_tasks > 0) {
     tasks_ = std::unique_ptr<SuffixAttentionTask[]>(
         new SuffixAttentionTask[n_tasks]);
@@ -294,7 +239,7 @@ void CotsSuffixAttentionInfer::install(int64_t n_tasks) {
   task_count_ = n_tasks;
 }
 
-void CotsSuffixAttentionInfer::populate_task(
+void CotsSuffixAttentionTaskRunner::populate_task(
     int64_t task_id, uintptr_t query_ptr, int32_t query_capacity,
     int32_t num_q_heads, int32_t num_kv_heads, int32_t head_dim,
     int64_t query_stride0, int64_t query_stride1, int64_t query_stride2,
@@ -386,7 +331,7 @@ void CotsSuffixAttentionInfer::populate_task(
   t.scale = scale;
 }
 
-void CotsSuffixAttentionInfer::submit_prepared_on_stream(
+void CotsSuffixAttentionTaskRunner::submit_prepared_on_stream(
     int64_t task_id, uintptr_t cuda_stream) {
   const bool diag = cots_suffix_diag::counters_enabled();
   const int64_t submit_t0 = diag ? now_ns() : 0;
@@ -521,8 +466,8 @@ void CotsSuffixAttentionInfer::submit_prepared_on_stream(
   }
 }
 
-void CotsSuffixAttentionInfer::set_runtime_counts(int32_t num_tokens,
-                                                  int32_t scatter_count) {
+void CotsSuffixAttentionTaskRunner::set_runtime_counts(int32_t num_tokens,
+                                                       int32_t scatter_count) {
   TORCH_CHECK(num_tokens >= -1, "set_runtime_counts: num_tokens=", num_tokens,
               " < -1; pass -1 to clear the row override.");
   TORCH_CHECK(scatter_count >= -1,
@@ -532,7 +477,7 @@ void CotsSuffixAttentionInfer::set_runtime_counts(int32_t num_tokens,
   runtime_scatter_count_.store(scatter_count, std::memory_order_release);
 }
 
-void CotsSuffixAttentionInfer::sync_on_stream(uintptr_t cuda_stream) {
+void CotsSuffixAttentionTaskRunner::sync_on_stream(uintptr_t cuda_stream) {
   check_error();
   auto stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   cudaError_t err = cudaLaunchHostFunc(stream, &SyncCallback,
@@ -542,8 +487,8 @@ void CotsSuffixAttentionInfer::sync_on_stream(uintptr_t cuda_stream) {
               cudaGetErrorString(err));
 }
 
-void CotsSuffixAttentionInfer::sync_or_wait_on_stream(int64_t task_id,
-                                                      uintptr_t cuda_stream) {
+void CotsSuffixAttentionTaskRunner::sync_or_wait_on_stream(
+    int64_t task_id, uintptr_t cuda_stream) {
   TORCH_CHECK(task_id >= 0 && task_id < task_count_,
               "sync_or_wait_on_stream: task_id ", task_id, " out of range");
   SuffixAttentionTask& task = tasks_[task_id];
@@ -554,7 +499,7 @@ void CotsSuffixAttentionInfer::sync_or_wait_on_stream(int64_t task_id,
   }
 }
 
-void CotsSuffixAttentionInfer::install_wait_kernel_sync_for_task(
+void CotsSuffixAttentionTaskRunner::install_wait_kernel_sync_for_task(
     int64_t task_id) {
   check_error();
   TORCH_CHECK(task_id >= 0 && task_id < task_count_,
@@ -567,15 +512,15 @@ void CotsSuffixAttentionInfer::install_wait_kernel_sync_for_task(
               task_id);
 
   if (cots_suffix_diag::wait_kernel_diag_enabled()) {
-    ensure_wait_kernel_diag_cell(&wait_kernel_spin_iters_host_,
-                                 &wait_kernel_spin_iters_dev_,
-                                 "suffix_spin_iters");
-    ensure_wait_kernel_diag_cell(&wait_kernel_immediate_resume_host_,
-                                 &wait_kernel_immediate_resume_dev_,
-                                 "suffix_immediate_resume");
-    ensure_wait_kernel_diag_cell(&wait_kernel_lagging_wait_host_,
-                                 &wait_kernel_lagging_wait_dev_,
-                                 "suffix_lagging_wait");
+    ensure_mapped_i64_cell(
+        &wait_kernel_spin_iters_host_, &wait_kernel_spin_iters_dev_,
+        "install_wait_kernel_sync_for_task", "suffix_spin_iters");
+    ensure_mapped_i64_cell(
+        &wait_kernel_immediate_resume_host_, &wait_kernel_immediate_resume_dev_,
+        "install_wait_kernel_sync_for_task", "suffix_immediate_resume");
+    ensure_mapped_i64_cell(
+        &wait_kernel_lagging_wait_host_, &wait_kernel_lagging_wait_dev_,
+        "install_wait_kernel_sync_for_task", "suffix_lagging_wait");
   }
 
   if (wait_kernel_slots_host_ == nullptr) {
@@ -622,7 +567,7 @@ void CotsSuffixAttentionInfer::install_wait_kernel_sync_for_task(
   task.wait_kernel_sync_installed.store(true, std::memory_order_release);
 }
 
-bool CotsSuffixAttentionInfer::wait_kernel_sync_installed_for_task(
+bool CotsSuffixAttentionTaskRunner::wait_kernel_sync_installed_for_task(
     int64_t task_id) const {
   TORCH_CHECK(task_id >= 0 && task_id < task_count_,
               "wait_kernel_sync_installed_for_task: task_id ", task_id,
@@ -631,13 +576,13 @@ bool CotsSuffixAttentionInfer::wait_kernel_sync_installed_for_task(
       std::memory_order_acquire);
 }
 
-void CotsSuffixAttentionInfer::wait_kernel_sync_on_stream(
+void CotsSuffixAttentionTaskRunner::wait_kernel_sync_on_stream(
     int64_t task_id, uintptr_t cuda_stream) {
   check_error();
   wait_kernel_sync_on_stream_no_check(task_id, cuda_stream);
 }
 
-void CotsSuffixAttentionInfer::wait_kernel_sync_on_stream_no_check(
+void CotsSuffixAttentionTaskRunner::wait_kernel_sync_on_stream_no_check(
     int64_t task_id, uintptr_t cuda_stream) {
   TORCH_CHECK(task_id >= 0 && task_id < task_count_,
               "wait_kernel_sync_on_stream: task_id ", task_id, " out of range");
@@ -650,30 +595,15 @@ void CotsSuffixAttentionInfer::wait_kernel_sync_on_stream_no_check(
   if (cots_suffix_diag::counters_enabled()) {
     wait_kernel_launch_count_.fetch_add(1, std::memory_order_relaxed);
   }
-  if (cots_suffix_diag::wait_kernel_diag_enabled()) {
-    TORCH_CHECK(
-        wait_kernel_spin_iters_dev_ != nullptr &&
-            wait_kernel_immediate_resume_dev_ != nullptr &&
-            wait_kernel_lagging_wait_dev_ != nullptr,
-        "wait_kernel_sync_on_stream: suffix diag mode active but counter "
-        "cells are not allocated");
-    launch_cots_wait_done_kernel_diag(
-        static_cast<uint32_t*>(task.dev_req_slot),
-        static_cast<uint32_t*>(task.dev_done_slot), wait_kernel_spin_iters_dev_,
-        wait_kernel_immediate_resume_dev_, wait_kernel_lagging_wait_dev_,
-        stream);
-  } else {
-    launch_cots_wait_done_kernel_production(
-        static_cast<uint32_t*>(task.dev_req_slot),
-        static_cast<uint32_t*>(task.dev_done_slot), stream);
-  }
-  cudaError_t le = cudaGetLastError();
-  TORCH_CHECK(le == cudaSuccess,
-              "wait_kernel_sync_on_stream: kernel launch failed: ",
-              cudaGetErrorString(le));
+  launch_wait_done_kernel(
+      static_cast<uint32_t*>(task.dev_req_slot),
+      static_cast<uint32_t*>(task.dev_done_slot),
+      cots_suffix_diag::wait_kernel_diag_enabled(), wait_kernel_spin_iters_dev_,
+      wait_kernel_immediate_resume_dev_, wait_kernel_lagging_wait_dev_, stream,
+      "wait_kernel_sync_on_stream");
 }
 
-uint32_t CotsSuffixAttentionInfer::wait_kernel_get_req_slot(
+uint32_t CotsSuffixAttentionTaskRunner::wait_kernel_get_req_slot(
     int64_t task_id) const {
   TORCH_CHECK(task_id >= 0 && task_id < task_count_,
               "wait_kernel_get_req_slot: task_id out of range");
@@ -685,7 +615,7 @@ uint32_t CotsSuffixAttentionInfer::wait_kernel_get_req_slot(
   return *static_cast<volatile uint32_t*>(task.host_req_slot);
 }
 
-uint32_t CotsSuffixAttentionInfer::wait_kernel_get_done_slot(
+uint32_t CotsSuffixAttentionTaskRunner::wait_kernel_get_done_slot(
     int64_t task_id) const {
   TORCH_CHECK(task_id >= 0 && task_id < task_count_,
               "wait_kernel_get_done_slot: task_id out of range");
@@ -697,8 +627,8 @@ uint32_t CotsSuffixAttentionInfer::wait_kernel_get_done_slot(
   return *static_cast<volatile uint32_t*>(task.host_done_slot);
 }
 
-void CotsSuffixAttentionInfer::wait_kernel_set_req_slot(int64_t task_id,
-                                                        uint32_t value) {
+void CotsSuffixAttentionTaskRunner::wait_kernel_set_req_slot(int64_t task_id,
+                                                             uint32_t value) {
   TORCH_CHECK(task_id >= 0 && task_id < task_count_,
               "wait_kernel_set_req_slot: task_id out of range");
   SuffixAttentionTask& task = tasks_[task_id];
@@ -710,8 +640,8 @@ void CotsSuffixAttentionInfer::wait_kernel_set_req_slot(int64_t task_id,
   *static_cast<volatile uint32_t*>(task.host_req_slot) = value;
 }
 
-void CotsSuffixAttentionInfer::wait_kernel_set_done_slot(int64_t task_id,
-                                                         uint32_t value) {
+void CotsSuffixAttentionTaskRunner::wait_kernel_set_done_slot(int64_t task_id,
+                                                              uint32_t value) {
   TORCH_CHECK(task_id >= 0 && task_id < task_count_,
               "wait_kernel_set_done_slot: task_id out of range");
   SuffixAttentionTask& task = tasks_[task_id];
@@ -723,12 +653,12 @@ void CotsSuffixAttentionInfer::wait_kernel_set_done_slot(int64_t task_id,
   *static_cast<volatile uint32_t*>(task.host_done_slot) = value;
 }
 
-void CotsSuffixAttentionInfer::sync_blocking() {
+void CotsSuffixAttentionTaskRunner::sync_blocking() {
   task_queue_->sync(0);
   check_error();
 }
 
-std::string CotsSuffixAttentionInfer::take_error() {
+std::string CotsSuffixAttentionTaskRunner::take_error() {
   std::lock_guard<std::mutex> lock(error_mtx_);
   std::string msg = std::move(last_error_msg_);
   last_error_msg_.clear();
@@ -736,7 +666,7 @@ std::string CotsSuffixAttentionInfer::take_error() {
   return msg;
 }
 
-void CotsSuffixAttentionInfer::check_error() {
+void CotsSuffixAttentionTaskRunner::check_error() {
   if (!has_error_.load(std::memory_order_acquire)) return;
   std::lock_guard<std::mutex> lock(error_mtx_);
   std::string msg = std::move(last_error_msg_);
@@ -745,7 +675,7 @@ void CotsSuffixAttentionInfer::check_error() {
   throw std::runtime_error(msg);
 }
 
-void CotsSuffixAttentionInfer::DispatchCallback(void* user_data) {
+void CotsSuffixAttentionTaskRunner::DispatchCallback(void* user_data) {
   NvtxScope nvtx_scope("cots:suffix_dispatch_cb");
   const bool diag = cots_suffix_diag::counters_enabled();
   const int64_t callback_t0 = diag ? now_ns() : 0;
@@ -755,7 +685,7 @@ void CotsSuffixAttentionInfer::DispatchCallback(void* user_data) {
           ? std::shared_ptr<SubmittedTask>(raw_submitted)
           : std::shared_ptr<SubmittedTask>(raw_submitted,
                                            [](SubmittedTask*) {});
-  CotsSuffixAttentionInfer* self = submitted->self;
+  CotsSuffixAttentionTaskRunner* self = submitted->self;
   SuffixAttentionTask* sync_task = submitted->sync_task;
   if (diag) {
     self->dispatch_cb_count_.fetch_add(1, std::memory_order_relaxed);
@@ -835,24 +765,24 @@ void CotsSuffixAttentionInfer::DispatchCallback(void* user_data) {
   }
 }
 
-void CotsSuffixAttentionInfer::SyncCallback(void* user_data) {
+void CotsSuffixAttentionTaskRunner::SyncCallback(void* user_data) {
   NvtxScope nvtx_scope("cots:suffix_sync_cb_wait");
   SyncArgs* args = static_cast<SyncArgs*>(user_data);
-  CotsSuffixAttentionInfer* self =
-      static_cast<CotsSuffixAttentionInfer*>(args->infer);
+  CotsSuffixAttentionTaskRunner* self =
+      static_cast<CotsSuffixAttentionTaskRunner*>(args->runner);
   if (cots_suffix_diag::counters_enabled()) {
     const int64_t t0 = now_ns();
     self->task_queue_->sync(args->allow_n_pending);
     const int64_t t1 = now_ns();
-    self->legacy_sync_cb_count_.fetch_add(1, std::memory_order_relaxed);
-    self->legacy_sync_cb_wait_total_ns_.fetch_add(t1 - t0,
-                                                  std::memory_order_relaxed);
+    self->host_callback_sync_count_.fetch_add(1, std::memory_order_relaxed);
+    self->host_callback_sync_wait_total_ns_.fetch_add(
+        t1 - t0, std::memory_order_relaxed);
   } else {
     self->task_queue_->sync(args->allow_n_pending);
   }
 }
 
-void CotsSuffixAttentionInfer::RunTaskOnWorker(
+void CotsSuffixAttentionTaskRunner::RunTaskOnWorker(
     std::shared_ptr<SubmittedTask> task) {
   NvtxScope nvtx_scope("cots:suffix_worker");
   struct DonePublisher {
@@ -877,7 +807,7 @@ void CotsSuffixAttentionInfer::RunTaskOnWorker(
     }
   }
   struct WorkerMetricsPublisher {
-    CotsSuffixAttentionInfer* self;
+    CotsSuffixAttentionTaskRunner* self;
     bool diag;
     int64_t worker_t0;
     ~WorkerMetricsPublisher() {
@@ -1092,7 +1022,7 @@ void CotsSuffixAttentionInfer::RunTaskOnWorker(
 }
 
 std::vector<std::pair<std::string, int64_t>>
-CotsSuffixAttentionInfer::get_counters() const {
+CotsSuffixAttentionTaskRunner::get_counters() const {
   auto load = [](const std::atomic<int64_t>& a) {
     return a.load(std::memory_order_relaxed);
   };
@@ -1112,9 +1042,10 @@ CotsSuffixAttentionInfer::get_counters() const {
                    load(dispatch_cb_snapshot_total_ns_));
   out.emplace_back("suffix_dispatch_cb_enqueue_total_ns",
                    load(dispatch_cb_enqueue_total_ns_));
-  out.emplace_back("suffix_legacy_sync_cb_count", load(legacy_sync_cb_count_));
-  out.emplace_back("suffix_legacy_sync_cb_wait_total_ns",
-                   load(legacy_sync_cb_wait_total_ns_));
+  out.emplace_back("suffix_host_callback_sync_count",
+                   load(host_callback_sync_count_));
+  out.emplace_back("suffix_host_callback_sync_wait_total_ns",
+                   load(host_callback_sync_wait_total_ns_));
   out.emplace_back("suffix_wait_kernel_launch_count",
                    load(wait_kernel_launch_count_));
   out.emplace_back("suffix_worker_run_count", load(worker_run_count_));
@@ -1148,7 +1079,7 @@ CotsSuffixAttentionInfer::get_counters() const {
   return out;
 }
 
-void CotsSuffixAttentionInfer::reset_counters() {
+void CotsSuffixAttentionTaskRunner::reset_counters() {
   populate_count_.store(0, std::memory_order_relaxed);
   submit_count_.store(0, std::memory_order_relaxed);
   submit_prepare_total_ns_.store(0, std::memory_order_relaxed);
@@ -1158,8 +1089,8 @@ void CotsSuffixAttentionInfer::reset_counters() {
   dispatch_cb_total_ns_.store(0, std::memory_order_relaxed);
   dispatch_cb_snapshot_total_ns_.store(0, std::memory_order_relaxed);
   dispatch_cb_enqueue_total_ns_.store(0, std::memory_order_relaxed);
-  legacy_sync_cb_count_.store(0, std::memory_order_relaxed);
-  legacy_sync_cb_wait_total_ns_.store(0, std::memory_order_relaxed);
+  host_callback_sync_count_.store(0, std::memory_order_relaxed);
+  host_callback_sync_wait_total_ns_.store(0, std::memory_order_relaxed);
   wait_kernel_launch_count_.store(0, std::memory_order_relaxed);
   worker_run_count_.store(0, std::memory_order_relaxed);
   worker_requested_num_threads_.store(0, std::memory_order_relaxed);
