@@ -116,6 +116,112 @@ __global__ void merge_attn_states_kernel(
   }
 }
 
+template <typename scalar_t, const uint NUM_THREADS>
+__global__ void merge_attn_states_indexed_kernel(
+    scalar_t* output, float* output_lse, const scalar_t* prefix_output,
+    const float* prefix_lse, const scalar_t* suffix_output,
+    const float* suffix_lse, const int64_t* token_indices,
+    const uint num_suffix_tokens, const uint num_prefix_tokens,
+    const uint num_heads, const uint head_size,
+    const int64_t prefix_output_stride0, const int64_t prefix_head_stride,
+    const int64_t suffix_output_stride0, const int64_t suffix_head_stride,
+    const int64_t output_stride0, const int64_t output_head_stride,
+    const int64_t prefix_lse_stride0, const int64_t suffix_lse_stride0,
+    const int64_t output_lse_stride0) {
+  using pack_128b_t = uint4;
+  const uint pack_size = 16 / sizeof(scalar_t);
+  const uint threads_per_head = head_size / pack_size;
+
+  const uint global_idx = blockIdx.x * NUM_THREADS + threadIdx.x;
+  const uint token_head_threads =
+      num_suffix_tokens * num_heads * threads_per_head;
+
+  if (global_idx >= token_head_threads) return;
+
+  const uint token_head_idx = global_idx / threads_per_head;
+  const uint pack_idx = global_idx % threads_per_head;
+
+  const uint token_idx = token_head_idx / num_heads;
+  const uint head_idx = token_head_idx % num_heads;
+  const int64_t dst_token_idx = token_indices[token_idx];
+
+  if (dst_token_idx < 0 ||
+      dst_token_idx >= static_cast<int64_t>(num_prefix_tokens)) {
+    return;
+  }
+
+  const uint pack_offset = pack_idx * pack_size;
+  const int64_t prefix_head_offset =
+      dst_token_idx * prefix_output_stride0 +
+      static_cast<int64_t>(head_idx) * prefix_head_stride;
+  const int64_t suffix_head_offset =
+      static_cast<int64_t>(token_idx) * suffix_output_stride0 +
+      static_cast<int64_t>(head_idx) * suffix_head_stride;
+  const int64_t output_head_offset =
+      dst_token_idx * output_stride0 +
+      static_cast<int64_t>(head_idx) * output_head_stride;
+  const scalar_t* prefix_head_ptr = prefix_output + prefix_head_offset;
+  const scalar_t* suffix_head_ptr = suffix_output + suffix_head_offset;
+  scalar_t* output_head_ptr = output + output_head_offset;
+
+  float p_lse = prefix_lse[static_cast<int64_t>(head_idx) * prefix_lse_stride0 +
+                           dst_token_idx];
+  float s_lse = suffix_lse[static_cast<int64_t>(head_idx) * suffix_lse_stride0 +
+                           token_idx];
+  p_lse = std::isinf(p_lse) ? -std::numeric_limits<float>::infinity() : p_lse;
+  s_lse = std::isinf(s_lse) ? -std::numeric_limits<float>::infinity() : s_lse;
+
+  const float max_lse = fmaxf(p_lse, s_lse);
+
+  if (std::isinf(max_lse)) {
+    if (pack_offset < head_size) {
+      pack_128b_t p_out_pack = reinterpret_cast<const pack_128b_t*>(
+          prefix_head_ptr)[pack_offset / pack_size];
+      reinterpret_cast<pack_128b_t*>(output_head_ptr)[pack_offset / pack_size] =
+          p_out_pack;
+    }
+    if (output_lse != nullptr && pack_idx == 0) {
+      output_lse[static_cast<int64_t>(head_idx) * output_lse_stride0 +
+                 dst_token_idx] = max_lse;
+    }
+    return;
+  }
+
+  p_lse = p_lse - max_lse;
+  s_lse = s_lse - max_lse;
+  const float p_se = expf(p_lse);
+  const float s_se = expf(s_lse);
+  const float out_se = p_se + s_se;
+  const float p_scale = p_se / out_se;
+  const float s_scale = s_se / out_se;
+
+  if (pack_offset < head_size) {
+    pack_128b_t p_out_pack = reinterpret_cast<const pack_128b_t*>(
+        prefix_head_ptr)[pack_offset / pack_size];
+    pack_128b_t s_out_pack = reinterpret_cast<const pack_128b_t*>(
+        suffix_head_ptr)[pack_offset / pack_size];
+    pack_128b_t o_out_pack;
+
+#pragma unroll
+    for (uint i = 0; i < pack_size; ++i) {
+      const float p_out_f =
+          vllm::to_float(reinterpret_cast<const scalar_t*>(&p_out_pack)[i]);
+      const float s_out_f =
+          vllm::to_float(reinterpret_cast<const scalar_t*>(&s_out_pack)[i]);
+      const float o_out_f = p_out_f * p_scale + (s_out_f * s_scale);
+      vllm::from_float(reinterpret_cast<scalar_t*>(&o_out_pack)[i], o_out_f);
+    }
+
+    reinterpret_cast<pack_128b_t*>(output_head_ptr)[pack_offset / pack_size] =
+        o_out_pack;
+  }
+  if (output_lse != nullptr && pack_idx == 0) {
+    const float out_lse = logf(out_se) + max_lse;
+    output_lse[static_cast<int64_t>(head_idx) * output_lse_stride0 +
+               dst_token_idx] = out_lse;
+  }
+}
+
 }  // namespace vllm
 
 // The following macro is used to dispatch the conversion function based on
@@ -144,6 +250,22 @@ __global__ void merge_attn_states_kernel(
             reinterpret_cast<scalar_t*>(suffix_output.data_ptr()),          \
             reinterpret_cast<float*>(suffix_lse.data_ptr()), num_tokens,    \
             num_heads, head_size, prefix_head_stride, output_head_stride);  \
+  }
+
+#define LAUNCH_MERGE_ATTN_STATES_INDEXED(scalar_t, NUM_THREADS)               \
+  {                                                                           \
+    vllm::merge_attn_states_indexed_kernel<scalar_t, NUM_THREADS>             \
+        <<<grid, block, 0, stream>>>(                                         \
+            reinterpret_cast<scalar_t*>(output.data_ptr()), output_lse_ptr,   \
+            reinterpret_cast<scalar_t*>(prefix_output.data_ptr()),            \
+            reinterpret_cast<float*>(prefix_lse.data_ptr()),                  \
+            reinterpret_cast<scalar_t*>(suffix_output.data_ptr()),            \
+            reinterpret_cast<float*>(suffix_lse.data_ptr()),                  \
+            reinterpret_cast<int64_t*>(token_indices.data_ptr()),             \
+            num_suffix_tokens, num_prefix_tokens, num_heads, head_size,       \
+            prefix_output_stride0, prefix_head_stride, suffix_output_stride0, \
+            suffix_head_stride, output_stride0, output_head_stride,           \
+            prefix_lse_stride0, suffix_lse_stride0, output_lse_stride0);      \
   }
 
 /*@brief Merges the attention states from prefix and suffix
@@ -206,4 +328,92 @@ void merge_attn_states(torch::Tensor& output,
                        const torch::Tensor& suffix_output,
                        const torch::Tensor& suffix_lse) {
   DISPATCH_BY_SCALAR_DTYPE(output.dtype(), CALL_MERGE_ATTN_STATES_LAUNCHER);
+}
+
+template <typename scalar_t>
+void merge_attn_states_indexed_launcher(torch::Tensor& output,
+                                        std::optional<torch::Tensor> output_lse,
+                                        const torch::Tensor& prefix_output,
+                                        const torch::Tensor& prefix_lse,
+                                        const torch::Tensor& suffix_output,
+                                        const torch::Tensor& suffix_lse,
+                                        const torch::Tensor& token_indices) {
+  constexpr uint NUM_THREADS = 128;
+  const uint num_prefix_tokens = prefix_output.size(0);
+  const uint num_suffix_tokens = suffix_output.size(0);
+  const uint num_heads = output.size(1);
+  const uint head_size = output.size(2);
+  const uint pack_size = 16 / sizeof(scalar_t);
+  TORCH_CHECK(head_size % pack_size == 0,
+              "headsize must be multiple of pack_size:", pack_size);
+  TORCH_CHECK(token_indices.scalar_type() == at::ScalarType::Long,
+              "token_indices must be int64");
+  TORCH_CHECK(token_indices.dim() == 1,
+              "token_indices must be one-dimensional");
+  TORCH_CHECK(token_indices.size(0) == suffix_output.size(0),
+              "token_indices length must match suffix tokens");
+  TORCH_CHECK(prefix_output.size(1) == output.size(1),
+              "prefix/output head count mismatch");
+  TORCH_CHECK(suffix_output.size(1) == output.size(1),
+              "suffix/output head count mismatch");
+  TORCH_CHECK(prefix_output.size(2) == output.size(2),
+              "prefix/output head size mismatch");
+  TORCH_CHECK(suffix_output.size(2) == output.size(2),
+              "suffix/output head size mismatch");
+  TORCH_CHECK(prefix_lse.size(0) == output.size(1),
+              "prefix_lse head count mismatch");
+  TORCH_CHECK(prefix_lse.size(1) == prefix_output.size(0),
+              "prefix_lse token count mismatch");
+  TORCH_CHECK(suffix_lse.size(0) == output.size(1),
+              "suffix_lse head count mismatch");
+  TORCH_CHECK(suffix_lse.size(1) == suffix_output.size(0),
+              "suffix_lse token count mismatch");
+
+  float* output_lse_ptr = nullptr;
+  int64_t output_lse_stride0 = 0;
+  if (output_lse.has_value()) {
+    output_lse_ptr = output_lse.value().data_ptr<float>();
+    output_lse_stride0 = output_lse.value().stride(0);
+    TORCH_CHECK(output_lse.value().size(0) == output.size(1),
+                "output_lse head count mismatch");
+    TORCH_CHECK(output_lse.value().size(1) == prefix_output.size(0),
+                "output_lse token count mismatch");
+  }
+  const int64_t prefix_output_stride0 = prefix_output.stride(0);
+  const int64_t prefix_head_stride = prefix_output.stride(1);
+  const int64_t suffix_output_stride0 = suffix_output.stride(0);
+  const int64_t suffix_head_stride = suffix_output.stride(1);
+  const int64_t output_stride0 = output.stride(0);
+  const int64_t output_head_stride = output.stride(1);
+  const int64_t prefix_lse_stride0 = prefix_lse.stride(0);
+  const int64_t suffix_lse_stride0 = suffix_lse.stride(0);
+
+  const uint threads_per_head = head_size / pack_size;
+  const uint total_threads = num_suffix_tokens * num_heads * threads_per_head;
+
+  dim3 block(NUM_THREADS);
+  dim3 grid((total_threads + NUM_THREADS - 1) / NUM_THREADS);
+
+  const c10::cuda::OptionalCUDAGuard device_guard(prefix_output.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  LAUNCH_MERGE_ATTN_STATES_INDEXED(scalar_t, NUM_THREADS);
+}
+
+#define CALL_MERGE_ATTN_STATES_INDEXED_LAUNCHER(scalar_t)             \
+  {                                                                   \
+    merge_attn_states_indexed_launcher<scalar_t>(                     \
+        output, output_lse, prefix_output, prefix_lse, suffix_output, \
+        suffix_lse, token_indices);                                   \
+  }
+
+void merge_attn_states_indexed(torch::Tensor& output,
+                               std::optional<torch::Tensor> output_lse,
+                               const torch::Tensor& prefix_output,
+                               const torch::Tensor& prefix_lse,
+                               const torch::Tensor& suffix_output,
+                               const torch::Tensor& suffix_lse,
+                               const torch::Tensor& token_indices) {
+  DISPATCH_BY_SCALAR_DTYPE(output.dtype(),
+                           CALL_MERGE_ATTN_STATES_INDEXED_LAUNCHER);
 }

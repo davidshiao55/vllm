@@ -248,10 +248,6 @@ class Scheduler(SchedulerInterface):
                 else 0
             ),
         )
-        self.cots_hybrid_suffix_active_admission_pause = (
-            envs.VLLM_COTS_HYBRID_SUFFIX_ACTIVE_ADMISSION_PAUSE
-            and self.kv_cache_manager.cots_hybrid_kv_enabled
-        )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None and hasattr(
@@ -362,19 +358,6 @@ class Scheduler(SchedulerInterface):
                 # prefill the last few tokens
                 pass
         return num_new_tokens
-
-    def _cots_hybrid_should_pause_waiting_admission(
-        self, scheduled_running_reqs: list[Request]
-    ) -> bool:
-        if not self.cots_hybrid_suffix_active_admission_pause:
-            return False
-        split_tokens = self.kv_cache_manager.cots_kv_split_tokens
-        if split_tokens <= 0:
-            return False
-        return any(
-            request.num_computed_tokens >= split_tokens
-            for request in scheduled_running_reqs
-        )
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -592,14 +575,7 @@ class Scheduler(SchedulerInterface):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         # Next, schedule the WAITING requests.
-        pause_waiting_for_cots_suffix = (
-            self._cots_hybrid_should_pause_waiting_admission(scheduled_running_reqs)
-        )
-        if (
-            not pause_waiting_for_cots_suffix
-            and not preempted_reqs
-            and self._pause_state == PauseState.UNPAUSED
-        ):
+        if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:

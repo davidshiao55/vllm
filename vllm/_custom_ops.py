@@ -270,6 +270,26 @@ def merge_attn_states(
     )
 
 
+def merge_attn_states_indexed(
+    output: torch.Tensor,
+    prefix_output: torch.Tensor,
+    prefix_lse: torch.Tensor,
+    suffix_output: torch.Tensor,
+    suffix_lse: torch.Tensor,
+    token_indices: torch.Tensor,
+    output_lse: torch.Tensor | None = None,
+) -> None:
+    torch.ops._C.merge_attn_states_indexed(
+        output,
+        output_lse,
+        prefix_output,
+        prefix_lse,
+        suffix_output,
+        suffix_lse,
+        token_indices,
+    )
+
+
 def convert_vertical_slash_indexes(
     q_seqlens: torch.Tensor,  # [BATCH, ]
     kv_seqlens: torch.Tensor,  # [BATCH, ]

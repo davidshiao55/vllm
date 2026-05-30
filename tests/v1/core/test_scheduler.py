@@ -710,53 +710,6 @@ def test_cots_hybrid_suffix_decode_can_mix_waiting_prefill():
     assert len(scheduler.waiting) == 0
 
 
-def test_cots_hybrid_suffix_admission_pause_blocks_waiting_prefill(monkeypatch):
-    monkeypatch.setenv("VLLM_COTS_HYBRID_SUFFIX_ACTIVE_ADMISSION_PAUSE", "1")
-    scheduler = create_scheduler(
-        max_num_batched_tokens=16,
-        max_num_seqs=4,
-        block_size=4,
-        max_model_len=16,
-        enforce_eager=True,
-        offload_config=OffloadConfig(
-            offload_backend="cots",
-            cots=CotsOffloadConfig(
-                kv_split_blocks=1,
-                kv_cpu_pool_bytes=16352,
-            ),
-        ),
-    )
-    running_req, waiting_req = create_requests(
-        num_requests=2,
-        num_tokens=4,
-        max_tokens=2,
-    )
-
-    scheduler.add_request(running_req)
-    prefill_output = scheduler.schedule()
-    scheduler.update_from_output(
-        prefill_output,
-        ModelRunnerOutput(
-            req_ids=[running_req.request_id],
-            req_id_to_index={running_req.request_id: 0},
-            sampled_token_ids=[[0]],
-            logprobs=None,
-            prompt_logprobs_dict={},
-            pooler_output=[],
-        ),
-    )
-    assert running_req.num_computed_tokens == 4
-
-    scheduler.add_request(waiting_req)
-    decode_output = scheduler.schedule()
-
-    assert decode_output.scheduled_new_reqs == []
-    assert decode_output.scheduled_cached_reqs.req_ids == [running_req.request_id]
-    assert decode_output.num_scheduled_tokens == {running_req.request_id: 1}
-    assert len(scheduler.waiting) == 1
-    assert scheduler.waiting.peek_request() is waiting_req
-
-
 @pytest.mark.parametrize("enable_chunked_prefill", [True, False])
 def test_schedule_order(enable_chunked_prefill: bool):
     scheduler = create_scheduler(

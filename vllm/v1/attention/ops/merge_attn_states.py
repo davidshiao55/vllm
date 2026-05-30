@@ -38,3 +38,53 @@ def merge_attn_states(
         return merge_attn_states(
             output, prefix_output, prefix_lse, suffix_output, suffix_lse, output_lse
         )
+
+
+def merge_attn_states_indexed(
+    output: torch.Tensor,
+    prefix_output: torch.Tensor,
+    prefix_lse: torch.Tensor,
+    suffix_output: torch.Tensor,
+    suffix_lse: torch.Tensor,
+    token_indices: torch.Tensor,
+    output_lse: torch.Tensor | None = None,
+) -> None:
+    if (
+        _merge_attn_supported(output)
+        and token_indices.is_cuda
+        and token_indices.dtype == torch.long
+    ):
+        from vllm._custom_ops import (
+            merge_attn_states_indexed as merge_attn_states_indexed_cuda,
+        )
+
+        return merge_attn_states_indexed_cuda(
+            output,
+            prefix_output,
+            prefix_lse,
+            suffix_output,
+            suffix_lse,
+            token_indices,
+            output_lse,
+        )
+
+    if token_indices.device != prefix_output.device:
+        token_indices = token_indices.to(device=prefix_output.device, non_blocking=True)
+    compact_prefix_output = prefix_output.index_select(0, token_indices)
+    compact_prefix_lse = prefix_lse.index_select(1, token_indices)
+    compact_output = torch.empty_like(suffix_output)
+    compact_output_lse = (
+        torch.empty_like(suffix_lse) if output_lse is not None else None
+    )
+    merge_attn_states(
+        compact_output,
+        compact_prefix_output,
+        compact_prefix_lse,
+        suffix_output,
+        suffix_lse,
+        compact_output_lse,
+    )
+    output.index_copy_(0, token_indices, compact_output)
+    if output_lse is not None:
+        assert compact_output_lse is not None
+        output_lse.index_copy_(1, token_indices, compact_output_lse)
