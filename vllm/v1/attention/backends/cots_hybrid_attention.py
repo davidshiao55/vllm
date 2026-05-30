@@ -897,36 +897,45 @@ def cots_hybrid_decode_attention(
         output = torch.empty_like(query)
 
     batch = query.shape[0]
-    block_size = gpu_key_cache.shape[-3]
-    prefix_len = hybrid_metadata.split_blocks * block_size
     device = query.device
+    if (precomputed_prefix_out is None) != (precomputed_prefix_lse is None):
+        raise ValueError("precomputed prefix output and LSE must be provided together")
+    has_precomputed_prefix = precomputed_prefix_out is not None
 
-    if gpu_block_table.shape[0] != batch:
-        req_indices_gpu = hybrid_metadata.req_indices_gpu
-        if req_indices_gpu is None:
+    prefix_len = None
+    cu_query_lens = None
+    prefix_kv_lens = None
+    if not has_precomputed_prefix:
+        block_size = gpu_key_cache.shape[-3]
+        prefix_len = hybrid_metadata.split_blocks * block_size
+        if gpu_block_table.shape[0] != batch:
+            req_indices_gpu = hybrid_metadata.req_indices_gpu
+            if req_indices_gpu is None:
+                raise ValueError(
+                    "gpu_block_table batch dimension must match query batch when "
+                    "no active request indices are provided: "
+                    f"{gpu_block_table.shape[0]} vs {batch}"
+                )
+            gpu_block_table = gpu_block_table.index_select(0, req_indices_gpu[:batch])
+        if gpu_block_table.shape[1] < hybrid_metadata.split_blocks:
             raise ValueError(
-                "gpu_block_table batch dimension must match query batch when "
-                "no active request indices are provided: "
-                f"{gpu_block_table.shape[0]} vs {batch}"
+                "gpu_block_table does not contain enough prefix blocks: "
+                f"{gpu_block_table.shape[1]} < {hybrid_metadata.split_blocks}"
             )
-        gpu_block_table = gpu_block_table.index_select(0, req_indices_gpu[:batch])
-    if gpu_block_table.shape[1] < hybrid_metadata.split_blocks:
-        raise ValueError(
-            "gpu_block_table does not contain enough prefix blocks: "
-            f"{gpu_block_table.shape[1]} < {hybrid_metadata.split_blocks}"
+        cu_query_lens = torch.arange(batch + 1, dtype=torch.int32, device=device)
+        prefix_kv_lens = torch.full(
+            (batch,), prefix_len, dtype=torch.int32, device=device
         )
     if hybrid_metadata.cpu_seq_lens.shape[0] != batch:
         raise ValueError("cpu_seq_lens batch dimension must match query")
-    cu_query_lens = torch.arange(batch + 1, dtype=torch.int32, device=device)
-    prefix_kv_lens = torch.full((batch,), prefix_len, dtype=torch.int32, device=device)
 
     cuda_timing = (
-        precomputed_prefix_out is None
+        not has_precomputed_prefix
         and hybrid_metadata.metrics is not None
         and _cuda_event_timing_enabled()
         and torch.cuda.is_available()
     )
-    current_stream = torch.cuda.current_stream(device)
+    current_stream = torch.cuda.current_stream(device) if cuda_timing else None
     prefix_start = prefix_end = None
     if cuda_timing:
         prefix_start, prefix_end = _make_cuda_timing_events()
@@ -1095,7 +1104,7 @@ def cots_hybrid_decode_attention(
     early_suffix_state = None
     early_suffix_submit = (
         _early_suffix_submit_enabled()
-        and precomputed_prefix_out is None
+        and not has_precomputed_prefix
         and hybrid_metadata.suffix_attention_runner is not None
         and hybrid_metadata.suffix_attention_runner.kind == "native_prepared"
         and hybrid_metadata.staged_query_valid
@@ -1106,8 +1115,6 @@ def cots_hybrid_decode_attention(
     if early_suffix_submit:
         early_suffix_state = _prepare_and_submit_suffix(sync_after_submit=False)
 
-    if (precomputed_prefix_out is None) != (precomputed_prefix_lse is None):
-        raise ValueError("precomputed prefix output and LSE must be provided together")
     if precomputed_prefix_out is not None:
         assert precomputed_prefix_lse is not None
         prefix_out = precomputed_prefix_out
@@ -1129,8 +1136,12 @@ def cots_hybrid_decode_attention(
             )
     else:
         if cuda_timing:
+            assert current_stream is not None
             assert prefix_start is not None
             prefix_start.record(current_stream)
+        assert prefix_len is not None
+        assert cu_query_lens is not None
+        assert prefix_kv_lens is not None
         descale_shape = (batch, gpu_key_cache.shape[-2])
         prefix_out, prefix_lse = flash_attn_varlen_func(
             q=query,
@@ -1158,6 +1169,7 @@ def cots_hybrid_decode_attention(
             num_splits=1,
         )
     if cuda_timing:
+        assert current_stream is not None
         assert prefix_end is not None
         prefix_end.record(current_stream)
 
@@ -1202,6 +1214,7 @@ def cots_hybrid_decode_attention(
     suffix_lse_gpu = get_accelerator_view_from_cpu_tensor(suffix_lse_cpu)
     merge_start = merge_end = None
     if cuda_timing:
+        assert current_stream is not None
         merge_start, merge_end = _make_cuda_timing_events()
         merge_start.record(current_stream)
     merge_attn_states(
