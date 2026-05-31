@@ -357,7 +357,7 @@ class CotsHybridKVStore:
             # publish scatter separately.
             self.set_live_counts(suffix_rows, suffix_rows)
 
-    def free_request(self, req_id: str) -> None:
+    def invalidate_common_metadata_cache(self) -> None:
         # CPU block ownership lives in the scheduler/KV manager. The worker only
         # drops cached metadata that may reference old physical CPU block IDs.
         self._common_cache_key = None
@@ -444,12 +444,6 @@ class CotsHybridKVStore:
         stats.suffix_worker_zero_live_count += counters.get(
             "suffix_worker_zero_live_count", 0
         )
-
-    def _suffix_len(self, seq_len: int) -> int:
-        return max(int(seq_len) - self.split_tokens, 0)
-
-    def _suffix_blocks(self, seq_len: int) -> int:
-        return cdiv(self._suffix_len(seq_len), self.block_size)
 
     def _synchronize_static_metadata_reuse(self) -> None:
         if not (self.pin_memory and torch.cuda.is_available()):

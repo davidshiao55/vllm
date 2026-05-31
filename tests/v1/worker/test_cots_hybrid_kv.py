@@ -271,7 +271,7 @@ def test_cots_hybrid_store_splits_chunks_that_cross_split() -> None:
     assert metadata_l1.scatter_source_indices_gpu is metadata.scatter_source_indices_gpu
 
 
-def test_cots_hybrid_store_free_request_clears_cached_metadata() -> None:
+def test_cots_hybrid_store_invalidates_common_metadata_cache() -> None:
     store = _make_store()
     metadata = store.build_decode_metadata(
         layer_name="layer.0.attn",
@@ -286,7 +286,7 @@ def test_cots_hybrid_store_free_request_clears_cached_metadata() -> None:
 
     assert metadata is not None
     assert store._common_cache_key is not None
-    store.free_request("a")
+    store.invalidate_common_metadata_cache()
     assert store._common_cache_key is None
 
 

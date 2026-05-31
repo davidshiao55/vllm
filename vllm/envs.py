@@ -731,12 +731,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_COTS_HYBRID_SUBMIT_TIMING", "0"
     )
     == "1",
+    "VLLM_COTS_HYBRID_ENGINE_TIMING": lambda: os.getenv(
+        "VLLM_COTS_HYBRID_ENGINE_TIMING", "0"
+    )
+    == "1",
     "VLLM_COTS_HYBRID_COALESCED_PREFIX": lambda: os.getenv(
         "VLLM_COTS_HYBRID_COALESCED_PREFIX", "1"
     )
     .strip()
     .lower()
     not in ("0", "false", "off"),
+    "VLLM_COTS_RESET_COUNTERS_AFTER_CUDAGRAPH_CAPTURE": lambda: os.getenv(
+        "VLLM_COTS_RESET_COUNTERS_AFTER_CUDAGRAPH_CAPTURE", "0"
+    )
+    == "1",
     # If set, vllm will use flashinfer sampler
     "VLLM_USE_FLASHINFER_SAMPLER": lambda: bool(
         int(os.environ["VLLM_USE_FLASHINFER_SAMPLER"])

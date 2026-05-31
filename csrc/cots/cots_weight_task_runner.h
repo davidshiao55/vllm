@@ -5,9 +5,8 @@
 // CPU backend with WorkerPool removed (oneDNN/ATen own intra-op threading) and
 // a slab-based task dispatch added.
 //
-// See David/Docs/implementation_roadmap.md Phase 1c, the approved plan
-// at /root/.claude/plans/pleaes-implement-phase1c-in-quizzical-mist.md,
-// and David/Docs/phase1a_findings.md §1.14 for the substrate motivation.
+// See David/Docs/implementation_roadmap.md Phase 1c and
+// David/Docs/phase1a_findings.md §1.14 for the substrate motivation.
 
 #ifndef VLLM_COTS_WEIGHT_TASK_RUNNER_H_
 #define VLLM_COTS_WEIGHT_TASK_RUNNER_H_
@@ -205,13 +204,9 @@ class CotsWeightTaskRunner {
   // is strictly ordered behind the copy. `x_stride1 == 1` is
   // required (no transposed-stride layouts in production decode).
   //
-  // The Python custom-op `vllm.cots_submit_gemm` (registered in
-  // vllm/model_executor/offloader/cots_ops.py) translates to a call
-  // here with `stream = c10::cuda::getCurrentCUDAStream()`,
-  // `x_gpu_ptr = x_gpu.data_ptr()`, and the shape/stride metadata
-  // pulled off the tensor. The torch.ops schema stays
-  // `(x_gpu, runner_id, task_id, num_tokens)` — Inductor only sees
-  // CUDA tensors + scalar ids.
+  // The Python custom-op `vllm.cots_submit_gemm` passes layer/op routing
+  // scalars plus tensor shape/stride metadata. Inductor only sees CUDA
+  // tensors and scalar ids; this method receives the resolved native task id.
   void submit_on_stream(int64_t task_id, int32_t num_tokens,
                         uintptr_t x_gpu_ptr, int64_t x_cols, int64_t x_stride0,
                         int64_t x_stride1, uintptr_t cuda_stream);
@@ -241,10 +236,10 @@ class CotsWeightTaskRunner {
 
   // Bucket-aware thread policy hook. Sets the worker thread's CPU affinity
   // to `cpu_set` (a bitmask of CPU IDs packed into uint64; bit i set =>
-  // CPU i is allowed). cpu_set == 0 means clear affinity. Intersect with
-  // sched_getaffinity at call time to avoid EINVAL when running under a
-  // restrictive cgroup. uint64 (not int64) so cpu_id 63 is representable
-  // — `int64_t{1} << 63` is signed-shift UB.
+  // CPU i is allowed). cpu_set == 0 means leave the kernel default unchanged.
+  // Intersect with sched_getaffinity at call time to avoid EINVAL when running
+  // under a restrictive cgroup. uint64 (not int64) so cpu_id 63 is
+  // representable — `int64_t{1} << 63` is signed-shift UB.
   void set_worker_affinity(uint64_t cpu_set);
 
   // Test helper: read whether the worker has set num_threads to the value

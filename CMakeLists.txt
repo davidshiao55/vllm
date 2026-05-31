@@ -1015,8 +1015,7 @@ endif()
 # sync uses a small CUDA kernel. ROCm/HIP have different host-callback
 # and stream-wait APIs and are out of current thesis scope. Gate the whole
 # extension on VLLM_GPU_LANG == "CUDA" so ROCm builds skip it cleanly. See
-# David/Docs/implementation_roadmap.md Phase 1c and the approved plan
-# at /root/.claude/plans/pleaes-implement-phase1c-in-quizzical-mist.md.
+# David/Docs/implementation_roadmap.md Phase 1c.
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
   set(VLLM_COTS_EXT_SRC

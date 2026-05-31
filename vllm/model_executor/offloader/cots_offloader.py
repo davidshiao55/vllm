@@ -83,20 +83,9 @@ class CotsOffloader(BaseOffloader):
                 f"f_prefetch ({self.f_prefetch}) must be <= "
                 f"f_cpu_store ({self.f_cpu_store})"
             )
-        # Only touch the process-wide PyTorch thread count when we actually
-        # offload — `--cots-f-cpu-store=0` should be a clean control with
-        # no side effects on CPU thread behavior. See `phase1a_findings.md
-        # §1.14`'s dryrun-vs-none baseline.
-        #
-        # §1c.21 review fix: gate this to PythonCotsWeightRunner. The native
-        # runner's thread policy lives inside the C++ worker via the
-        # per-slab `n_threads` field (§1c.8) — applying a global
-        # `torch.set_num_threads` for the native path leaks oneDNN /
-        # main-thread settings into Inductor's compiled forward and was
-        # implicated as a possible contributor to the native+capture orch
-        # regression. Python runner still uses the global because its
-        # callbacks run on `at::linear` from `_get_executor()`'s thread
-        # pool, which inherits `set_num_threads` semantics.
+        # Only the Python runner uses process-wide PyTorch thread count. The
+        # native runner carries per-bucket thread policy on each C++ slab, and
+        # `f_cpu_store=0` should remain a no-side-effect control.
         if self.f_cpu_store > 0.0 and config.cpu_runner == "python":
             torch.set_num_threads(int(config.cpu_num_threads))
 
@@ -134,27 +123,14 @@ class CotsOffloader(BaseOffloader):
         self._prefetch_buffer_pool: CotsPrefetchBufferPool | None = None
         self._streamer: WeightPrefetchStreamer | None = None
 
-        # Phase 1c: one offloader-owned runner shared across all operator
-        # call sites (Stage 2 installer refactor — replaces the Phase
-        # 1a/1b pattern of fresh Python runner instances per op). The factory
-        # selects PythonCotsWeightRunner / NativeCotsWeightRunner from
-        # `config.cpu_runner`. See `_make_runner` and the runner classes
-        # above. Only constructed when COTS is actually offloading
-        # (`f_cpu_store > 0`); the no-offload path leaves it None to
-        # avoid spinning up a worker thread for a no-op session.
-        # Stage 3 dropped the Stage-2 native rejection — operators now
-        # flip to the uniform facade and either runner runs end-to-end.
+        # One offloader-owned runner is shared across all operator call sites.
+        # The no-offload path leaves it unset to avoid starting a worker thread.
         self._runner: PythonCotsWeightRunner | NativeCotsWeightRunner | None = None
         if self.f_cpu_store > 0.0:
             self._runner = _make_runner(config)
 
-        # Phase 1c: active-bucket lives on the offloader, not the
-        # streamer (plan §design-decision 11). `prepare_before_forward`
-        # always sets `_current_bucket` regardless of streamer presence
-        # so the operator slab/closure lookup never sees `bucket=None`
-        # at `f_prefetch=0`. The first-decoder pre-hook is installed
-        # unconditionally when COTS is active (see
-        # `_install_bucket_prehook`), independent of prefetch.
+        # Active bucket is set out-of-graph by `on_dispatch` before operators
+        # run. This stays valid even when prefetch is disabled.
         self._current_bucket: int | None = None
         # Two distinct dummy CUDA anchors for the cots_sync_then_uva
         # custom op's mutates_args=["y_gpu", "gpu_anchor_a",
@@ -232,18 +208,6 @@ class CotsOffloader(BaseOffloader):
         # f_prefetch == 0.
         if any(h.max_n_prefetch > 0 for h in self._handles):
             self._install_prefetch_machinery()
-        # NOTE: the in-graph pre-hook used to set `_current_bucket` via
-        # `anchor.shape[0]` (the persistent input buffer under FULL
-        # CUDA Graph capture). Under fullgraph trace it clobbered the
-        # OOG bucket set by the model runner and saturated the
-        # bucket key to the largest captured size. The replacement is
-        # `on_dispatch`, called OOG per-forward from the active
-        # model-runner path and from the older cudagraph utility path.
-        # `prepare_before_forward` is kept as the offloader-local
-        # bucket/slot repair primitive — only the pre-hook registration
-        # is removed. See bucket-key-fix discussion.
-        # self._install_bucket_prehook()  # DISABLED — see comment above
-
         logger.debug(
             "CotsOffloader: wrapped %d linear modules and %d fused MLP blocks "
             "(f_cpu_store=%.4f, f_prefetch=%.4f, kv_biased=%s, "
@@ -316,11 +280,7 @@ class CotsOffloader(BaseOffloader):
     # --- Pass 2a: QKV operator install ---
 
     def _install_qkv_ops(self, handles: list[CotsLinearHandle]) -> None:
-        # Phase 1c installer refactor: operators share the offloader's
-        # single runner (constructed once in __init__). Phase 1a/1b
-        # constructed a fresh Python runner per op; that pattern is
-        # incompatible with Stage 3's per-offloader slab pool +
-        # runner_id design.
+        # Operators share the offloader-owned runner constructed in __init__.
         assert self._runner is not None, (
             "_install_qkv_ops called with f_cpu_store=0 — runner not constructed"
         )
@@ -478,21 +438,12 @@ class CotsOffloader(BaseOffloader):
             self._dispatch_table = {b: pair for b in self._capture_buckets}
 
     def _install_prefetch_machinery(self) -> None:
-        """Phase 1b: allocate buffer pool, stamp slot indices, allocate
-        streamer, install layer-level forward hooks, register first-decoder
-        pre-hook for bucket caching + layer-0 repair."""
+        """Allocate prefetch buffers and install layer-level prefetch hooks."""
         device = torch.device("cuda")
         self._prefetch_buffer_pool = CotsPrefetchBufferPool(self._handles, device)
         for h in self._handles:
             if h.layer_idx >= 0:
                 h.slot_idx = h.layer_idx % CotsPrefetchBufferPool.K
-
-        # Stage 7-C: dropped the `w_row_prefetch_src_t` duplicate
-        # allocation. The unified transposed-storage `w_cpu` (allocated
-        # in `CotsLinearHandle.install()` for row-handle as
-        # `(n_cpu, out_dim)`) IS the contiguous prefetch source — no
-        # second buffer needed. Saves ~max_n_prefetch * out_dim * 2
-        # bytes pinned per row-handle.
 
         n_layers = len(self._layer_modules)
         self._streamer = WeightPrefetchStreamer(
@@ -504,7 +455,7 @@ class CotsOffloader(BaseOffloader):
         for i, layer in enumerate(self._layer_modules):
             self._hook_layer_forward(i, layer)
 
-    # --- Phase 1c Stage 3: runner install (closures / slab specs) -----
+    # --- Runner install (closures / slab specs) -----
 
     @staticmethod
     def _make_qkv_python_callback(w_cpu: torch.Tensor) -> PyCotsWeightCallback:
@@ -527,15 +478,10 @@ class CotsOffloader(BaseOffloader):
         w_gate: torch.Tensor, w_up: torch.Tensor, w_down: torch.Tensor
     ) -> PyCotsWeightCallback:
         """Closure for the fused MLP block (gate + up + silu*up + down).
-        Encapsulates the fused MLP block (gate + up + silu*up + down)
-        with weights captured at install time so the operator-side call
-        only carries x_pinned/y_pinned views.
 
-        Stage 7-C: `w_down` is now Stage 7-C's transposed-storage view
-        `(dn_n_cpu, out_dim) = (K, N)` row-major contig — passed to
-        `torch.matmul` directly (the GEMM is `y = z @ w_down`, no
-        F.linear-style implicit `.T`). gate / up stay on F.linear
-        because they use the PyTorch-natural `(out, in)` layout.
+        `w_down` is the row-major `(K, N)` CPU-compute slice, so it is passed
+        directly to `torch.matmul`. Gate/up use the PyTorch-natural `(out, in)`
+        layout and stay on `F.linear`.
         """
 
         def cb(
@@ -590,10 +536,6 @@ class CotsOffloader(BaseOffloader):
                     n_cpu_per_half_total + n_pref_per_half : 2 * n_cpu_per_half_total,
                     :,
                 ]
-                # Stage 7-C: `dn_h.w_cpu` is now (n_cpu, out_dim) row-major.
-                # The CPU-compute slice is rows `[dn_n_pref, dn_n_pref+dn_n_cpu)`
-                # → contiguous `(dn_n_cpu, out_dim)` = `(K, N)` view for the
-                # transposed-storage kernel path.
                 w_down_view = dn_h.w_cpu.narrow(0, dn_n_pref, dn_n_cpu)
                 callbacks[(gu_h.layer_idx, bucket, "mlp_block")] = (
                     self._make_mlp_python_callback(w_gate_view, w_up_view, w_down_view)
@@ -603,13 +545,9 @@ class CotsOffloader(BaseOffloader):
     def _n_threads_for(self, bucket: int) -> int:
         """Resolve the CPU GEMM thread count for a given bucket.
 
-        Phase 1c Stage 4: when `config.cpu_num_threads_by_bucket` is
-        set, look up the bucket; missing keys fall back to the scalar
-        `cpu_num_threads` (the Planner is allowed to specify only the
-        buckets it has profile data for; uncovered buckets get the
-        scalar default rather than failing). When the dict is None
-        (default), every bucket uses the scalar `cpu_num_threads` —
-        Phase 1a/1b behavior, no per-bucket variation.
+        When `config.cpu_num_threads_by_bucket` is set, missing buckets fall
+        back to the scalar `cpu_num_threads`. The Planner may specify only
+        buckets it has profile data for.
 
         Validation lives in `_validate_thread_policy` because
         `_capture_buckets` is not known until `_resolve_capture_buckets`
@@ -681,7 +619,7 @@ class CotsOffloader(BaseOffloader):
         slabs additionally carry strides reflecting the source tensor.
         Each slab's `n_threads` is per-bucket via `_n_threads_for` so
         the C++ worker dispatcher's cache-guarded `at::set_num_threads`
-        picks up Stage 4's per-`BatchDescriptor` policy.
+        picks up the per-`BatchDescriptor` policy.
         """
         assert self._x_pinned is not None
         assert self._y_pinned is not None
@@ -728,11 +666,6 @@ class CotsOffloader(BaseOffloader):
                     n_cpu_per_half_total + n_pref_per_half : 2 * n_cpu_per_half_total,
                     :,
                 ]
-                # Stage 7-C: `dn_h.w_cpu` is (n_cpu_total, out_dim);
-                # narrow on dim 0 yields a contiguous (dn_n_cpu, out_dim)
-                # = (K, N) view feedable to the transposed-storage kernel.
-                #   w_down_rows = K (= dn_n_cpu)
-                #   w_down_cols = N (= out_dim)
                 w_down_view = dn_h.w_cpu.narrow(0, dn_n_pref, dn_n_cpu)
                 specs.append(
                     _NativeWeightSlabSpecMlp(
@@ -760,9 +693,8 @@ class CotsOffloader(BaseOffloader):
         but post_init is the natural ordering point)."""
         if self._runner is None or not self._handles or not self._has_cpu_compute_work:
             return
-        # Stage 4: validate per-bucket thread policy keys before
-        # building specs so a Planner-mistyped bucket fails loudly at
-        # install instead of silently falling back to scalar.
+        # Validate per-bucket thread policy keys before building specs so a
+        # Planner-mistyped bucket fails loudly at install.
         self._validate_thread_policy()
         if isinstance(self._runner, PythonCotsWeightRunner):
             callbacks = self._build_python_callbacks()
@@ -775,14 +707,8 @@ class CotsOffloader(BaseOffloader):
                 slab_specs=slab_specs,
                 max_num_tokens=int(self._max_num_tokens),
             )
-            # Stage 4: optional worker-thread CPU affinity. The C++
-            # `set_worker_affinity` packs cpu IDs into a uint64 bitmask,
-            # intersects with the process's `sched_getaffinity` mask,
-            # and warns-and-skips on empty intersection. None / empty
-            # list means "no opinion" — leave the kernel default.
-            # §1c.19: routed through the cots_ops registry helper so
-            # the offloader doesn't need to dereference
-            # `runner._infer` (which no longer exists on the runner).
+            # Optional worker-thread CPU affinity. None / empty list means
+            # "no opinion" and leaves the kernel default unchanged.
             cpu_affinity = getattr(self.config, "cpu_worker_affinity", None)
             if cpu_affinity:
                 from vllm.model_executor.offloader import cots_ops
@@ -796,23 +722,6 @@ class CotsOffloader(BaseOffloader):
                         )
                     mask |= 1 << int(cpu_id)
                 cots_ops.set_worker_affinity(self._runner._runner_id, mask)
-
-    def _install_bucket_prehook(self) -> None:
-        """Phase 1c (Stage 3): install the first-decoder pre-hook
-        UNCONDITIONALLY whenever COTS has handles, not gated on
-        prefetch. The pre-hook calls `prepare_before_forward` which now
-        always sets `_current_bucket` (plan §design-decision 11). Under
-        `f_prefetch=0` (no streamer) this is the only path that sets
-        `_current_bucket` under eager mode — without it, the operator's
-        slab lookup would see `bucket=None`. Kept only as historical
-        kill-switch scaffolding; production dispatch uses `on_dispatch`
-        outside the captured graph.
-        """
-        if not self._layer_modules:
-            return
-        self._layer_modules[0].register_forward_pre_hook(
-            self._first_decoder_pre_hook, with_kwargs=True
-        )
 
     def _hook_layer_forward(self, index: int, layer: nn.Module) -> None:
         """Wrap the decoder layer's `forward` with pre-compute scheduling.
@@ -848,44 +757,15 @@ class CotsOffloader(BaseOffloader):
 
         layer.forward = forward
 
-    def _first_decoder_pre_hook(self, module, args, kwargs):
-        """Fires at the start of every model forward. Sets the active
-        bucket and repairs layer 0's slot if it's underfilled relative to
-        the active bucket.
-
-        Invariant: this hook is traced into the captured graph under
-        `torch.compile(fullgraph=True)`, so the call chain
-        (`prepare_before_forward` → `_bucket_for`) must stay
-        Dynamo-traceable. `_bucket_for` uses a linear scan over the
-        capture buckets (treated as a constant by Dynamo and unrolled
-        at trace time) rather than `bisect.bisect_left` (a C builtin
-        Dynamo cannot trace). Resolved as §1c.18 — see
-        `phase1c_findings.md` for the history.
-
-        Layer 0 is the only slot consumed before the current forward can
-        issue a prefetch for it; all other layers are prefetched by their
-        predecessor's pre-compute hook. The same repair is called at the
-        Phase 1c FULL CUDA graph boundary.
-        """
-        del module
-        anchor = args[0] if args else next(iter(kwargs.values()))
-        self.prepare_before_forward(anchor.shape[0])
-
     def _bucket_for(self, num_tokens: int) -> int:
         """Round-up lookup on `_capture_buckets`. Returns the bucket key
-        (matches `lookup_dispatch`'s rounding semantics, `planner_design.md
-        §4.5`). Out-of-range returns the largest captured bucket.
+        (matches `lookup_dispatch`'s rounding semantics). Out-of-range returns
+        the largest captured bucket.
 
-        Implementation note: this used to call `bisect.bisect_left`, but
-        `_bisect.bisect_left` is a C builtin Dynamo can't trace. Under
-        `torch.compile(fullgraph=True)` the model's forward pre-hooks
-        (which include this offloader's first-decoder pre-hook) are
-        traced into the captured graph, so this lookup must be
-        Dynamo-friendly. A linear scan over the bucket tuple is treated
-        as a constant by Dynamo and unrolled at trace time. N is the
-        number of capture buckets (typically O(10)), and this runs once
-        per forward boundary — not per-GEMM — so the O(N) vs O(log N)
-        difference is unobservable. See `phase1c_findings.md §1c.18`.
+        This used to call `bisect.bisect_left`, but the C builtin was not
+        Dynamo-friendly when bucket repair lived in a traced pre-hook. Keeping
+        the simple linear scan avoids reintroducing that constraint, and this
+        runs once per forward boundary rather than per GEMM.
         """
         for bucket in self._capture_buckets:
             if num_tokens <= bucket:
@@ -906,11 +786,9 @@ class CotsOffloader(BaseOffloader):
         records them as graph nodes rather than relying on replay-time
         Python state.
 
-        Kept Dynamo-clean (no pybind calls) because vLLM's
-        `_first_decoder_pre_hook` is registered on the model and gets
-        traced into the captured graph. The C++-side runtime token
-        row cap is pushed via the separate `set_live_num_tokens`
-        method, called OUT OF GRAPH by `on_dispatch`.
+        Kept free of pybind calls so it can be used from graph-boundary helper
+        paths. The C++ runtime token row cap is pushed separately by
+        `on_dispatch`, outside captured graphs.
         """
         self._current_bucket = self._bucket_for(num_tokens)
         if self._streamer is None:
@@ -1000,13 +878,7 @@ class CotsOffloader(BaseOffloader):
         self.set_live_num_tokens(num_tokens_unpadded)
 
     def post_cudagraph_capture(self) -> None:
-        """§1c.22: env-gated counter reset after all bucket graphs are
-        captured. Set `VLLM_COTS_RESET_COUNTERS_AFTER_CUDAGRAPH_CAPTURE=1`
-        when running the byte-accounting bench so per-generate
-        diagnostics isolate replay-time activity from capture/warmup.
-        Default off — counters accumulate across capture + replay
-        (which is fine for most diagnostics, including the §1c.21
-        live-token confirmation)."""
+        """Optionally reset COTS counters after bucket graphs are captured."""
 
         if (
             os.environ.get("VLLM_COTS_RESET_COUNTERS_AFTER_CUDAGRAPH_CAPTURE", "0")
@@ -1016,7 +888,7 @@ class CotsOffloader(BaseOffloader):
         from vllm.model_executor.offloader import cots_ops
 
         cots_ops.reset_all_counters()
-        logger.info("[cots §1c.22] reset_all_counters() fired post-cudagraph-capture")
+        logger.info("COTS reset_all_counters() fired post-cudagraph-capture")
 
     def shutdown(self) -> None:
         """Drain and release the shared CPU runner at worker shutdown."""
@@ -1053,9 +925,8 @@ class CotsOffloader(BaseOffloader):
         )
         if not capture_sizes:
             capture_sizes = [self._max_num_tokens]
-        # Tuple (not list) so Dynamo treats `_capture_buckets` as a
-        # constant container during graph capture; the linear scan in
-        # `_bucket_for` then unrolls cleanly. See §1c.18.
+        # Tuple (not list) so Dynamo treats `_capture_buckets` as a constant
+        # container during graph capture.
         self._capture_buckets = tuple(sorted(set(capture_sizes)))
 
     # --- Activation buffer allocation ---
@@ -1086,14 +957,10 @@ class CotsOffloader(BaseOffloader):
         )
         self._y_gpu = torch.empty(y_capacity, dtype=dtype, device=device)
 
-        # Phase 1c: two distinct dummy CUDA tensors for the
-        # cots_sync_then_uva op's gpu_anchor_a / gpu_anchor_b mutates_args.
-        # Operators pass these when the corresponding GPU GEMM (out_perm
-        # / out_pref / out_gpu) didn't run for this slab — never aliased,
-        # so torch.compile / functionalization sees two distinct
-        # mutation slots. Allocated here (inside the
-        # DeviceMemoryProfiler accounting window per phase1a §1.5),
-        # NOT in __init__ which can predate CUDA device setup.
+        # Two distinct dummy CUDA tensors for cots_sync_then_uva's anchor
+        # mutates_args. Operators pass these when a GPU GEMM output is absent,
+        # so torch.compile / functionalization sees distinct mutation slots.
+        # Allocate here because __init__ can predate CUDA device setup.
         self._dummy_gpu_anchor_a = torch.empty(1, dtype=dtype, device=device)
         self._dummy_gpu_anchor_b = torch.empty(1, dtype=dtype, device=device)
 
@@ -1102,24 +969,17 @@ class CotsOffloader(BaseOffloader):
     def post_init(self) -> None:
         """Verify enforce_eager (conditional on runner) and finalize
         bookkeeping. The dispatch table and per-bucket geometry are
-        built in `wrap_modules` (Phase 1b — they must exist before the
-        prefetch buffer pool is sized inside the DeviceMemoryProfiler
-        context)."""
+        built in `wrap_modules` before the prefetch buffer pool is sized inside
+        the DeviceMemoryProfiler context."""
         if not self._handles:
             return
         from vllm.config import get_current_vllm_config
 
         vllm_config = get_current_vllm_config()
-        # Phase 1c: the `enforce_eager` requirement is CONDITIONAL on
-        # runner type:
+        # The `enforce_eager` requirement is conditional on runner type:
         #   * cpu_runner='native': the C++ `cudaLaunchHostFunc`
         #     substrate IS graph-capturable (CUDA Graph host-function
-        #     nodes, supported since CUDA 11.1). `enforce_eager=False`
-        #     is SUPPORTED but is NOT the Phase 2 production
-        #     recommendation — §1c.32 / §1c.33 nsys attribution showed
-        #     native eager beats native+capture+wait-kernel on the
-        #     measured Qwen2.5-7B workload grid. Captured-graph mode is
-        #     preserved as an opt-in research path.
+        #     nodes, supported since CUDA 11.1).
         #   * cpu_runner='python': the `ThreadPoolExecutor.submit` /
         #     `future.result()` substrate is NOT graph-capturable —
         #     capturing it would silently produce wrong results, not
@@ -1136,18 +996,16 @@ class CotsOffloader(BaseOffloader):
                     "switch to cpu_runner='native'."
                 )
 
-        # §1c.21 review-fix: native runner is incompatible with vLLM
-        # microbatching/ubatching (DBO or ubatch_size > 1). The
-        # live-token cap
+        # Native weight offload is incompatible with vLLM microbatching/
+        # ubatching (DBO or ubatch_size > 1). The live-token cap
         # (`GPUModelRunner._publish_forward_dispatch` →
         # `BaseOffloader.set_live_num_tokens`)
         # currently sets ONE global value per scheduler batch. Under
         # ubatching, a COTS operator runs on a per-ubatch slice but
         # sees the cap as the FULL batch token count, which can
         # over-compute (the worker would read past the per-ubatch
-        # x_pinned slice into stale data). Hard-fail at construction
-        # with a clear message until §1c.23 plumbs per-ubatch live
-        # counts.
+        # x_pinned slice into stale data). Hard-fail until per-ubatch live
+        # counts are plumbed.
         cpu_runner = getattr(self.config, "cpu_runner", "python")
         if (
             self._has_cpu_compute_work
@@ -1163,7 +1021,7 @@ class CotsOffloader(BaseOffloader):
                 "over-compute against the full-batch cap. "
                 "Either disable ubatching or use cpu_runner='python' "
                 "with enforce_eager=True. Tracking under "
-                "phase1c_findings.md §1c.23."
+                "phase1c_findings.md."
             )
 
         # Wait-kernel-sync safety gates for the Phase 1 weight runner.
@@ -1247,21 +1105,15 @@ class CotsOffloader(BaseOffloader):
 
         self._eager_fallback_entry = self._dispatch_table[self._capture_buckets[-1]]
 
-        # Phase 1c Stage 3: install the runner's per-(layer, bucket,
-        # op_kind) work table. Python runner gets a closures dict
-        # capturing weight views; native runner populates the C++ slab
-        # pool. Both can be done at post_init: the underlying
-        # `w_cpu`/`_x_pinned`/`_y_pinned` storages are stable
-        # post-allocation regardless of when their views are taken.
+        # Install the runner's per-(layer, bucket, op_kind) work table after
+        # the underlying CPU and pinned storages are stable.
         self._install_runner()
 
         # Install wait-kernel sync host-mapped pinned slots once
         # the slab pool exists. The installer walks every slab in the
-        # pool and allocates the req/done slot pair (and the diag
-        # counter cells lazily, only when VLLM_COTS_DIAG=1 — see
-        # commit 1 review-fix). After this returns, the captured
-        # graph's sync_cb host_fn nodes are replaced with wait kernel
-        # launches at every cots_sync_then_uva call site.
+        # pool and allocates the req/done slot pair. After this returns, the
+        # captured graph's sync host-callback nodes are replaced with wait
+        # kernel launches at every cots_sync_then_uva call site.
         if (
             self._has_cpu_compute_work
             and wait_kernel_enabled
@@ -1356,12 +1208,7 @@ class CotsOffloader(BaseOffloader):
     # --- Runtime: dispatch lookup ---
 
     def lookup_dispatch(self, num_tokens: int) -> tuple[float, float]:
-        """Per `planner_design.md §4.5`: round `num_tokens` UP to the nearest
-        capture bucket; out-of-range falls back to the largest bucket's entry.
-        Shares `_bucket_for`'s rounding semantics so dispatch and bucket
-        state always agree (and so neither path uses `bisect_left` —
-        see §1c.18).
-        """
+        """Round `num_tokens` up to the nearest capture bucket."""
         if num_tokens > self._capture_buckets[-1]:
             return self._eager_fallback_entry
         return self._dispatch_table[self._bucket_for(num_tokens)]

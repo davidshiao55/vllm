@@ -1445,7 +1445,10 @@ class VllmConfig:
                 "--no-cots-auto-graph-split to keep the legacy host_callback "
                 "weight capture path."
             )
-            cots_config.weight_capture_sync_mode = "wait_kernel"
+            self.offload_config = replace(
+                self.offload_config,
+                cots=replace(cots_config, weight_capture_sync_mode="wait_kernel"),
+            )
 
         # Only Phase 1 weight offload adds COTS custom-op split points.
         # Phase 2 hybrid KV is captured through the regular attention piecewise

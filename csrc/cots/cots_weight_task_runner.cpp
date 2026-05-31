@@ -44,10 +44,10 @@ namespace {
 
 constexpr int kMaxCpus = 64;
 
-// §1c.24 instrumentation gates. `VLLM_COTS_DIAG=1` remains a legacy
-// alias for all diagnostics; the split flags let benchmark runs enable
-// counters or the diagnostic wait kernel independently. NVTX is shared across
-// COTS runners via NvtxScope in cots_common.h.
+// Instrumentation gates. `VLLM_COTS_DIAG=1` is the umbrella shortcut; split
+// flags let benchmark runs enable counters or the diagnostic wait kernel
+// independently. NVTX is shared across COTS runners via NvtxScope in
+// cots_common.h.
 namespace cots_diag {
 inline bool legacy_enabled() {
   static const bool enabled = []() { return env_flag("VLLM_COTS_DIAG"); }();

@@ -730,7 +730,7 @@ class FlashAttentionImpl(AttentionImpl):
                 )
             if self.kv_cache_dtype.startswith("fp8"):
                 raise NotImplementedError(
-                    "COTS hybrid KV Phase 2 supports only BF16/FP16 KV cache"
+                    "COTS hybrid KV Phase 2 supports only BF16 KV cache"
                 )
             is_partial_cots_hybrid = (
                 attn_metadata.cots_hybrid_decode.scatter_source_indices is not None

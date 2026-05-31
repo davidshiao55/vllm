@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""§1c.24/§1c.25: env-gated diagnostic helpers for COTS attribution.
+"""Env-gated diagnostic helpers for COTS attribution.
 
 Split diagnostic gates:
 
 * `VLLM_COTS_NVTX=1` enables NVTX `range_push`/`range_pop` pairs.
 * `VLLM_COTS_COUNTERS=1` enables cheap C++/Python counters.
 * `VLLM_COTS_WAIT_KERNEL_DIAG=1` enables the diagnostic wait kernel.
-* `VLLM_COTS_DIAG=1` remains a backward-compatible alias for all three.
+* `VLLM_COTS_DIAG=1` is the umbrella shortcut for all three.
 
 Centralized so each call site reads the env once at module import,
 not on every entry, and so the gate-check pattern is consistent
@@ -27,8 +27,8 @@ def _flag(name: str) -> bool:
     return os.environ.get(name, "0") == "1"
 
 
-# Single env reads at first import. `ENABLED` is kept as the legacy
-# "some COTS diagnostic is active" umbrella for older tests/imports.
+# Single env reads at first import. `ENABLED` is the "some COTS diagnostic is
+# active" umbrella for callers that only need a coarse gate.
 LEGACY_ENABLED = _flag("VLLM_COTS_DIAG")
 NVTX_ENABLED = LEGACY_ENABLED or _flag("VLLM_COTS_NVTX")
 COUNTERS_ENABLED = LEGACY_ENABLED or _flag("VLLM_COTS_COUNTERS")

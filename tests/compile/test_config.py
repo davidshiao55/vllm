@@ -291,6 +291,21 @@ def test_cots_auto_graph_split_defaults():
         assert op in config.compilation_config.splitting_ops
 
 
+def test_cots_auto_graph_split_does_not_mutate_shared_cots_config():
+    cots = CotsOffloadConfig(f_cpu_store=0.05)
+
+    config = VllmConfig(
+        offload_config=OffloadConfig(offload_backend="cots", cots=cots),
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE,
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        ),
+    )
+
+    assert config.offload_config.cots.weight_capture_sync_mode == "wait_kernel"
+    assert cots.weight_capture_sync_mode == "host_callback"
+
+
 def test_cots_auto_graph_split_can_be_disabled():
     config = VllmConfig(
         offload_config=OffloadConfig(

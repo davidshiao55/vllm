@@ -8,9 +8,6 @@ each with a `mutates_args` list that declares barrier-installing
 dependencies so torch.compile / CUDA graph capture preserve the overlap
 ordering between submit, GPU GEMMs, sync, and UVA copy.
 
-Final schemas after the §1c.20 simplification and §1c.35 dispatch-state
-fix (see `phase1c_findings.md §1c.20` / §1c.35):
-
   * vllm.cots_submit_gemm(x_gpu, runner_id, layer_idx, op_kind_code)
       mutates_args=["x_gpu"]
       x_gpu mutated → pins submit BEFORE every GPU GEMM that reads
@@ -37,12 +34,10 @@ intermediate + blocking GPU→CPU copy that CUDA Graph capture
 rejects with cudaErrorStreamCaptureUnsupported), so the design
 keeps pinned-buffer addresses entirely on the C++ side.
 
-§1c.19 split (see `phase1c_findings.md §1c.19`): the registry stores
-the `CotsWeightTaskRunner` pybind handle DIRECTLY by runner_id, NOT a
-`NativeCotsWeightRunner` instance. The compile-visible runner is a thin
-facade with only pickleable state (runner_id, task_id map, flags);
-the unpicklable C++ handle lives here. Custom op impls and the
-offloader's install/teardown helpers all dereference the registry.
+The registry stores the `CotsWeightTaskRunner` pybind handle directly by
+runner_id, not a `NativeCotsWeightRunner` instance. The compile-visible runner
+is a thin facade with only pickleable state; the unpicklable C++ handle lives
+here.
 """
 
 from __future__ import annotations
@@ -87,7 +82,7 @@ def op_kind_code(op_kind: str) -> int:
 def register_weight_runner(runner: Any) -> int:
     """Register a `CotsWeightTaskRunner` instance and return a fresh runner_id.
     The registry takes ownership of the strong reference; the caller
-    should retain only the runner_id. See §1c.19 for the rationale."""
+    should retain only the runner_id."""
     rid = next(_NEXT_WEIGHT_RUNNER_ID)
     _COTS_WEIGHT_RUNNERS[rid] = runner
     return rid
@@ -245,16 +240,11 @@ def install_wait_kernel_sync_for_all_tasks(
     runner_id: int,
     n_slabs: int,
 ) -> None:
-    """§1c.29 commit 2: install wait-kernel sync (host-mapped pinned req/done
-    slots, lazy diag-counter alloc when VLLM_COTS_DIAG=1) for
-    every slab in the pool. Called from `CotsOffloader.post_init`
-    only when `weight_capture_sync_mode="wait_kernel"`.
+    """Install wait-kernel sync slots for every slab in the pool.
 
-    Idempotent only at the offloader level — calling
-    `install_wait_kernel_sync_for_task` twice for the same task_id raises
-    (idempotency violation; see §1c.29 design). The offloader
-    holds a single `_wait_kernel_sync_installed` flag to make sure this helper
-    runs once per offloader.
+    Called from `CotsOffloader.post_init` only when
+    `weight_capture_sync_mode="wait_kernel"`. The offloader holds a single
+    `_wait_kernel_sync_installed` flag to ensure this helper runs once.
     """
     runner = lookup_weight_runner(runner_id, "install_wait_kernel_sync_for_all_tasks")
     for tid in range(int(n_slabs)):
@@ -269,11 +259,7 @@ def set_worker_affinity(runner_id: int, mask: int) -> None:
 
 
 def reset_all_counters() -> None:
-    """§1c.22: zero every CotsWeightTaskRunner counter currently in the
-    registry. Used as the env-gated post-cudagraph-capture hook
-    (`VLLM_COTS_RESET_COUNTERS_AFTER_CUDAGRAPH_CAPTURE=1`) so the
-    byte-accounting bench artifact reflects ONLY the measured
-    replay, not capture-time activity."""
+    """Zero every registered CotsWeightTaskRunner counter."""
     import contextlib
 
     for runner in _COTS_WEIGHT_RUNNERS.values():
@@ -311,22 +297,6 @@ def sync_blocking(runner_id: int) -> None:
 
 
 # --- vllm.cots_submit_gemm -------------------------------------------------
-#
-# §1c.20 schema: BOTH y_pinned AND x_pinned are intentionally
-# excluded from this op's argument list. The earlier intermediate
-# schema (which kept x_pinned but dropped y_pinned) still hit
-# Inductor's CPU-tensor functionalization on the SUBMIT side: the
-# operator's `x_pinned.copy_(x_gpu, non_blocking=True)` was
-# expanded into (GPU intermediate → fresh pageable CPU →
-# `cpp_fused_copy_slice_view` into the pinned slice), where the
-# blocking GPU→CPU step is rejected under CUDA Graph capture. The
-# fix bundles the D2H into C++: `submit_on_stream(task_id,
-# num_tokens, x_gpu_ptr, stream)` issues `cudaMemcpyAsync(D2H)`
-# from x_gpu's data pointer to slab.x_pinned_ptr, then enqueues
-# the host callback. The custom op's only Python-visible tensor
-# argument is x_gpu (a CUDA tensor — Inductor handles GPU tensors
-# natively without CPU/GPU shuffles).
-# See `phase1c_findings.md §1c.20`.
 
 
 def _cots_submit_gemm_impl(
@@ -337,15 +307,10 @@ def _cots_submit_gemm_impl(
 ) -> None:
     """Real impl: dispatched to the per-runner pybind handle.
 
-    §1c.20: bundles the x_gpu → slab.x_pinned_ptr D2H copy WITH the
-    host-callback enqueue, all on the current CUDA stream. x_pinned
-    is intentionally NOT a Python-side argument — Inductor's
-    functionalization materializes any CPU tensor visible in the
-    captured graph (in the worst case via a GPU intermediate +
-    blocking GPU→CPU copy that CUDA Graph capture rejects). Both
-    custom ops are now CUDA-tensors-and-scalars only; the worker
-    reaches the pinned input via the slab pointer populated at
-    install time.
+    Bundles the x_gpu -> slab.x_pinned_ptr D2H copy with the host-callback
+    enqueue, all on the current CUDA stream. CPU pinned buffers are not Python
+    arguments because Inductor materializes CPU tensors visible in captured
+    graphs. Both custom ops are CUDA tensors plus scalar ids only.
 
     Moving the D2H from Python `copy_(non_blocking=True)` to a raw
     `cudaMemcpyAsync` loses Python's automatic shape/stride/dtype
@@ -390,10 +355,8 @@ def _cots_submit_gemm_impl(
         )
     runner = lookup_weight_runner(runner_id, "cots_submit_gemm")
     stream = torch.cuda.current_stream().cuda_stream
-    # §1c.24: NVTX scope so the nsys timeline can attribute the
-    # Python-side dispatch boundary separately from the C++ submit
-    # body's d2h_record / launch_dispatch_cb sub-ranges. Env-gated
-    # (VLLM_COTS_DIAG=1) — diagnostic only, off by default.
+    # Diagnostic-only NVTX scope for attributing the Python-side dispatch
+    # boundary separately from the C++ submit body.
     if _COTS_NVTX_ENABLED:
         torch.cuda.nvtx.range_push("cots:py_submit_gemm")
     try:
@@ -443,16 +406,10 @@ def _cots_sync_then_uva_impl(
     GEMMs (out_perm, out_pref). `submit_anchor` is `x_gpu` from the
     matching `cots_submit_gemm`; reading it pins this op AFTER submit.
 
-    §1c.20: `y_pinned` is intentionally NOT a parameter. Inductor's
-    functionalization materializes any CPU tensor visible in the
-    captured graph by allocating a fresh pageable CPU buffer and
-    cloning into it (in the worst case via a GPU intermediate +
-    blocking GPU→CPU copy that CUDA Graph capture rejects). The slab
-    pointer the worker wrote to IS the source of truth; we reach it
-    directly via the C++-side `y_pinned_view(task_id,
-    num_transfer_rows)` helper. The Python-visible custom-op signature
-    contains only CUDA tensors and scalar ids, so Inductor has nothing
-    CPU-side to materialize. The trust boundary is install-time: the
+    `y_pinned` is intentionally not a parameter. The slab pointer the worker
+    wrote to is the source of truth; we reach it through the C++-side
+    `y_pinned_view(task_id, num_transfer_rows)` helper. The trust boundary is
+    install-time: the
     slab pointer came from `_y_pinned`, allocated `pin_memory=True` and
     validated there.
     """
@@ -515,8 +472,7 @@ def register_cots_offloader_ops() -> None:
     direct_register_custom_op(
         op_name="cots_submit_gemm",
         op_func=_cots_submit_gemm_impl,
-        # §1c.20: `mutates_args=["x_gpu"]` only. x_gpu is the CUDA
-        # dispatch anchor AND the ordering pin — mutating it forces
+        # x_gpu is the CUDA dispatch anchor and ordering pin: mutating it forces
         # every subsequent GPU GEMM that reads x_gpu (F.linear
         # permanent / prefetched) to be ordered after submit, AND
         # `cots_sync_then_uva` reads x_gpu as `submit_anchor` to

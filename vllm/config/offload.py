@@ -196,7 +196,7 @@ class CotsOffloadConfig:
       `ThreadPoolExecutor` substrate for A/B diagnostics. NOT
       graph-capturable; `cpu_runner='python'` requires
       `enforce_eager=True` and is rejected at engine launch
-      otherwise. Slated for deprecation after Phase 2.
+      otherwise.
 
     See `David/Docs/implementation_roadmap.md` Phase 1c and
     `David/Docs/phase1c_findings.md` for the capture-gap

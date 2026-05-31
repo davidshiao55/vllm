@@ -1072,7 +1072,7 @@ class GPUModelRunner(
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
             if self.cots_hybrid_kv is not None:
-                self.cots_hybrid_kv.free_request(req_id)
+                self.cots_hybrid_kv.invalidate_common_metadata_cache()
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -1324,7 +1324,7 @@ class GPUModelRunner(
                 assert req_index is None
                 assert new_block_ids is not None
                 if self.cots_hybrid_kv is not None:
-                    self.cots_hybrid_kv.free_request(req_id)
+                    self.cots_hybrid_kv.invalidate_common_metadata_cache()
                 # The request is resumed from preemption.
                 # Replace the existing block IDs with the new ones.
                 req_state.block_ids = new_block_ids
