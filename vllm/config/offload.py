@@ -159,9 +159,13 @@ class CotsOffloadConfig:
     """Per-`BatchDescriptor` thread count for the native CPU
     GEMM worker. Keys are `num_tokens` bucket values (must be a subset
     of `cudagraph_capture_sizes`); values are >= 1. When unset, every
-    bucket uses the scalar `cpu_num_threads`. The Planner produces
-    this mapping by sweeping per-bucket optimal thread counts (see
-    `bench_thread_policy_sweep.py`).
+    bucket uses the scalar `cpu_num_threads`.
+
+    This is a runtime policy hook, not an additional Planner search axis.
+    The Profiler/Planner may provide the map explicitly, or derive it from
+    the chosen weight dispatch table using a calibrated work-score policy
+    such as `bucket * f_cpu_compute`. The Planner should model costs after
+    this policy is applied rather than sweep thread count independently.
 
     Only consulted by `cpu_runner='native'`; the Python runner uses the
     process-wide `torch.set_num_threads(cpu_num_threads)` set once at
