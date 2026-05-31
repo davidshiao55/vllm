@@ -45,6 +45,14 @@ When this checkout is used as the `vllm/` fork inside the TTC thesis repository,
 use the parent repository's conda workflow for local thesis experiments:
 `conda activate thesis`, run Python from `FastTTS-thesis/` instead of the parent
 repo root, and use `/TTC/scripts/rebuild-vllm.sh` for C++/CUDA changes.
+For hook-aware vLLM commits in the TTC checkout, run Git through the parent
+Docker helper because the installed hook path points at the container's
+`/opt/conda/envs/thesis`:
+
+```bash
+TTC_DOCKER_WORKDIR=/TTC/vllm /TTC/scripts/ttc-docker-env.sh thesis \
+  'git commit -m "Describe vLLM change"'
+```
 
 Use the upstream `uv`/`.venv` workflow below when preparing work intended for
 `vllm-project/vllm`, running upstream-style validation, or when the task
