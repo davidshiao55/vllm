@@ -44,7 +44,7 @@ If work is duplicate/trivial busywork, **do not proceed**. Return a short explan
 When this checkout is used as the `vllm/` fork inside the TTC thesis repository,
 use the parent repository's conda workflow for local thesis experiments:
 `conda activate thesis`, run Python from `FastTTS-thesis/` instead of the parent
-repo root, and use the parent `rebuild_vllm.sh` for C++/CUDA changes.
+repo root, and use `/TTC/scripts/rebuild-vllm.sh` for C++/CUDA changes.
 
 Use the upstream `uv`/`.venv` workflow below when preparing work intended for
 `vllm-project/vllm`, running upstream-style validation, or when the task

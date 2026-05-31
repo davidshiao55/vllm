@@ -1220,7 +1220,7 @@ class CotsOffloader(BaseOffloader):
                     "CotsOffloader: weight_capture_sync_mode="
                     f"{weight_capture_sync_mode!r} requires the `vllm._cots_C` "
                     "extension. Rebuild vLLM with CUDA support "
-                    "(./rebuild_vllm.sh). Underlying "
+                    "(/TTC/scripts/rebuild-vllm.sh). Underlying "
                     f"ImportError: {e}"
                 ) from e
 
