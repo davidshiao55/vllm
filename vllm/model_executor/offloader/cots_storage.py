@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -16,8 +17,46 @@ from vllm.model_executor.offloader.cots_utils import (
 )
 from vllm.utils.platform_utils import is_pin_memory_available
 
+SplitAxis = Literal["output", "input"]
+CotsLinearRole = Literal["qkv", "mlp_gate_up", "mlp_down", "wo"]
+
+OUTPUT_SPLIT_AXIS: SplitAxis = "output"
+INPUT_SPLIT_AXIS: SplitAxis = "input"
+
+QKV_ROLE: CotsLinearRole = "qkv"
+MLP_GATE_UP_ROLE: CotsLinearRole = "mlp_gate_up"
+MLP_DOWN_ROLE: CotsLinearRole = "mlp_down"
+WO_ROLE: CotsLinearRole = "wo"
+
+ROLE_SPLIT_AXIS: dict[CotsLinearRole, SplitAxis] = {
+    QKV_ROLE: OUTPUT_SPLIT_AXIS,
+    MLP_GATE_UP_ROLE: OUTPUT_SPLIT_AXIS,
+    MLP_DOWN_ROLE: INPUT_SPLIT_AXIS,
+    WO_ROLE: OUTPUT_SPLIT_AXIS,
+}
+
 MLP_CHANNEL_GRANULARITY = 64
 """Planner/COTS MLP snap grid: channels per gate/up half and down input."""
+
+DEFAULT_OUTPUT_CHANNEL_GRANULARITY = 128
+"""Fallback dense output-split alignment when no QKV head size is available.
+
+Production WO gets this from the layer's QKV head_size so its output split uses
+the same granularity as the WQKV picker. The fallback keeps synthetic WO-only
+unit tests and unusual module slices deterministic.
+"""
+
+
+def _snap_channels(requested: float, limit: int, granularity: int) -> int:
+    """Snap a channel count to a positive grid, preserving exact full size."""
+    if granularity <= 0:
+        raise ValueError(f"granularity must be positive, got {granularity}")
+    if requested <= 0:
+        return 0
+    if requested >= limit:
+        return limit
+    snapped = int(((requested + granularity / 2) // granularity) * granularity)
+    return min(snapped, limit)
 
 
 def _snap_mlp_channels(requested: float, limit: int) -> int:
@@ -29,28 +68,64 @@ def _snap_mlp_channels(requested: float, limit: int) -> int:
     nearest grid point, break ties upward, and allow the exact full-size limit
     even when a future model's intermediate size is not divisible by 64.
     """
-    if requested <= 0:
-        return 0
-    if requested >= limit:
-        return limit
-    gran = MLP_CHANNEL_GRANULARITY
-    snapped = int(((requested + gran / 2) // gran) * gran)
-    return min(snapped, limit)
+    return _snap_channels(requested, limit, MLP_CHANNEL_GRANULARITY)
+
+
+def _snap_qkv_output_channels(
+    requested: int,
+    *,
+    q_size: int,
+    kv_size: int,
+    head_dim: int,
+    kv_biased: bool,
+) -> int:
+    """Snap WQKV output channels through the head-aware WQKV picker."""
+    n_q_tail, n_k, n_v = _qkv_kv_biased_counts(
+        q_size,
+        kv_size,
+        requested,
+        head_dim=head_dim,
+        kv_biased=kv_biased,
+    )
+    return n_q_tail + n_k + n_v
+
+
+def _snap_dense_output_channels(
+    requested: float,
+    limit: int,
+    *,
+    output_granularity: int,
+) -> int:
+    """Snap dense output-split channels to the WQKV output alignment.
+
+    WO has no semantic heads, but using the attention head size keeps its
+    output-channel split on the same grid as WQKV.
+    """
+    return _snap_channels(requested, limit, output_granularity)
 
 
 class CotsLinearHandle:
     """Per-Linear partition primitive: storage + load. No execution.
 
-    Construction: use the kind-specific class methods (`for_qkv`, `for_col`,
-    `for_row`) which compute snapped n_cpu and pick indices.
-    """
+    Role decides module-specific splitting:
+      qkv         : WQKV output split with the head-aware K/V-biased picker.
+      mlp_gate_up : MLP gate/up merged output split, two matched halves.
+      mlp_down    : MLP down input split, matched to gate/up's intermediate rows.
+      wo          : Dense output split, used by opt-in WO.
 
-    KINDS = ("qkv", "col", "row")
+    Split axis is derived from role and decides generic storage shape:
+      output : CPU weight is stored as `(n_cpu, in_dim)`.
+      input  : CPU weight is stored as transposed `(n_cpu, out_dim)`.
+
+    Construction: use the role-specific class methods (`for_qkv`,
+    `for_mlp_gate_up`, `for_mlp_down`, `for_wo`) which compute snapped
+    `n_cpu` and pick indices.
+    """
 
     def __init__(
         self,
         *,
-        kind: str,
+        role: CotsLinearRole,
         linear: nn.Module,
         qualified_name: str,
         in_dim: int,
@@ -66,15 +141,18 @@ class CotsLinearHandle:
         kv_biased: bool = True,
         # Merged-col-only metadata:
         merged_partition_sizes: tuple[int, int] | None = None,
+        # Dense-output-only metadata:
+        output_granularity: int = DEFAULT_OUTPUT_CHANNEL_GRANULARITY,
     ):
-        if kind not in self.KINDS:
-            raise ValueError(f"unknown kind: {kind}")
+        if role not in ROLE_SPLIT_AXIS:
+            raise ValueError(f"unknown role: {role}")
         if cpu_indices.numel() != n_cpu:
             raise ValueError(
                 f"cpu_indices.numel()={cpu_indices.numel()} != n_cpu={n_cpu}"
             )
 
-        self.kind = kind
+        self.role = role
+        self.split_axis = ROLE_SPLIT_AXIS[role]
         self.linear = linear
         self.qualified_name = qualified_name
         self.in_dim = in_dim
@@ -90,10 +168,10 @@ class CotsLinearHandle:
         self.gpu_indices_cuda: torch.Tensor | None = None
 
         # Sub-module shapes used by operator buffer-slicing.
-        if kind == "row":
+        if self.split_axis == INPUT_SPLIT_AXIS:
             self.cpu_in_dim = n_cpu
             self.cpu_out_dim = out_dim
-        else:  # col, qkv
+        else:
             self.cpu_in_dim = in_dim
             self.cpu_out_dim = n_cpu
 
@@ -103,11 +181,12 @@ class CotsLinearHandle:
         self.head_dim = head_dim
         self.kv_biased = kv_biased
         self.merged_partition_sizes = merged_partition_sizes
+        self.output_granularity = output_granularity
         self.n_q_tail = 0
         self.n_k = 0
         self.n_v = 0
         self.n_cpu_per_half = 0
-        if kind == "qkv":
+        if role == QKV_ROLE:
             assert q_size is not None and kv_size is not None
             assert head_dim is not None
             self.n_q_tail, self.n_k, self.n_v = _qkv_kv_biased_counts(
@@ -122,14 +201,14 @@ class CotsLinearHandle:
                 f"sum of (n_q_tail={self.n_q_tail}, n_k={self.n_k}, "
                 f"n_v={self.n_v})."
             )
-        elif kind == "col":
+        elif role == MLP_GATE_UP_ROLE:
             assert merged_partition_sizes is not None
             assert merged_partition_sizes[0] == merged_partition_sizes[1], (
                 f"MergedColumnParallelLinear's gate/up output partitions "
                 f"must be equal-sized; got {merged_partition_sizes}"
             )
             assert n_cpu % 2 == 0, (
-                f"col layer expects n_cpu divisible by 2; got n_cpu={n_cpu}"
+                f"mlp_gate_up expects n_cpu divisible by 2; got n_cpu={n_cpu}"
             )
             self.n_cpu_per_half = n_cpu // 2
 
@@ -154,8 +233,9 @@ class CotsLinearHandle:
         self.max_n_prefetch: int = 0
         # GPU prefetch buffer slot views — bound by the prefetch buffer pool
         # (Step 3). Length K=2; layer i uses slot `i % K`. Each view is
-        # shape `(max_n_prefetch, in_dim)` for col/qkv or
-        # `(out_dim, max_n_prefetch)` for row, matching `w_cpu`'s layout.
+        # shape `(max_n_prefetch, in_dim)` for output-split handles or
+        # `(max_n_prefetch, out_dim)` for input-split handles, matching
+        # `w_cpu`'s layout.
         self.w_prefetch_slots: list[torch.Tensor] = []
         # Shape-group-shared per-slot state — buffer pool binds the SAME
         # list to every handle in a group so writes are visible across
@@ -163,9 +243,9 @@ class CotsLinearHandle:
         # `prefetch_owner_in_slot[k]`: handle that last filled slot k
         #   (None = empty). Operators assert owner is self before reading.
         # `prefetch_available_rows_in_slot[k]`: how many leading prefix
-        #   rows of the slot are valid. Per-half row count for col
+        #   rows of the slot are valid. Per-half row count for MLP gate/up
         #   (`gate[:a]` AND `up[:a]` valid → available_rows == a); total
-        #   prefix rows for qkv/row. 0 = empty.
+        #   prefix rows for qkv/wo/mlp_down. 0 = empty.
         self.prefetch_owner_in_slot: list[CotsLinearHandle | None] = []
         self.prefetch_available_rows_in_slot: list[int] = []
         # Stage 7-C: row-handle `w_cpu` is stored in transposed
@@ -197,14 +277,13 @@ class CotsLinearHandle:
             f"QKV: kv_size={k_part} not a multiple of head_dim={head_dim}"
         )
         requested = int(round(f_cpu_store * out_dim))
-        n_q_tail, n_k, n_v = _qkv_kv_biased_counts(
-            q_part,
-            k_part,
+        n_cpu = _snap_qkv_output_channels(
             requested,
+            q_size=q_part,
+            kv_size=k_part,
             head_dim=head_dim,
             kv_biased=kv_biased,
         )
-        n_cpu = n_q_tail + n_k + n_v
         if n_cpu == 0:
             return None
         cpu_indices = _qkv_kv_biased_indices(
@@ -215,7 +294,7 @@ class CotsLinearHandle:
             kv_biased=kv_biased,
         )
         return cls(
-            kind="qkv",
+            role=QKV_ROLE,
             linear=linear,
             qualified_name=qualified_name,
             in_dim=in_dim,
@@ -231,7 +310,7 @@ class CotsLinearHandle:
         )
 
     @classmethod
-    def for_col(
+    def for_mlp_gate_up(
         cls,
         linear: nn.Module,
         qualified_name: str,
@@ -253,7 +332,7 @@ class CotsLinearHandle:
         base = torch.arange(half - n_cpu_per_half, half, dtype=torch.long, device="cpu")
         cpu_indices = torch.cat([base, base + half])
         return cls(
-            kind="col",
+            role=MLP_GATE_UP_ROLE,
             linear=linear,
             qualified_name=qualified_name,
             in_dim=in_dim,
@@ -266,7 +345,7 @@ class CotsLinearHandle:
         )
 
     @classmethod
-    def for_row(
+    def for_mlp_down(
         cls,
         linear: nn.Module,
         qualified_name: str,
@@ -283,7 +362,7 @@ class CotsLinearHandle:
             in_dim - n_cpu, in_dim, dtype=torch.long, device="cpu"
         )
         return cls(
-            kind="row",
+            role=MLP_DOWN_ROLE,
             linear=linear,
             qualified_name=qualified_name,
             in_dim=in_dim,
@@ -292,6 +371,45 @@ class CotsLinearHandle:
             cpu_indices=cpu_indices,
             gpu_indices=_complement(cpu_indices, in_dim),
             dtype=linear.weight.dtype,
+        )
+
+    @classmethod
+    def for_wo(
+        cls,
+        linear: nn.Module,
+        qualified_name: str,
+        *,
+        f_cpu_store: float,
+        output_granularity: int = DEFAULT_OUTPUT_CHANNEL_GRANULARITY,
+    ) -> CotsLinearHandle | None:
+        """WO dense output-row split.
+
+        MLP gate/up is also output-axis split, but it uses a merged two-half
+        layout and matched-index invariant. WO has no Q/K/V or gate/up
+        structure, so its selected output channels are just a dense tail.
+        """
+        out_dim, in_dim = tuple(linear.weight.shape)
+        n_cpu = _snap_dense_output_channels(
+            f_cpu_store * out_dim,
+            out_dim,
+            output_granularity=output_granularity,
+        )
+        if n_cpu == 0:
+            return None
+        cpu_indices = torch.arange(
+            out_dim - n_cpu, out_dim, dtype=torch.long, device="cpu"
+        )
+        return cls(
+            role=WO_ROLE,
+            linear=linear,
+            qualified_name=qualified_name,
+            in_dim=in_dim,
+            out_dim=out_dim,
+            n_cpu=n_cpu,
+            cpu_indices=cpu_indices,
+            gpu_indices=_complement(cpu_indices, out_dim),
+            dtype=linear.weight.dtype,
+            output_granularity=output_granularity,
         )
 
     # ------------------------------------------------------------------
@@ -306,10 +424,10 @@ class CotsLinearHandle:
         the GPU and CPU portions at load time. Tags `linear._cots_handle`.
         """
         weight_param = linear_weight = self.linear.weight
-        if self.kind in ("col", "qkv"):
+        if self.split_axis == OUTPUT_SPLIT_AXIS:
             gpu_slice_shape = (self.out_dim - self.n_cpu, self.in_dim)
             w_cpu_shape = (self.n_cpu, self.in_dim)
-        else:  # row
+        else:
             gpu_slice_shape = (self.out_dim, self.in_dim - self.n_cpu)
             # Stage 7-C: row-handle (down_proj) stores CPU weight as
             # transposed `(n_cpu, out_dim)` row-major. Both the
@@ -338,12 +456,16 @@ class CotsLinearHandle:
         self.linear._cots_handle = self  # type: ignore[attr-defined]
 
     def _build_weight_loader(self) -> Callable:
-        """Return the kind-specific weight_loader closure."""
-        if self.kind == "row":
+        """Return the role-specific weight_loader closure."""
+        if self.role == MLP_DOWN_ROLE:
             return self._row_weight_loader
-        if self.kind == "col":
+        if self.role == MLP_GATE_UP_ROLE:
             return self._merged_col_weight_loader
-        return self._qkv_weight_loader
+        if self.role == WO_ROLE:
+            return self._wo_weight_loader
+        if self.role == QKV_ROLE:
+            return self._qkv_weight_loader
+        raise ValueError(f"unknown COTS linear role: {self.role}")
 
     # ------------------------------------------------------------------
     # Per-bucket prefetch geometry. Populated after install. Loader closures
@@ -390,48 +512,61 @@ class CotsLinearHandle:
         Layout invariants:
           qkv: `cpu_indices` order is `[Q_tail | K_cpu | V_cpu]`. Prefetch
             takes the first `n_pref` indices.
-          col: `cpu_indices` is `[gate_last_n_cpu_per_half | up_last_n_cpu_per_half]`.
+          mlp_gate_up: `cpu_indices` is
+            `[gate_last_n_cpu_per_half | up_last_n_cpu_per_half]`.
             Prefetch takes the FIRST `n_pref_per_half` of each half — keeps
             the matched-index invariant with MLP2's input cols.
-          row: `cpu_indices` is the LAST `n_cpu` input cols. Prefetch takes
-            the first `n_pref` of those.
+          mlp_down: `cpu_indices` is the LAST `n_cpu` input cols. Prefetch
+            takes the first `n_pref` of those.
+          wo: dense output-tail split. Prefetch takes the first `n_pref` rows.
 
         For qkv, n_pref is snapped via the same picker as n_cpu so its
         snap grid matches: at f_prefetch == f_cpu_store the picker sees
         identical input → returns identical (n_q, n_k, n_v) → n_pref ==
-        n_cpu by construction, no residual leak. col / row use the shared
-        64-channel MLP snap grid for both n_cpu and n_pref, then clamp n_pref
-        to the CPU-stored cap.
+        n_cpu by construction, no residual leak. MLP gate/up and down use the
+        shared 64-channel MLP snap grid; WO uses the dense output granularity.
+        Both clamp n_pref to the CPU-stored cap.
         """
         cap = self.n_cpu
 
-        if self.kind == "qkv":
+        if self.role == QKV_ROLE:
             assert self.q_size is not None and self.kv_size is not None
             assert self.head_dim is not None
             requested = int(round(f_prefetch * self.out_dim))
-            n_q, n_k, n_v = _qkv_kv_biased_counts(
-                self.q_size,
-                self.kv_size,
+            n_pref = _snap_qkv_output_channels(
                 requested,
+                q_size=self.q_size,
+                kv_size=self.kv_size,
                 head_dim=self.head_dim,
                 kv_biased=self.kv_biased,
             )
-            n_pref = min(n_q + n_k + n_v, cap)
-        elif self.kind == "col":
+            n_pref = min(n_pref, cap)
+        elif self.role == MLP_GATE_UP_ROLE:
             half = self.out_dim // 2
             n_pref_per_half = min(
                 _snap_mlp_channels(f_prefetch * half, half),
                 self.n_cpu_per_half,
             )
             n_pref = 2 * n_pref_per_half
-        else:  # row
+        elif self.role == WO_ROLE:
+            n_pref = min(
+                _snap_dense_output_channels(
+                    f_prefetch * self.out_dim,
+                    self.out_dim,
+                    output_granularity=self.output_granularity,
+                ),
+                cap,
+            )
+        elif self.role == MLP_DOWN_ROLE:
             n_pref = min(
                 _snap_mlp_channels(f_prefetch * self.in_dim, self.in_dim),
                 cap,
             )
+        else:
+            raise ValueError(f"unknown COTS linear role: {self.role}")
 
-        # Index extraction is per-kind and depends on `cpu_indices`'s layout.
-        if self.kind == "col":
+        # Index extraction is per role and depends on `cpu_indices`'s layout.
+        if self.role == MLP_GATE_UP_ROLE:
             n_pref_per_half = n_pref // 2
             ncph = self.n_cpu_per_half
             pref_idx = torch.cat(
@@ -448,10 +583,10 @@ class CotsLinearHandle:
             )
             return n_pref, pref_idx, cpu_idx
 
-        # qkv / row: prefetch is a contiguous prefix of cpu_indices.
+        # qkv / wo / mlp_down: prefetch is a contiguous prefix of cpu_indices.
         return n_pref, self.cpu_indices[:n_pref], self.cpu_indices[n_pref:]
 
-    # --- Loader closures (per-kind, accessing self by closure) ---
+    # --- Loader closures (per role, accessing self by closure) ---
 
     def _row_weight_loader(self, param, loaded_weight):
         """RowParallelLinear (down_proj): single call, full
@@ -506,6 +641,17 @@ class CotsLinearHandle:
                 f"cots merged col loader: expected loaded_shard_id in {{0, 1}}, "
                 f"got {loaded_shard_id!r}"
             )
+
+    def _wo_weight_loader(self, param, loaded_weight):
+        """Dense output-row split (WO): single full `(out_dim, in_dim)` load."""
+        assert self.w_cpu is not None
+        assert loaded_weight.shape == (self.out_dim, self.in_dim), (
+            f"wo loader at {self.qualified_name}: expected "
+            f"({self.out_dim}, {self.in_dim}), got {tuple(loaded_weight.shape)}"
+        )
+        keep_gpu = self.out_dim - self.n_cpu
+        param.data.copy_(loaded_weight[:keep_gpu, :], non_blocking=False)
+        self.w_cpu.copy_(loaded_weight[keep_gpu:, :], non_blocking=False)
 
     def _qkv_weight_loader(self, param, loaded_weight, loaded_shard_id=None):
         """QKVParallelLinear (qkv_proj): per-shard call ('q'/'k'/'v')."""
@@ -569,10 +715,11 @@ class CotsLinearHandle:
 # offloaded handle so prefetch for layer i+1 can overlap with layer i's
 # compute (every layer is offloaded → K=2 is the minimum slot count for any
 # overlap; see `phase0_findings.md §0.10.1d` and the Phase 1b plan).
-# Slot shape mirrors `w_cpu`'s row-major storage per kind:
-#   col / qkv : (max_n_prefetch, in_dim)   — prefetch dim 0
-#   row       : (max_n_prefetch, out_dim)  — prefetch dim 0
-# Col slots are filled in active-bucket-adjacent layout `[gate_active | up_active]`.
+# Slot shape mirrors `w_cpu`'s row-major storage per split axis:
+#   output split : (max_n_prefetch, in_dim)   — prefetch dim 0
+#   input split  : (max_n_prefetch, out_dim)  — prefetch dim 0
+# MLP gate/up slots are filled in active-bucket-adjacent layout
+# `[gate_active | up_active]`.
 # Sized to `max_n_prefetch` (max across buckets); per-forward H2D narrows.
 # ---------------------------------------------------------------------------
 class CotsPrefetchBufferPool:
@@ -603,7 +750,7 @@ class CotsPrefetchBufferPool:
         self.total_bytes = 0
         self._buffer: torch.Tensor | None = None
 
-        # Group handles by (kind, slot_shape). Within a group, all handles
+        # Group handles by (role, slot_shape). Within a group, all handles
         # share K slots, rotated at runtime by `handle.slot_idx`.
         groups: dict[tuple, list[CotsLinearHandle]] = {}
         for h in handles:
@@ -612,15 +759,15 @@ class CotsPrefetchBufferPool:
                 h.prefetch_owner_in_slot = []
                 h.prefetch_available_rows_in_slot = []
                 continue
-            if h.kind == "row":
-                # Row slot is (max_n_prefetch, out_dim) — matches the
+            if h.split_axis == INPUT_SPLIT_AXIS:
+                # Input-split slot is (max_n_prefetch, out_dim) — matches the
                 # unified transposed-storage `w_cpu` layout
                 # (n_cpu, out_dim) so H2D `narrow(0, ...)` on both
                 # ends is contiguous.
                 slot_shape = (h.max_n_prefetch, h.out_dim)
-            else:  # col, qkv
+            else:
                 slot_shape = (h.max_n_prefetch, h.in_dim)
-            groups.setdefault((h.kind, slot_shape), []).append(h)
+            groups.setdefault((h.role, slot_shape), []).append(h)
 
         if not groups:
             return
@@ -729,7 +876,7 @@ class WeightPrefetchStreamer:
                 # dry_run: keep all bookkeeping (slot tracking, events,
                 # fork_event ordering) but skip the actual H2D.
                 if not self._dry_run:
-                    if h.kind == "row":
+                    if h.split_axis == INPUT_SPLIT_AXIS:
                         # Stage 7-C: row-handle `w_cpu` is now stored in
                         # transposed `(n_cpu, out_dim)` layout. The
                         # prefetch source is `w_cpu.narrow(0, 0, n)` —
@@ -741,7 +888,7 @@ class WeightPrefetchStreamer:
                         src = h.w_cpu.narrow(0, 0, n)
                         dst = h.w_prefetch_slots[h.slot_idx].narrow(0, 0, n)
                         dst.copy_(src, non_blocking=True)
-                    elif h.kind == "col":
+                    elif h.role == MLP_GATE_UP_ROLE:
                         # MergedCol w_cpu layout is [gate_full | up_full].
                         # Prefetch takes the first n_per_half rows of EACH
                         # half and writes them active-adjacent as
@@ -763,8 +910,8 @@ class WeightPrefetchStreamer:
                             ],
                             non_blocking=True,
                         )
-                    else:  # qkv: w_cpu rows are [Q_tail | K | V]; prefetch
-                        # takes a contiguous prefix.
+                    else:
+                        # qkv/wo prefetch takes a contiguous prefix.
                         assert h.w_cpu is not None
                         src = h.w_cpu.narrow(0, 0, n)
                         dst = h.w_prefetch_slots[h.slot_idx].narrow(0, 0, n)
@@ -774,10 +921,10 @@ class WeightPrefetchStreamer:
                 # assert it's reading its own weights, not another
                 # layer's that overwrote the shared physical slot via
                 # K=2 rotation. available_rows tracks how many leading
-                # prefix rows are valid (per-half for col, total for
-                # qkv/row).
+                # prefix rows are valid (per-half for MLP gate/up, total for
+                # qkv/wo/mlp_down).
                 h.prefetch_owner_in_slot[h.slot_idx] = h
-                if h.kind == "col":
+                if h.role == MLP_GATE_UP_ROLE:
                     h.prefetch_available_rows_in_slot[h.slot_idx] = n // 2
                 else:
                     h.prefetch_available_rows_in_slot[h.slot_idx] = n
@@ -789,11 +936,12 @@ class WeightPrefetchStreamer:
         self, layer_idx: int, handles: list[CotsLinearHandle]
     ) -> None:
         """Idempotent boundary repair for `layer_idx` at `current_bucket`.
-        Repairs the layer-0 slot relative to the active bucket. For qkv/row,
-        larger previously-filled prefixes can be reused. For col, the slot is
-        active-adjacent `[gate_active | up_active]`, so any active-size change
-        rewrites the full active prefix. Owner mismatch is a hard error, except
-        an empty slot (`owner is None`) is filled on demand.
+        Repairs the layer-0 slot relative to the active bucket. For qkv, wo,
+        and mlp_down, larger previously-filled prefixes can be reused. For
+        mlp_gate_up, the slot is active-adjacent `[gate_active | up_active]`,
+        so any active-size change rewrites the full active prefix. Owner
+        mismatch is a hard error, except an empty slot (`owner is None`) is
+        filled on demand.
 
         Phase 1c precondition: bucket dispatch is decided by the active
         bucket (capture-time constant), not by slot state. This method
@@ -808,7 +956,7 @@ class WeightPrefetchStreamer:
             if h.max_n_prefetch == 0:
                 continue
             n_pref = h.n_prefetch_by_bucket.get(b, 0)
-            required = (n_pref // 2) if h.kind == "col" else n_pref
+            required = n_pref // 2 if h.role == MLP_GATE_UP_ROLE else n_pref
             if required == 0:
                 continue
             avail = h.prefetch_available_rows_in_slot[h.slot_idx]
@@ -818,7 +966,7 @@ class WeightPrefetchStreamer:
                     f"prepare_for_forward_bucket: slot owner mismatch on "
                     f"{h.qualified_name} slot {h.slot_idx} (owner={owner})"
                 )
-            if h.kind == "col":
+            if h.role == MLP_GATE_UP_ROLE:
                 needs_fill = owner is None or avail != required
             else:
                 needs_fill = owner is None or avail < required
@@ -831,7 +979,7 @@ class WeightPrefetchStreamer:
                 issued = True
             with torch.cuda.stream(self.copy_stream):
                 if not self._dry_run:
-                    if h.kind == "row":
+                    if h.split_axis == INPUT_SPLIT_AXIS:
                         # Stage 7-C: read from the unified transposed
                         # `w_cpu` instead of the dropped duplicate.
                         assert h.w_cpu is not None
@@ -840,7 +988,7 @@ class WeightPrefetchStreamer:
                         h.w_prefetch_slots[h.slot_idx][start:required, :].copy_(
                             src, non_blocking=True
                         )
-                    elif h.kind == "col":
+                    elif h.role == MLP_GATE_UP_ROLE:
                         assert h.w_cpu is not None
                         n_cpu_per_half_total = h.n_cpu // 2
                         slot = h.w_prefetch_slots[h.slot_idx]
@@ -854,7 +1002,7 @@ class WeightPrefetchStreamer:
                             ],
                             non_blocking=True,
                         )
-                    else:  # qkv
+                    else:  # qkv/wo
                         assert h.w_cpu is not None
                         start = 0 if owner is None else avail
                         h.w_prefetch_slots[h.slot_idx][start:required, :].copy_(

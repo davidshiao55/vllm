@@ -67,6 +67,7 @@ _NEXT_WEIGHT_RUNNER_ID = itertools.count(1)
 _OP_KIND_TO_CODE: dict[str, int] = {
     "qkv": 1,
     "mlp_block": 2,
+    "wo": 3,
 }
 _OP_KIND_BY_CODE: dict[int, str] = {v: k for k, v in _OP_KIND_TO_CODE.items()}
 

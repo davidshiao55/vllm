@@ -14,12 +14,17 @@ import torch.nn.functional as F
 
 # Register prefetch custom ops; COTS reuses wait_prefetch/start_prefetch.
 import vllm.model_executor.offloader.prefetch_ops  # noqa: F401
+from vllm.config.cots import (
+    cots_weight_module_for_name,
+    normalize_cots_weight_modules,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.offloader.base import BaseOffloader, ForwardDispatchInfo
 from vllm.model_executor.offloader.cots_operators import (
     CotsQKVOp,
     CotsSwiGLUMLPOp,
+    CotsWOOp,
     _RaiseOnDirectCall,
 )
 from vllm.model_executor.offloader.cots_runners import (
@@ -28,10 +33,16 @@ from vllm.model_executor.offloader.cots_runners import (
     PyCotsWeightCallback,
     PythonCotsWeightRunner,
     _make_runner,
+    _NativeWeightSlabSpecLinear,
     _NativeWeightSlabSpecMlp,
-    _NativeWeightSlabSpecQkv,
 )
 from vllm.model_executor.offloader.cots_storage import (
+    DEFAULT_OUTPUT_CHANNEL_GRANULARITY,
+    INPUT_SPLIT_AXIS,
+    MLP_DOWN_ROLE,
+    MLP_GATE_UP_ROLE,
+    QKV_ROLE,
+    WO_ROLE,
     CotsLinearHandle,
     CotsPrefetchBufferPool,
     WeightPrefetchStreamer,
@@ -43,6 +54,11 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+LINEAR_OP_KIND_BY_ROLE = {
+    QKV_ROLE: "qkv",
+    WO_ROLE: "wo",
+}
+
 
 class CotsOffloader(BaseOffloader):
     """Collaborative CPU-GPU weight offloader (thesis Phase 1a).
@@ -51,14 +67,11 @@ class CotsOffloader(BaseOffloader):
       1. Build & install handles for each offloadable Linear.
       2. Install operator adapters: `CotsQKVOp` per QKV linear,
          `CotsSwiGLUMLPOp` per recognized MLP block (replaces parent.forward,
-         installs `_RaiseOnDirectCall` guards on the MLP linears).
-      3. Reject orphan col/row handles loudly: MergedCol/Row offload
+         installs `_RaiseOnDirectCall` guards on the MLP linears), and
+         `CotsWOOp` per opt-in WO linear.
+      3. Reject orphan MLP gate/up/down handles loudly: MergedCol/Row offload
          requires an MLP block parent.
     """
-
-    # `o_proj` intentionally absent — WO is GPU-resident in Phase 1/2 per
-    # `weight_offload_design.md §WO Split Axis Decision`.
-    _OFFLOAD_SUFFIXES = ("qkv_proj", "gate_up_proj", "down_proj")
 
     def __init__(
         self,
@@ -72,6 +85,9 @@ class CotsOffloader(BaseOffloader):
         self.f_cpu_store = float(config.f_cpu_store)
         self.f_prefetch = float(config.f_prefetch)
         self.kv_biased = bool(config.kv_biased)
+        self.weight_modules = frozenset(
+            normalize_cots_weight_modules(getattr(config, "weight_modules", None))
+        )
         self.dry_run = bool(config.dry_run)
         # Optional injection point for the Planner. None → uniform fill
         # from config in `post_init`.
@@ -91,9 +107,11 @@ class CotsOffloader(BaseOffloader):
 
         # Populated in wrap_modules. _handles is the master list of all
         # offloaded linears (in insertion order); _fused_ops tracks installed
-        # MLP-block ops (one per recognized parent).
+        # MLP-block ops (one per recognized parent), and _wo_ops tracks
+        # opt-in output-split WO adapters.
         self._handles: list[CotsLinearHandle] = []
         self._fused_ops: list[CotsSwiGLUMLPOp] = []
+        self._wo_ops: list[CotsWOOp] = []
 
         # Per-layer tracking for prefetch hook installation. `_layer_modules[i]`
         # is the i-th offloaded decoder layer; `_layer_handles[i]` is its
@@ -178,7 +196,8 @@ class CotsOffloader(BaseOffloader):
                 h.layer_idx = layer_idx
             self._install_qkv_ops(layer_handles)
             self._install_mlp_ops(layer, layer_handles)
-            self._check_no_orphan_col_row(layer_handles)
+            self._install_wo_ops(layer_handles)
+            self._check_no_orphan_mlp_handles(layer_handles)
             self._layer_modules.append(layer)
             self._layer_handles.append(layer_handles)
             layer_idx += 1
@@ -209,11 +228,13 @@ class CotsOffloader(BaseOffloader):
         if any(h.max_n_prefetch > 0 for h in self._handles):
             self._install_prefetch_machinery()
         logger.debug(
-            "CotsOffloader: wrapped %d linear modules and %d fused MLP blocks "
-            "(f_cpu_store=%.4f, f_prefetch=%.4f, kv_biased=%s, "
-            "cpu_num_threads=%d, dry_run=%s).",
+            "CotsOffloader: wrapped %d linear modules, %d fused MLP blocks, "
+            "and %d WO ops (modules=%s, f_cpu_store=%.4f, f_prefetch=%.4f, "
+            "kv_biased=%s, cpu_num_threads=%d, dry_run=%s).",
             len(self._handles),
             len(self._fused_ops),
+            len(self._wo_ops),
+            sorted(self.weight_modules),
             self.f_cpu_store,
             self.f_prefetch,
             self.kv_biased,
@@ -234,8 +255,12 @@ class CotsOffloader(BaseOffloader):
         )
 
         layer_handles: list[CotsLinearHandle] = []
+        output_granularity = self._dense_output_granularity_for_layer(
+            layer, QKVParallelLinear
+        )
         for qualified_name, child in layer.named_modules():
-            if not any(qualified_name.endswith(s) for s in self._OFFLOAD_SUFFIXES):
+            module = self._module_for_qualified_name(qualified_name)
+            if module is None:
                 continue
             if not isinstance(child.quant_method, UnquantizedLinearMethod):
                 raise RuntimeError(
@@ -244,7 +269,7 @@ class CotsOffloader(BaseOffloader):
                     f"on {qualified_name}."
                 )
             self._check_dtype_is_bfloat16(child, qualified_name)
-            if isinstance(child, QKVParallelLinear):
+            if module == "qkv" and isinstance(child, QKVParallelLinear):
                 handle = CotsLinearHandle.for_qkv(
                     child,
                     qualified_name,
@@ -252,22 +277,29 @@ class CotsOffloader(BaseOffloader):
                     kv_biased=self.kv_biased,
                     f_cpu_store=self.f_cpu_store,
                 )
-            elif isinstance(child, MergedColumnParallelLinear):
-                handle = CotsLinearHandle.for_col(
+            elif module == "mlp" and isinstance(child, MergedColumnParallelLinear):
+                handle = CotsLinearHandle.for_mlp_gate_up(
                     child,
                     qualified_name,
                     f_cpu_store=self.f_cpu_store,
                 )
-            elif isinstance(child, RowParallelLinear):
-                handle = CotsLinearHandle.for_row(
+            elif module == "mlp" and isinstance(child, RowParallelLinear):
+                handle = CotsLinearHandle.for_mlp_down(
                     child,
                     qualified_name,
                     f_cpu_store=self.f_cpu_store,
+                )
+            elif module == "wo" and isinstance(child, RowParallelLinear):
+                handle = CotsLinearHandle.for_wo(
+                    child,
+                    qualified_name,
+                    f_cpu_store=self.f_cpu_store,
+                    output_granularity=output_granularity,
                 )
             else:
                 raise RuntimeError(
-                    f"CotsOffloader: {qualified_name} matched offload suffix "
-                    f"but is not Merged/QKV/Row ParallelLinear "
+                    f"CotsOffloader: {qualified_name} matched enabled COTS "
+                    f"module {module!r} but has unsupported linear type "
                     f"(got {type(child).__name__})"
                 )
             if handle is None:
@@ -277,6 +309,27 @@ class CotsOffloader(BaseOffloader):
             layer_handles.append(handle)
         return layer_handles
 
+    def _module_for_qualified_name(self, qualified_name: str) -> str | None:
+        """Return the enabled semantic COTS module for a linear name."""
+        return cots_weight_module_for_name(self.weight_modules, qualified_name)
+
+    @staticmethod
+    def _dense_output_granularity_for_layer(
+        layer: nn.Module,
+        qkv_cls: type[nn.Module],
+    ) -> int:
+        """Use the layer's WQKV head size as dense output-split alignment.
+
+        WO has no semantic heads, but aligning its output-channel split to the
+        same grid as WQKV keeps the storage and prefetch policy consistent.
+        Synthetic WO-only tests may not include a QKV module, so they fall back
+        to the common Qwen/Llama 128-channel head grid.
+        """
+        for _, child in layer.named_modules():
+            if isinstance(child, qkv_cls):
+                return int(child.head_size)
+        return DEFAULT_OUTPUT_CHANNEL_GRANULARITY
+
     # --- Pass 2a: QKV operator install ---
 
     def _install_qkv_ops(self, handles: list[CotsLinearHandle]) -> None:
@@ -285,7 +338,7 @@ class CotsOffloader(BaseOffloader):
             "_install_qkv_ops called with f_cpu_store=0 — runner not constructed"
         )
         for h in handles:
-            if h.kind != "qkv":
+            if h.role != QKV_ROLE:
                 continue
             h.linear.quant_method = CotsQKVOp(
                 handle=h,
@@ -293,6 +346,23 @@ class CotsOffloader(BaseOffloader):
                 offloader=self,
                 original_quant_method=h.linear.quant_method,
             )
+
+    # --- Pass 2a-2: WO operator install ---
+
+    def _install_wo_ops(self, handles: list[CotsLinearHandle]) -> None:
+        assert self._runner is not None, (
+            "_install_wo_ops called with f_cpu_store=0 — runner not constructed"
+        )
+        for h in handles:
+            if h.role != WO_ROLE:
+                continue
+            h.linear.quant_method = CotsWOOp(
+                handle=h,
+                runner=self._runner,
+                offloader=self,
+                original_quant_method=h.linear.quant_method,
+            )
+            self._wo_ops.append(h.linear.quant_method)
 
     # --- Pass 2b: MLP block operator install ---
 
@@ -414,10 +484,10 @@ class CotsOffloader(BaseOffloader):
             )
 
     @staticmethod
-    def _check_no_orphan_col_row(handles: list[CotsLinearHandle]) -> None:
-        """Every col/row handle must be in a fused MLP block."""
+    def _check_no_orphan_mlp_handles(handles: list[CotsLinearHandle]) -> None:
+        """Every MLP split handle must be in a fused MLP block."""
         for h in handles:
-            if h.kind in ("col", "row") and not h.in_block:
+            if h.role in (MLP_GATE_UP_ROLE, MLP_DOWN_ROLE) and not h.in_block:
                 raise RuntimeError(
                     f"cots: {h.qualified_name} is offloaded but not "
                     f"part of a recognized MLP block (gate_up_proj + act_fn "
@@ -458,8 +528,10 @@ class CotsOffloader(BaseOffloader):
     # --- Runner install (closures / slab specs) -----
 
     @staticmethod
-    def _make_qkv_python_callback(w_cpu: torch.Tensor) -> PyCotsWeightCallback:
-        """Build a closure that captures the per-(layer, bucket) QKV
+    def _make_output_split_python_callback(
+        w_cpu: torch.Tensor,
+    ) -> PyCotsWeightCallback:
+        """Build a closure that captures a per-(layer, bucket) output-split
         weight slice. Module-level helper so closures don't accidentally
         capture `self` (would leak the offloader through the registry)."""
 
@@ -506,17 +578,18 @@ class CotsOffloader(BaseOffloader):
         """
         callbacks: dict[tuple[int, int, str], PyCotsWeightCallback] = {}
         for h in self._handles:
-            if h.kind != "qkv":
+            if h.role not in (QKV_ROLE, WO_ROLE):
                 continue
             assert h.w_cpu is not None
+            op_kind = LINEAR_OP_KIND_BY_ROLE[h.role]
             for bucket in self._capture_buckets:
                 n_pref = h.n_prefetch_by_bucket.get(bucket, 0)
                 n_cpu = h.n_cpu_compute_by_bucket.get(bucket, h.n_cpu)
                 if n_cpu == 0:
                     continue
                 w_view = h.w_cpu.narrow(0, n_pref, n_cpu)
-                callbacks[(h.layer_idx, bucket, "qkv")] = (
-                    self._make_qkv_python_callback(w_view)
+                callbacks[(h.layer_idx, bucket, op_kind)] = (
+                    self._make_output_split_python_callback(w_view)
                 )
         for fop in self._fused_ops:
             gu_h = fop._gate_up
@@ -627,9 +700,10 @@ class CotsOffloader(BaseOffloader):
         y_pinned_ptr = int(self._y_pinned.data_ptr())
         specs: list[NativeWeightSlabSpec] = []
         for h in self._handles:
-            if h.kind != "qkv":
+            if h.role not in (QKV_ROLE, WO_ROLE):
                 continue
             assert h.w_cpu is not None
+            op_kind = LINEAR_OP_KIND_BY_ROLE[h.role]
             for bucket in self._capture_buckets:
                 n_pref = h.n_prefetch_by_bucket.get(bucket, 0)
                 n_cpu = h.n_cpu_compute_by_bucket.get(bucket, h.n_cpu)
@@ -637,8 +711,8 @@ class CotsOffloader(BaseOffloader):
                     continue
                 w_view = h.w_cpu.narrow(0, n_pref, n_cpu)
                 specs.append(
-                    _NativeWeightSlabSpecQkv(
-                        op_descriptor=(h.layer_idx, bucket, "qkv"),
+                    _NativeWeightSlabSpecLinear(
+                        op_descriptor=(h.layer_idx, bucket, op_kind),
                         n_threads=self._n_threads_for(bucket),
                         x_pinned_ptr=x_pinned_ptr,
                         in_dim=int(h.in_dim),
@@ -1156,14 +1230,17 @@ class CotsOffloader(BaseOffloader):
             prefetch_gb = 0.0
 
         logger.info(
-            "[CotsOffloader] ready: runner=%s, sync=%s, linears=%d, "
-            "mlp_blocks=%d, weights_saved=%.4f GB, buffers=%.4f GB "
+            "[CotsOffloader] ready: runner=%s, sync=%s, modules=%s, "
+            "linears=%d, mlp_blocks=%d, wo_ops=%d, weights_saved=%.4f GB, "
+            "buffers=%.4f GB "
             "pinned_in + %.4f GB pinned_out + %.4f GB gpu_uva, "
             "prefetch_pool=%.4f GB, buckets=%s",
             cpu_runner,
             weight_capture_sync_mode,
+            sorted(self.weight_modules),
             len(self._handles),
             len(self._fused_ops),
+            len(self._wo_ops),
             total_offloaded / 1e9,
             x_pinned_gb,
             y_pinned_gb,
@@ -1173,34 +1250,43 @@ class CotsOffloader(BaseOffloader):
         )
 
         # Effective routing breakdown — actual bytes routed through each
-        # path, accounting for head-aligned snapping and per-kind geometry.
+        # path, accounting for head-aligned snapping and per-role geometry.
         # Reported at the largest capture bucket (worst case for prefetch
         # buffer sizing).
         bucket = self._capture_buckets[-1]
         elem = self._handles[0].dtype.itemsize
-        per_kind_pref = {"qkv": 0, "col": 0, "row": 0}
-        per_kind_cpu = {"qkv": 0, "col": 0, "row": 0}
+        per_role_pref = {"qkv": 0, "mlp_col": 0, "mlp_row": 0, "wo": 0}
+        per_role_cpu = {"qkv": 0, "mlp_col": 0, "mlp_row": 0, "wo": 0}
         for h in self._handles:
             n_pref = h.n_prefetch_by_bucket.get(bucket, 0)
             n_cpu = h.n_cpu_compute_by_bucket.get(bucket, 0)
-            other_dim = h.in_dim if h.kind != "row" else h.out_dim
-            per_kind_pref[h.kind] += n_pref * other_dim * elem
-            per_kind_cpu[h.kind] += n_cpu * other_dim * elem
-        total_pref = sum(per_kind_pref.values())
-        total_cpu = sum(per_kind_cpu.values())
+            other_dim = h.in_dim if h.split_axis != INPUT_SPLIT_AXIS else h.out_dim
+            key = {
+                QKV_ROLE: "qkv",
+                MLP_GATE_UP_ROLE: "mlp_col",
+                MLP_DOWN_ROLE: "mlp_row",
+                WO_ROLE: "wo",
+            }[h.role]
+            per_role_pref[key] += n_pref * other_dim * elem
+            per_role_cpu[key] += n_cpu * other_dim * elem
+        total_pref = sum(per_role_pref.values())
+        total_cpu = sum(per_role_cpu.values())
         logger.debug(
             "[CotsOffloader] Effective routing @ bucket=%d:\n"
-            "  qkv:  prefetched=%.4f GiB, cpu-computed=%.4f GiB\n"
-            "  col:  prefetched=%.4f GiB, cpu-computed=%.4f GiB\n"
-            "  row:  prefetched=%.4f GiB, cpu-computed=%.4f GiB\n"
+            "  qkv:     prefetched=%.4f GiB, cpu-computed=%.4f GiB\n"
+            "  mlp_col: prefetched=%.4f GiB, cpu-computed=%.4f GiB\n"
+            "  mlp_row: prefetched=%.4f GiB, cpu-computed=%.4f GiB\n"
+            "  wo:      prefetched=%.4f GiB, cpu-computed=%.4f GiB\n"
             "  total: prefetched=%.4f GiB, cpu-computed=%.4f GiB",
             bucket,
-            per_kind_pref["qkv"] / 1024**3,
-            per_kind_cpu["qkv"] / 1024**3,
-            per_kind_pref["col"] / 1024**3,
-            per_kind_cpu["col"] / 1024**3,
-            per_kind_pref["row"] / 1024**3,
-            per_kind_cpu["row"] / 1024**3,
+            per_role_pref["qkv"] / 1024**3,
+            per_role_cpu["qkv"] / 1024**3,
+            per_role_pref["mlp_col"] / 1024**3,
+            per_role_cpu["mlp_col"] / 1024**3,
+            per_role_pref["mlp_row"] / 1024**3,
+            per_role_cpu["mlp_row"] / 1024**3,
+            per_role_pref["wo"] / 1024**3,
+            per_role_cpu["wo"] / 1024**3,
             total_pref / 1024**3,
             total_cpu / 1024**3,
         )

@@ -52,7 +52,7 @@ class NativeWeightSlabSpec:
         raise NotImplementedError
 
 
-class _NativeWeightSlabSpecQkv(NativeWeightSlabSpec):
+class _NativeWeightSlabSpecLinear(NativeWeightSlabSpec):
     def __init__(
         self,
         op_descriptor: tuple[int, int, str],

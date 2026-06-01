@@ -5,8 +5,13 @@
 import warnings
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
+from vllm.config.cots import (
+    DEFAULT_COTS_WEIGHT_MODULES,
+    CotsWeightModule,
+    normalize_cots_weight_modules,
+)
 from vllm.config.utils import config
 
 OffloadBackend = Literal["auto", "uva", "prefetch", "prefetch_defer", "cots"]
@@ -86,23 +91,24 @@ class PrefetchOffloadConfig:
 class CotsOffloadConfig:
     """Configuration for COTS collaborative CPU-GPU offloading (thesis backend).
 
-    Splits each WQKV / MLP1 / MLP2 weight along its tensor-parallel-native axis
-    so a fraction `f_cpu_store` of the bytes lives in pinned CPU memory and is
+    Splits selected decoder sub-modules along their COTS policy axis so a
+    fraction `f_cpu_store` of the bytes lives in pinned CPU memory and is
     GEMM'd on the CPU each forward pass, in parallel with the GPU's compute on
     the GPU-resident slice. Activation returns from CPU use an SM-issued UVA
-    copy kernel that bypasses the H2D copy engine. WO (`o_proj`) is NOT
-    offloaded in Phase 1/2.
+    copy kernel that bypasses the H2D copy engine. The default module set is
+    WQKV + MLP; WO (`o_proj`) is opt-in for forced-fit experiments.
 
     See `David/Docs/implementation_roadmap.md` and `David/Docs/phase0_findings.md`
     for the full design and the empirical numbers that justify it.
     """
 
     f_cpu_store: float = Field(default=0.0, ge=0.0, le=1.0)
-    """Fraction of WQKV / MLP1 / MLP2 weight bytes resident on CPU. Single
-    uniform scalar applied to all three sub-modules (matched-index invariant
-    between MLP1 col-parallel and MLP2 row-parallel is automatic under uniform
-    dispatch). Default 0.0 means no offload. Typical thesis value at
-    7B B=1 decode is ~0.09 ("free" regime per phase0 §0.3.3)."""
+    """Fraction of enabled COTS weight bytes resident on CPU. Single uniform
+    scalar applied to the selected module set (default WQKV / MLP1 / MLP2;
+    optional WO). The matched-index invariant between MLP1 col-parallel and
+    MLP2 row-parallel is automatic under uniform dispatch. Default 0.0 means no
+    offload. Typical thesis value at 7B B=1 decode is ~0.09 ("free" regime per
+    phase0 §0.3.3)."""
 
     f_prefetch: float = Field(default=0.0, ge=0.0, le=1.0)
     """Manual fallback for the layer-ahead weight-prefetch fraction. Only
@@ -130,6 +136,17 @@ class CotsOffloadConfig:
     `weight_offload_design.md §WQKV Column Choice`. If False, columns are
     picked from the front of WQKV's output (Q first), useful only for
     controlled diagnostics."""
+
+    weight_modules: set[CotsWeightModule | str] = Field(
+        default_factory=lambda: set(DEFAULT_COTS_WEIGHT_MODULES)
+    )
+    """COTS weight sub-modules to offload. Valid entries:
+    * `"qkv"`: WQKV output split using the WQKV-specific KV-biased picker.
+    * `"mlp"`: fused MLP block (`gate_up_proj` col split + `down_proj` row
+      split) with matched intermediate indices.
+    * `"wo"`: opt-in WO (`o_proj`) output split for forced-fit/E2E
+      experiments. Disabled by default because current 7B measurements do not
+      justify the extra post-attention communication."""
 
     kv_split_blocks: int = Field(default=0, ge=0)
     """Phase 2 hybrid-KV split point in KV-cache blocks. Blocks before this
@@ -258,6 +275,11 @@ class CotsOffloadConfig:
     remain available by disabling `auto_graph_split`.
     """
 
+    @field_validator("weight_modules", mode="before")
+    @classmethod
+    def normalize_weight_modules_field(cls, value: object) -> set[str]:
+        return normalize_cots_weight_modules(value)
+
     @property
     def hybrid_kv_enabled(self) -> bool:
         """Whether the Phase 2 hybrid CPU-suffix KV path is configured."""
@@ -266,6 +288,7 @@ class CotsOffloadConfig:
     @model_validator(mode="after")
     def validate_cots_config(self) -> "CotsOffloadConfig":
         """Validate COTS storage/dispatch invariants."""
+        self.weight_modules = normalize_cots_weight_modules(self.weight_modules)
         if self.f_prefetch > self.f_cpu_store:
             raise ValueError(
                 f"cots.f_prefetch ({self.f_prefetch}) must be <= "

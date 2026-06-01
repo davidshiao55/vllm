@@ -474,6 +474,7 @@ class EngineArgs:
         CotsOffloadConfig.dispatch_table
     )
     cots_kv_biased: bool = CotsOffloadConfig.kv_biased
+    cots_weight_modules: set[str] = get_field(CotsOffloadConfig, "weight_modules")
     cots_kv_split_blocks: int = CotsOffloadConfig.kv_split_blocks
     cots_kv_cpu_pool_bytes: int = CotsOffloadConfig.kv_cpu_pool_bytes
     cots_kv_h2d_mode: Literal["uva"] = CotsOffloadConfig.kv_h2d_mode
@@ -1092,6 +1093,9 @@ class EngineArgs:
             "--cots-dispatch-table", **cots_kwargs["dispatch_table"]
         )
         offload_group.add_argument("--cots-kv-biased", **cots_kwargs["kv_biased"])
+        offload_group.add_argument(
+            "--cots-weight-modules", **cots_kwargs["weight_modules"]
+        )
         offload_group.add_argument(
             "--cots-kv-split-blocks", **cots_kwargs["kv_split_blocks"]
         )
@@ -2025,6 +2029,7 @@ class EngineArgs:
             f_prefetch=self.cots_f_prefetch,
             dispatch_table=self.cots_dispatch_table,
             kv_biased=self.cots_kv_biased,
+            weight_modules=self.cots_weight_modules,
             kv_split_blocks=self.cots_kv_split_blocks,
             kv_cpu_pool_bytes=self.cots_kv_cpu_pool_bytes,
             kv_h2d_mode=self.cots_kv_h2d_mode,

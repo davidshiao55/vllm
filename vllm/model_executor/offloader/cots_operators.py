@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""QKV, MLP, scatter, and UVA-facing operators for COTS."""
+"""Output-split linear, MLP, scatter, and UVA-facing operators for COTS."""
 
 from __future__ import annotations
 
@@ -14,7 +14,14 @@ from vllm.model_executor.offloader.cots_runners import (
     NativeCotsWeightRunner,
     PythonCotsWeightRunner,
 )
-from vllm.model_executor.offloader.cots_storage import CotsLinearHandle
+from vllm.model_executor.offloader.cots_storage import (
+    MLP_DOWN_ROLE,
+    MLP_GATE_UP_ROLE,
+    OUTPUT_SPLIT_AXIS,
+    QKV_ROLE,
+    WO_ROLE,
+    CotsLinearHandle,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.offloader.cots_offloader import CotsOffloader
@@ -45,12 +52,14 @@ def _assert_prefetch_slot_ready(
     )
 
 
-class CotsQKVOp:
-    """Patched `quant_method.apply` for QKVParallelLinear.
+class CotsOutputSplitLinearOp:
+    """Patched `quant_method.apply` for output-split linears.
 
-    GPU computes its slice; CPU computes its slice via the runner; outputs
-    are scattered through `cpu_indices_cuda` / `gpu_indices_cuda` to restore
-    the canonical `[Q | K | V]` column ordering.
+    GPU computes its permanent output slice; CPU computes its slice via the
+    runner; optional prefetched rows run on GPU. The three disjoint outputs are
+    scattered through `cpu_indices_cuda` / `gpu_indices_cuda` to restore the
+    canonical output-channel order. WQKV and WO share this execution shape; the
+    handle decides which channels were stored on CPU.
     """
 
     def __init__(
@@ -59,12 +68,17 @@ class CotsQKVOp:
         runner: PythonCotsWeightRunner | NativeCotsWeightRunner,
         offloader: CotsOffloader,
         original_quant_method,
+        *,
+        op_kind: str = "qkv",
+        expected_role: str = QKV_ROLE,
     ):
-        assert handle.kind == "qkv"
+        assert handle.role == expected_role
+        assert handle.split_axis == OUTPUT_SPLIT_AXIS
         self._handle = handle
         self._runner = runner
         self._offloader = offloader
         self._original = original_quant_method
+        self._op_kind = op_kind
 
     def __getattr__(self, name):
         return getattr(self._original, name)
@@ -131,7 +145,7 @@ class CotsQKVOp:
         if n_cpu > 0 and not dry_run:
             assert self._runner is not None
             assert offloader._y_gpu is not None
-            desc = (h.layer_idx, b, "qkv")
+            desc = (h.layer_idx, b, self._op_kind)
             # §1c.20: BRANCH before constructing CPU pinned views.
             # The native captured path has a different compiler
             # contract — Inductor materializes any CPU view it sees,
@@ -145,7 +159,7 @@ class CotsQKVOp:
             # x_in/y_out flow because it isn't traced by Inductor.
             y_dst = offloader._y_gpu[: num_tokens * n_cpu].view(num_tokens, n_cpu)
             if isinstance(self._runner, NativeCotsWeightRunner):
-                self._runner.submit_with_d2h(x, h.layer_idx, "qkv")
+                self._runner.submit_with_d2h(x, h.layer_idx, self._op_kind)
             else:
                 assert offloader._x_pinned is not None
                 assert offloader._y_pinned is not None
@@ -190,14 +204,16 @@ class CotsQKVOp:
             # captured-graph custom op sees only CUDA tensors +
             # scalars.
             if isinstance(self._runner, NativeCotsWeightRunner):
-                self._runner.wait_and_uva(y_dst, gpu_a, gpu_b, x, h.layer_idx, "qkv")
+                self._runner.wait_and_uva(
+                    y_dst, gpu_a, gpu_b, x, h.layer_idx, self._op_kind
+                )
             else:
                 self._runner.wait_and_uva(y_dst, gpu_a, gpu_b, x, desc)
 
         if out_perm is None and out_pref is None and y_dst is None:
             # Dry-run/full-offload corner: all active offloaded work is
             # intentionally skipped, but downstream layers still need the
-            # canonical QKV shape. Values are diagnostic garbage by design.
+            # canonical output shape. Values are diagnostic garbage by design.
             out = x.new_empty((num_tokens, h.out_dim))
         else:
             out = _scatter_col_outputs_three_way(
@@ -206,6 +222,51 @@ class CotsQKVOp:
         if bias is not None:
             out = out + bias
         return out
+
+
+class CotsQKVOp(CotsOutputSplitLinearOp):
+    """Output-split operator for QKVParallelLinear."""
+
+    def __init__(
+        self,
+        handle: CotsLinearHandle,
+        runner: PythonCotsWeightRunner | NativeCotsWeightRunner,
+        offloader: CotsOffloader,
+        original_quant_method,
+    ):
+        super().__init__(
+            handle=handle,
+            runner=runner,
+            offloader=offloader,
+            original_quant_method=original_quant_method,
+            op_kind="qkv",
+            expected_role=QKV_ROLE,
+        )
+
+
+class CotsWOOp(CotsOutputSplitLinearOp):
+    """Patched `quant_method.apply` for WO (`o_proj`) output-column split.
+
+    WO uses a dense output split: GPU, prefetched-GPU, and CPU slices produce
+    disjoint output hidden channels which are scattered back into canonical
+    hidden-state order. The split is deliberately not WQKV/KV-biased.
+    """
+
+    def __init__(
+        self,
+        handle: CotsLinearHandle,
+        runner: PythonCotsWeightRunner | NativeCotsWeightRunner,
+        offloader: CotsOffloader,
+        original_quant_method,
+    ):
+        super().__init__(
+            handle=handle,
+            runner=runner,
+            offloader=offloader,
+            original_quant_method=original_quant_method,
+            op_kind="wo",
+            expected_role=WO_ROLE,
+        )
 
 
 class CotsSwiGLUMLPOp:
@@ -229,8 +290,8 @@ class CotsSwiGLUMLPOp:
         offloader: CotsOffloader,
         qualified_name: str,
     ):
-        assert gate_up_handle.kind == "col"
-        assert down_handle.kind == "row"
+        assert gate_up_handle.role == MLP_GATE_UP_ROLE
+        assert down_handle.role == MLP_DOWN_ROLE
         # Matched-index invariant.
         assert gate_up_handle.n_cpu_per_half == down_handle.n_cpu, (
             f"MLP block matched-index violated at {qualified_name}: "
@@ -261,11 +322,11 @@ class CotsSwiGLUMLPOp:
         assert dn_h.w_cpu is not None
         # NOTE: under torch.compile + BACKED dynamic shapes, this is
         # really the activation buffer's row capacity (= max_num_batched_tokens),
-        # not the live token count. See CotsQKVOp.apply for the full
+        # not the live token count. See CotsOutputSplitLinearOp.apply for the full
         # comment. Used only for shape-consistent buffer slicing.
         num_tokens = x.shape[0]
         # Phase 1c Stage 3: bucket from offloader, not streamer (see
-        # CotsQKVOp.apply for the resolution rationale). gu and dn
+        # CotsOutputSplitLinearOp.apply for the resolution rationale). gu and dn
         # share the active bucket by construction. §1c.19: resolve to
         # a non-None int up-front; the runner facade no longer carries
         # a fallback callable.
@@ -306,7 +367,7 @@ class CotsSwiGLUMLPOp:
             desc = (gu_h.layer_idx, b, "mlp_block")
             # §1c.20: branch BEFORE constructing the CPU pinned views
             # — Inductor materializes any CPU view it sees in the
-            # captured graph (see CotsQKVOp.apply for the rationale).
+            # captured graph (see CotsOutputSplitLinearOp.apply for the rationale).
             y2_gpu = offloader._y_gpu[: num_tokens * self._out_dim].view(
                 num_tokens, self._out_dim
             )
