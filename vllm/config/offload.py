@@ -123,11 +123,25 @@ class CotsOffloadConfig:
     Planner. Keys are vLLM `BatchDescriptor.num_tokens` bucket values. Values
     are `(f_cpu_compute, f_prefetch_compute)` for that bucket. When set, this
     table overrides the uniform `f_prefetch` fallback above. Runtime validates
-    that all captured buckets are present before installing COTS slabs.
+    that all COTS dispatch buckets are present before installing slabs. In
+    graph mode, every CUDA graph capture bucket must also have a matching
+    dispatch row.
 
     This is an engine-local interface: FastTTS/global planning decides the
     storage budget and may provide a table; vLLM still owns snapping, bucket
     validation, and tensor geometry."""
+
+    dispatch_table_by_module: (
+        dict[CotsWeightModule | str, dict[int, tuple[float, float]]] | None
+    ) = Field(default=None)
+    """Optional module-specific COTS dispatch table. Top-level keys are COTS
+    weight module names (`"qkv"`, `"mlp"`, `"wo"`); values have the same
+    per-bucket `(f_cpu_compute, f_prefetch_compute)` shape as
+    `dispatch_table`. Missing module keys fall back to `dispatch_table`, or to
+    the uniform `f_prefetch` fallback when no global table is configured.
+
+    This is intended for Planner policies where, for example, decode MLP stays
+    CPU-computed while QKV uses prefetch."""
 
     kv_biased: bool = Field(default=True)
     """If True, the WQKV column picker is biased toward K/V: K+V column groups
@@ -174,9 +188,8 @@ class CotsOffloadConfig:
 
     cpu_num_threads_by_bucket: dict[int, int] | None = Field(default=None)
     """Per-`BatchDescriptor` thread count for the native CPU
-    GEMM worker. Keys are `num_tokens` bucket values (must be a subset
-    of `cudagraph_capture_sizes`); values are >= 1. When unset, every
-    bucket uses the scalar `cpu_num_threads`.
+    GEMM worker. Keys are COTS dispatch bucket values; values are >= 1. When
+    unset, every bucket uses the scalar `cpu_num_threads`.
 
     This is a runtime policy hook, not an additional Planner search axis.
     The Profiler/Planner may provide the map explicitly, or derive it from
@@ -295,30 +308,52 @@ class CotsOffloadConfig:
                 f"cots.f_cpu_store ({self.f_cpu_store}); prefetch consumes "
                 "CPU-stored bytes."
             )
-        if self.dispatch_table is None:
-            return self
-        for bucket, entry in self.dispatch_table.items():
-            if bucket <= 0:
-                raise ValueError(
-                    f"cots.dispatch_table bucket keys must be positive; got {bucket}"
-                )
-            if len(entry) != 2:
-                raise ValueError(
-                    "cots.dispatch_table values must be "
-                    "(f_cpu_compute, f_prefetch_compute)"
-                )
-            f_cpu_compute, f_prefetch_compute = entry
-            if f_cpu_compute < 0 or f_prefetch_compute < 0:
-                raise ValueError(
-                    "cots.dispatch_table fractions must be non-negative; "
-                    f"got {entry} for bucket {bucket}"
-                )
-            if f_cpu_compute + f_prefetch_compute > self.f_cpu_store + 1e-9:
-                raise ValueError(
-                    "cots.dispatch_table entry exceeds f_cpu_store: "
-                    f"bucket={bucket}, entry={entry}, "
-                    f"f_cpu_store={self.f_cpu_store}"
-                )
+
+        def validate_table(label: str, table: dict[int, tuple[float, float]]) -> None:
+            for bucket, entry in table.items():
+                if bucket <= 0:
+                    raise ValueError(
+                        f"{label} bucket keys must be positive; got {bucket}"
+                    )
+                if len(entry) != 2:
+                    raise ValueError(
+                        f"{label} values must be (f_cpu_compute, f_prefetch_compute)"
+                    )
+                f_cpu_compute, f_prefetch_compute = entry
+                if f_cpu_compute < 0 or f_prefetch_compute < 0:
+                    raise ValueError(
+                        f"{label} fractions must be non-negative; "
+                        f"got {entry} for bucket {bucket}"
+                    )
+                if f_cpu_compute + f_prefetch_compute > self.f_cpu_store + 1e-9:
+                    raise ValueError(
+                        f"{label} entry exceeds f_cpu_store: "
+                        f"bucket={bucket}, entry={entry}, "
+                        f"f_cpu_store={self.f_cpu_store}"
+                    )
+
+        if self.dispatch_table is not None:
+            validate_table("cots.dispatch_table", self.dispatch_table)
+
+        if self.dispatch_table_by_module is not None:
+            normalized: dict[str, dict[int, tuple[float, float]]] = {}
+            for raw_module, table in self.dispatch_table_by_module.items():
+                modules = normalize_cots_weight_modules({raw_module}, default=())
+                if len(modules) != 1:
+                    raise ValueError(
+                        "cots.dispatch_table_by_module keys must be single "
+                        f"module names; got {raw_module!r}"
+                    )
+                module = next(iter(modules))
+                if module not in self.weight_modules:
+                    raise ValueError(
+                        "cots.dispatch_table_by_module contains module "
+                        f"{module!r}, but cots.weight_modules is "
+                        f"{sorted(self.weight_modules)}"
+                    )
+                validate_table(f"cots.dispatch_table_by_module[{module!r}]", table)
+                normalized[module] = table
+            self.dispatch_table_by_module = normalized
         return self
 
 

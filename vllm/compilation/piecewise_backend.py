@@ -384,12 +384,33 @@ class PiecewiseBackend:
                     return self.range_entries[range]
         return None
 
+    def _static_range_entry(self) -> RangeEntry:
+        """Return a deterministic compiled entry for shape-independent pieces.
+
+        Some route-specialized graphs have no symbolic batch-size placeholder
+        in a piecewise subgraph. In that case every compiled range is equivalent
+        for dispatch purposes, so runtime shape lookup is neither possible nor
+        needed.
+        """
+        for compile_range in self.compile_ranges:
+            entry = self.range_entries.get(compile_range)
+            if entry is not None:
+                return entry
+        return next(iter(self.range_entries.values()))
+
     def __call__(self, *args: Any) -> Any:
-        runtime_shape = args[self.sym_shape_indices[0]]
-        range_entry = self._find_range_for_shape(runtime_shape)
+        range_entry: RangeEntry | None
+        if not self.sym_shape_indices:
+            runtime_shape_repr: object = "<static>"
+            range_entry = self._static_range_entry()
+        else:
+            runtime_shape = args[self.sym_shape_indices[0]]
+            runtime_shape_repr = runtime_shape
+            range_entry = self._find_range_for_shape(runtime_shape)
 
         assert range_entry is not None, (
-            f"Shape: {runtime_shape} out of considered ranges: {self.compile_ranges}"
+            f"Shape: {runtime_shape_repr} out of considered ranges: "
+            f"{self.compile_ranges}"
         )
         assert range_entry.compiled, (
             "All ranges should be compiled or loaded up front in "

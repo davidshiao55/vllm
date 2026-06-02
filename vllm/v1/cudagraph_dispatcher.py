@@ -146,13 +146,20 @@ class CudagraphDispatcher:
             uniform_decode = False
             num_reqs = min(num_tokens_padded, max_num_seqs)
 
-        return BatchDescriptor(
+        desc = BatchDescriptor(
             num_tokens=num_tokens_padded,
             num_reqs=num_reqs,
             uniform=uniform_decode,
             has_lora=has_lora,
             num_active_loras=num_active_loras,
         )
+        return self._decorate_for_offloader(desc)
+
+    @staticmethod
+    def _decorate_for_offloader(batch_descriptor: BatchDescriptor) -> BatchDescriptor:
+        from vllm.model_executor.offloader import get_offloader
+
+        return get_offloader().decorate_batch_descriptor(batch_descriptor)
 
     def add_cudagraph_key(
         self, runtime_mode: CUDAGraphMode, batch_descriptor: BatchDescriptor
@@ -277,7 +284,9 @@ class CudagraphDispatcher:
             or num_tokens > max_size
             or allowed_modes <= {CUDAGraphMode.NONE}
         ):
-            return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)
+            return CUDAGraphMode.NONE, self._decorate_for_offloader(
+                BatchDescriptor(num_tokens)
+            )
 
         effective_num_active_loras = num_active_loras
         if has_lora and num_active_loras > 0:
@@ -320,7 +329,9 @@ class CudagraphDispatcher:
             f"No matching cudagraph found and NONE is not in "
             f"allowed_modes={allowed_modes}"
         )
-        return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)
+        return CUDAGraphMode.NONE, self._decorate_for_offloader(
+            BatchDescriptor(num_tokens)
+        )
 
     def get_capture_descs(self) -> list[tuple[CUDAGraphMode, list[BatchDescriptor]]]:
         """

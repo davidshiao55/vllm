@@ -153,18 +153,88 @@ class TorchCompileWithNoGuardsWrapper:
                 msg += "upgrade PyTorch version to use AOT compile."
                 logger.warning(msg)
 
+        self._compiled_ptr = compiled_ptr
+        self._compile_options = options
         with aot_context:
-            self._compiled_callable = torch.compile(
-                compiled_ptr,
-                fullgraph=True,
-                dynamic=False,
-                backend=backend,
-                options=options,
-            )
+            self._compiled_callable = self._make_compiled_callable(backend)
+        self._compiled_callable_by_cots_signature: dict[int, Any] = {}
+        self._first_call_by_cots_signature: set[int] = set()
+        self._logged_cots_signatures: set[int | None] = set()
+        self._compiled_bytecode_by_cots_signature: dict[int, CodeType] = {}
+        self._pending_cots_bytecode_signature: int | None = None
 
         if envs.VLLM_USE_BYTECODE_HOOK and mode != CompilationMode.STOCK_TORCH_COMPILE:
             torch._dynamo.convert_frame.register_bytecode_hook(self.bytecode_hook)
             self._compiled_bytecode: CodeType | None = None
+
+    def _make_compiled_callable(self, backend: Any) -> Any:
+        return torch.compile(
+            self._compiled_ptr,
+            fullgraph=True,
+            dynamic=False,
+            backend=backend,
+            options=self._compile_options,
+        )
+
+    def _cots_route_compile_signature(self) -> int | None:
+        try:
+            from vllm.forward_context import (
+                get_forward_context,
+                is_forward_context_available,
+            )
+        except ImportError:
+            return None
+        if not is_forward_context_available():
+            return None
+        batch_descriptor = get_forward_context().batch_descriptor
+        if batch_descriptor is None:
+            return None
+        signature = batch_descriptor.cots_route_signature
+        if signature is None:
+            signature = batch_descriptor.cots_dispatch_bucket
+        return None if signature is None else int(signature)
+
+    def _log_cots_route_signature(self, signature: int | None) -> None:
+        if envs.VLLM_COTS_COUNTERS and signature not in self._logged_cots_signatures:
+            self._logged_cots_signatures.add(signature)
+            logger.info(
+                "COTS route compile dispatch: module=%s signature=%s",
+                self.__class__.__name__,
+                signature,
+            )
+
+    def _compiled_callable_for_cots_signature(self, signature: int) -> tuple[Any, bool]:
+        compiled_callable = self._compiled_callable_by_cots_signature.get(signature)
+        if compiled_callable is not None:
+            return (
+                compiled_callable,
+                signature not in self._first_call_by_cots_signature,
+            )
+
+        variant_prefix = (
+            f"{self._compile_prefix}_cots_route_{signature}"
+            if self._compile_prefix
+            else f"cots_route_{signature}"
+        )
+        backend = self.vllm_config.compilation_config.init_backend(
+            self.vllm_config,
+            prefix=variant_prefix,
+            is_encoder=self._is_encoder,
+        )
+        if envs.VLLM_COTS_COUNTERS:
+            logger.info(
+                "COTS route compile variant: module=%s signature=%d prefix=%s",
+                self.__class__.__name__,
+                signature,
+                variant_prefix,
+            )
+        compiled_callable = self._make_compiled_callable(backend)
+        self._compiled_callable_by_cots_signature[signature] = compiled_callable
+        # The base wrapper drops guards, so clear Dynamo's frame cache before
+        # the first call for a new COTS route. Otherwise a previous route's
+        # branch-pruned graph can satisfy the no-guard cache entry.
+        torch._dynamo.eval_frame.remove_from_cache(self.original_code_object())
+        return compiled_callable, True
 
     def aot_compile(self, *args: Any, **kwargs: Any) -> Any:
         if not hasattr(self._compiled_callable, "aot_compile"):
@@ -183,6 +253,28 @@ class TorchCompileWithNoGuardsWrapper:
             ):
                 return self._compiled_callable(*args, **kwargs)
 
+            cots_signature = self._cots_route_compile_signature()
+            self._log_cots_route_signature(cots_signature)
+            if cots_signature is not None:
+                compiled_bytecode = self._compiled_bytecode_by_cots_signature.get(
+                    cots_signature
+                )
+                if compiled_bytecode is None:
+                    compiled_callable, _ = self._compiled_callable_for_cots_signature(
+                        cots_signature
+                    )
+                    self._pending_cots_bytecode_signature = cots_signature
+                    try:
+                        return self._call_with_optional_nvtx_range(
+                            compiled_callable, *args, **kwargs
+                        )
+                    finally:
+                        self._pending_cots_bytecode_signature = None
+                with self._dispatch_to_compiled_code(compiled_bytecode):
+                    return self._call_with_optional_nvtx_range(
+                        self.forward, *args, **kwargs
+                    )
+
             if not self._compiled_bytecode:
                 # Make sure a compilation is triggered by clearing dynamo
                 # cache.
@@ -196,15 +288,25 @@ class TorchCompileWithNoGuardsWrapper:
                         self.forward, *args, **kwargs
                     )
         else:
+            cots_signature = self._cots_route_compile_signature()
+            self._log_cots_route_signature(cots_signature)
+            compiled_callable = self._compiled_callable
+            if cots_signature is None:
+                first_compile = self.first_compile
+                self.first_compile = False
+            else:
+                compiled_callable, first_compile = (
+                    self._compiled_callable_for_cots_signature(cots_signature)
+                )
+                self._first_call_by_cots_signature.add(cots_signature)
             ctx = (
                 nullcontext()
-                if self.first_compile or not self.evaluate_guards
+                if first_compile or not self.evaluate_guards
                 else torch.compiler.set_stance("fail_on_recompile")
             )
-            self.first_compile = False
             with _compilation_context(), ctx:
                 return self._call_with_optional_nvtx_range(
-                    self._compiled_callable, *args, **kwargs
+                    compiled_callable, *args, **kwargs
                 )
 
     @abstractmethod
@@ -232,7 +334,7 @@ class TorchCompileWithNoGuardsWrapper:
         if frame.f_locals["self"] is not self:
             return
 
-        self._compiled_bytecode = new_code
+        self._store_compiled_bytecode(new_code)
 
         path = self.vllm_config.compile_debug_dump_path()
         if path:
@@ -270,8 +372,17 @@ class TorchCompileWithNoGuardsWrapper:
             )
             raise RuntimeError(msg)
 
+    def _store_compiled_bytecode(self, new_code: CodeType) -> None:
+        pending_signature = self._pending_cots_bytecode_signature
+        if pending_signature is None:
+            self._compiled_bytecode = new_code
+        else:
+            self._compiled_bytecode_by_cots_signature[int(pending_signature)] = new_code
+
     @contextmanager
-    def _dispatch_to_compiled_code(self) -> Generator[None, None, None]:
+    def _dispatch_to_compiled_code(
+        self, compiled_bytecode: CodeType | None = None
+    ) -> Generator[None, None, None]:
         # noqa: E501
         """
         Context manager to dispatch to internally compiled code for torch<2.8.
@@ -283,8 +394,10 @@ class TorchCompileWithNoGuardsWrapper:
         See https://dev-discuss.pytorch.org/t/what-is-the-relationship-requirement-among-original-bytecode-transformed-bytecode-and-bytecode-returned-by-hooks-in-dynamo/1693/7 for more details.
         """  # noqa: E501 line too long
         original = self.original_code_object()
-        assert self._compiled_bytecode is not None
-        self.__class__.forward.__code__ = self._compiled_bytecode
+        if compiled_bytecode is None:
+            compiled_bytecode = self._compiled_bytecode
+        assert compiled_bytecode is not None
+        self.__class__.forward.__code__ = compiled_bytecode
         try:
             yield
         finally:

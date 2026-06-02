@@ -56,6 +56,19 @@ class BatchDescriptor:
     (like fused_moe_lora) whose grid size depends on num_active_loras
     to be properly captured.
     """
+    cots_dispatch_bucket: int | None = None
+    """
+    Optional COTS planner dispatch bucket. This is distinct from
+    `num_tokens`, which is the CUDA graph replay shape. COTS uses this bucket
+    to select native slabs and prefetch/CPU routing for the forward.
+    """
+    cots_route_signature: int | None = None
+    """
+    Optional COTS compile-visible route-geometry signature. Multiple dispatch
+    buckets may share one signature when their Python-visible COTS geometry is
+    identical, allowing one torch.compile graph to serve those buckets while
+    CUDA graph replay remains keyed by the full BatchDescriptor.
+    """
 
 
 def _compute_sp_num_tokens(

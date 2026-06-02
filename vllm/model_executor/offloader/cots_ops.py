@@ -270,6 +270,15 @@ def reset_all_counters() -> None:
             runner.reset_counters()
 
 
+def get_all_counters() -> dict[int, dict[str, int]]:
+    """Return diagnostic counters for every registered weight runner."""
+    out: dict[int, dict[str, int]] = {}
+    for runner_id, runner in _COTS_WEIGHT_RUNNERS.items():
+        counters = runner.get_counters()
+        out[int(runner_id)] = {str(k): int(v) for k, v in counters.items()}
+    return out
+
+
 def set_live_num_tokens(runner_id: int, n: int) -> None:
     """Publish the live-token row cap to the native COTS worker.
 

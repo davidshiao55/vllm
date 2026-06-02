@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import defaultdict
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -42,6 +42,8 @@ class BatchExecutionDescriptor:
     num_tokens: int
     num_reqs: int | None  # None means no request padding is needed (PIECEWISE graphs)
     uniform_token_count: int | None = None
+    cots_dispatch_bucket: int | None = None
+    cots_route_signature: int | None = None
 
 
 def _batch_descriptor_from_execution(
@@ -51,6 +53,21 @@ def _batch_descriptor_from_execution(
         num_tokens=desc.num_tokens,
         num_reqs=desc.num_reqs,
         uniform=desc.uniform_token_count is not None,
+        cots_dispatch_bucket=desc.cots_dispatch_bucket,
+        cots_route_signature=desc.cots_route_signature,
+    )
+
+
+def _decorate_execution_for_offloader(
+    desc: BatchExecutionDescriptor,
+) -> BatchExecutionDescriptor:
+    batch_desc = get_offloader().decorate_batch_descriptor(
+        _batch_descriptor_from_execution(desc)
+    )
+    return replace(
+        desc,
+        cots_dispatch_bucket=batch_desc.cots_dispatch_bucket,
+        cots_route_signature=batch_desc.cots_route_signature,
     )
 
 
@@ -159,6 +176,7 @@ class CudaGraphManager:
                     num_reqs=num_tokens // self.decode_query_len,
                     uniform_token_count=self.decode_query_len,
                 )
+                desc = _decorate_execution_for_offloader(desc)
                 descs_by_mode[decode_mode].append(desc)
                 descs_by_token_count[num_tokens].append(desc)
 
@@ -176,6 +194,7 @@ class CudaGraphManager:
                     num_tokens=num_tokens,
                     num_reqs=num_reqs,
                 )
+                desc = _decorate_execution_for_offloader(desc)
                 descs_by_mode[mixed_mode].append(desc)
                 descs_by_token_count[num_tokens].append(desc)
 
@@ -278,8 +297,12 @@ class CudaGraphManager:
             for desc in self._candidates[num_tokens]:
                 if _is_compatible(desc, num_reqs, num_tokens, uniform_token_count):
                     return desc
-        return BatchExecutionDescriptor(
-            cg_mode=CUDAGraphMode.NONE, num_tokens=num_tokens, num_reqs=num_reqs
+        return _decorate_execution_for_offloader(
+            BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.NONE,
+                num_tokens=num_tokens,
+                num_reqs=num_reqs,
+            )
         )
 
     def run_fullgraph(
@@ -399,7 +422,7 @@ class ModelCudaGraphManager(CudaGraphManager):
 
             def forward_fn(cg_mode: CUDAGraphMode) -> None:
                 batch_descriptor = (
-                    BatchDescriptor(num_tokens=num_tokens)
+                    _batch_descriptor_from_execution(desc)
                     if cg_mode == CUDAGraphMode.PIECEWISE
                     else None
                 )

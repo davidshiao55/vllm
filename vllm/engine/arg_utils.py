@@ -473,6 +473,9 @@ class EngineArgs:
     cots_dispatch_table: dict[int, tuple[float, float]] | None = (
         CotsOffloadConfig.dispatch_table
     )
+    cots_dispatch_table_by_module: dict[str, dict[int, tuple[float, float]]] | None = (
+        CotsOffloadConfig.dispatch_table_by_module
+    )
     cots_kv_biased: bool = CotsOffloadConfig.kv_biased
     cots_weight_modules: set[str] = get_field(CotsOffloadConfig, "weight_modules")
     cots_kv_split_blocks: int = CotsOffloadConfig.kv_split_blocks
@@ -1091,6 +1094,10 @@ class EngineArgs:
         offload_group.add_argument("--cots-f-prefetch", **cots_kwargs["f_prefetch"])
         offload_group.add_argument(
             "--cots-dispatch-table", **cots_kwargs["dispatch_table"]
+        )
+        offload_group.add_argument(
+            "--cots-dispatch-table-by-module",
+            **cots_kwargs["dispatch_table_by_module"],
         )
         offload_group.add_argument("--cots-kv-biased", **cots_kwargs["kv_biased"])
         offload_group.add_argument(
@@ -2028,6 +2035,7 @@ class EngineArgs:
             f_cpu_store=self.cots_f_cpu_store,
             f_prefetch=self.cots_f_prefetch,
             dispatch_table=self.cots_dispatch_table,
+            dispatch_table_by_module=self.cots_dispatch_table_by_module,
             kv_biased=self.cots_kv_biased,
             weight_modules=self.cots_weight_modules,
             kv_split_blocks=self.cots_kv_split_blocks,

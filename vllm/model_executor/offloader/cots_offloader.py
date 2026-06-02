@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable, Generator, Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -51,6 +52,7 @@ from vllm.utils.platform_utils import is_pin_memory_available
 
 if TYPE_CHECKING:
     from vllm.config import CotsOffloadConfig
+    from vllm.forward_context import BatchDescriptor
 
 logger = init_logger(__name__)
 
@@ -80,6 +82,10 @@ class CotsOffloader(BaseOffloader):
             [Sequence[int]], dict[int, tuple[float, float]]
         ]
         | None = None,
+        module_dispatch_table_factory: Callable[
+            [Sequence[int]], dict[str, dict[int, tuple[float, float]]]
+        ]
+        | None = None,
     ):
         self.config = config
         self.f_cpu_store = float(config.f_cpu_store)
@@ -92,6 +98,7 @@ class CotsOffloader(BaseOffloader):
         # Optional injection point for the Planner. None → uniform fill
         # from config in `post_init`.
         self._dispatch_table_factory = dispatch_table_factory
+        self._module_dispatch_table_factory = module_dispatch_table_factory
         if not (0.0 <= self.f_cpu_store <= 1.0):
             raise ValueError(f"f_cpu_store must be in [0, 1], got {self.f_cpu_store}")
         if self.f_prefetch > self.f_cpu_store:
@@ -130,7 +137,14 @@ class CotsOffloader(BaseOffloader):
         # Dispatch table populated in wrap_modules (Phase 1b: needed before
         # the prefetch buffer pool is sized).
         self._dispatch_table: dict[int, tuple[float, float]] = {}
-        self._capture_buckets: tuple[int, ...] = ()
+        self._dispatch_table_by_module: dict[str, dict[int, tuple[float, float]]] = {}
+        # CUDA graph capture buckets and Planner dispatch buckets are related
+        # but distinct. Graph buckets describe replay shapes. Dispatch buckets
+        # describe the COTS route selected from BatchDescriptor.num_tokens and
+        # must exist even in eager mode, where CUDA graph buckets are empty.
+        self._graph_capture_buckets: tuple[int, ...] = ()
+        self._dispatch_buckets: tuple[int, ...] = ()
+        self._route_signature_by_bucket: dict[int, int] = {}
         self._max_num_tokens: int = 0
         self._eager_fallback_entry: tuple[float, float] = (0.0, 0.0)
         self._has_cpu_compute_work: bool = False
@@ -181,7 +195,7 @@ class CotsOffloader(BaseOffloader):
 
         # Resolved early so per-bucket geometry can be built before the
         # prefetch buffer pool is sized.
-        self._resolve_capture_buckets()
+        self._resolve_bucket_sets()
 
         modules: list[nn.Module] = []
         layer_idx = 0
@@ -214,8 +228,9 @@ class CotsOffloader(BaseOffloader):
         # leaves all of this no-op'd.
         self._build_dispatch_table()
         for h in self._handles:
-            h.apply_prefetch_split_per_bucket(self._dispatch_table)
+            h.apply_prefetch_split_per_bucket(self._dispatch_table_for_role(h.role))
         self._has_cpu_compute_work = self._compute_has_cpu_compute_work()
+        self._build_route_signatures()
 
         # Allocate shared CPU-compute buffers only when some bucket actually
         # leaves rows on the CPU-compute path. Pure-prefetch configurations
@@ -498,14 +513,38 @@ class CotsOffloader(BaseOffloader):
     # --- Phase 1b: dispatch table + prefetch machinery installation ---
 
     def _build_dispatch_table(self) -> None:
-        """Construct `_dispatch_table`. Uses the injected factory if present,
-        otherwise uniform fill from config (`f_cpu_store - f_prefetch`,
-        `f_prefetch`)."""
+        """Construct dispatch tables.
+
+        `_dispatch_table` is the global/default table. Module-specific tables
+        override it for Python-side handle geometry when the Planner provides
+        per-module dispatch.
+        """
         if self._dispatch_table_factory is not None:
-            self._dispatch_table = self._dispatch_table_factory(self._capture_buckets)
+            self._dispatch_table = self._dispatch_table_factory(self._dispatch_buckets)
         else:
             pair = (self.f_cpu_store - self.f_prefetch, self.f_prefetch)
-            self._dispatch_table = {b: pair for b in self._capture_buckets}
+            self._dispatch_table = {b: pair for b in self._dispatch_buckets}
+        if self._module_dispatch_table_factory is not None:
+            self._dispatch_table_by_module = self._module_dispatch_table_factory(
+                self._dispatch_buckets
+            )
+        else:
+            self._dispatch_table_by_module = {}
+        self._validate_graph_capture_dispatch_coverage()
+
+    @staticmethod
+    def _module_for_role(role: str) -> str:
+        if role == QKV_ROLE:
+            return "qkv"
+        if role in (MLP_GATE_UP_ROLE, MLP_DOWN_ROLE):
+            return "mlp"
+        if role == WO_ROLE:
+            return "wo"
+        raise ValueError(f"unknown COTS role: {role}")
+
+    def _dispatch_table_for_role(self, role: str) -> dict[int, tuple[float, float]]:
+        module = self._module_for_role(role)
+        return self._dispatch_table_by_module.get(module, self._dispatch_table)
 
     def _install_prefetch_machinery(self) -> None:
         """Allocate prefetch buffers and install layer-level prefetch hooks."""
@@ -582,7 +621,7 @@ class CotsOffloader(BaseOffloader):
                 continue
             assert h.w_cpu is not None
             op_kind = LINEAR_OP_KIND_BY_ROLE[h.role]
-            for bucket in self._capture_buckets:
+            for bucket in self._dispatch_buckets:
                 n_pref = h.n_prefetch_by_bucket.get(bucket, 0)
                 n_cpu = h.n_cpu_compute_by_bucket.get(bucket, h.n_cpu)
                 if n_cpu == 0:
@@ -597,7 +636,7 @@ class CotsOffloader(BaseOffloader):
             assert gu_h.w_cpu is not None
             assert dn_h.w_cpu is not None
             n_cpu_per_half_total = gu_h.n_cpu // 2
-            for bucket in self._capture_buckets:
+            for bucket in self._dispatch_buckets:
                 gu_n_pref = gu_h.n_prefetch_by_bucket.get(bucket, 0)
                 dn_n_pref = dn_h.n_prefetch_by_bucket.get(bucket, 0)
                 dn_n_cpu = dn_h.n_cpu_compute_by_bucket.get(bucket, dn_h.n_cpu)
@@ -623,8 +662,8 @@ class CotsOffloader(BaseOffloader):
         buckets it has profile data for.
 
         Validation lives in `_validate_thread_policy` because
-        `_capture_buckets` is not known until `_resolve_capture_buckets`
-        runs in `wrap_modules`.
+        `_dispatch_buckets` is not known until `_resolve_bucket_sets` runs in
+        `wrap_modules`.
         """
         per_bucket = getattr(self.config, "cpu_num_threads_by_bucket", None)
         if per_bucket is None:
@@ -632,19 +671,19 @@ class CotsOffloader(BaseOffloader):
         return int(per_bucket.get(bucket, self.config.cpu_num_threads))
 
     def _validate_thread_policy(self) -> None:
-        """Reject `cpu_num_threads_by_bucket` keys that aren't captured
-        buckets — would silently fall back to scalar and the Planner's
-        intent would be lost."""
+        """Reject `cpu_num_threads_by_bucket` keys that aren't dispatch
+        buckets — would silently fall back to scalar and the Planner's intent
+        would be lost."""
         per_bucket = getattr(self.config, "cpu_num_threads_by_bucket", None)
         if per_bucket is None:
             return
-        unknown = set(per_bucket.keys()) - set(self._capture_buckets)
+        unknown = set(per_bucket.keys()) - set(self._dispatch_buckets)
         if unknown:
             raise ValueError(
                 f"cots: cpu_num_threads_by_bucket has keys "
-                f"{sorted(unknown)} that are not in cudagraph_capture_sizes "
-                f"({self._capture_buckets}). Per-bucket thread policy must "
-                f"only reference captured buckets."
+                f"{sorted(unknown)} that are not in COTS dispatch buckets "
+                f"({self._dispatch_buckets}). Per-bucket thread policy must "
+                f"only reference dispatch buckets."
             )
         for b, n in per_bucket.items():
             if n < 1:
@@ -655,35 +694,66 @@ class CotsOffloader(BaseOffloader):
     def _native_routing_uniform_across_buckets(self) -> bool:
         """Whether compile-visible operator geometry is bucket-invariant.
 
-        Native custom ops now resolve task_id from OOG dispatch state, but
-        Python-side routing geometry (`n_prefetch`, `n_cpu_compute`, scatter
-        indices, GPU branch shape) is still selected in the compiled forward.
-        FULL CUDA Graph mode is therefore only structurally sound for
-        uniform routing until that geometry is also moved behind an OOG or
-        per-capture boundary.
+        The dispatch bucket still selects native task ids at runtime, while the
+        route signature selects the compiled graph variant for Python-visible
+        geometry (`n_prefetch`, `n_cpu_compute`, scatter indices, GPU branch
+        shape). This helper remains useful as a diagnostic and for tests that
+        distinguish uniform and nonuniform routing.
         """
-        if not self._capture_buckets:
+        if not self._dispatch_buckets:
             return True
         for h in self._handles:
             pref_values = {
                 int(h.n_prefetch_by_bucket.get(bucket, 0))
-                for bucket in self._capture_buckets
+                for bucket in self._dispatch_buckets
             }
             cpu_values = {
                 int(h.n_cpu_compute_by_bucket.get(bucket, h.n_cpu))
-                for bucket in self._capture_buckets
+                for bucket in self._dispatch_buckets
             }
             if len(pref_values) > 1 or len(cpu_values) > 1:
                 return False
         return True
 
     def _compute_has_cpu_compute_work(self) -> bool:
-        """Whether any captured bucket leaves rows for CPU GEMM."""
+        """Whether any dispatch bucket leaves rows for CPU GEMM."""
         for h in self._handles:
-            for bucket in self._capture_buckets:
+            for bucket in self._dispatch_buckets:
                 if int(h.n_cpu_compute_by_bucket.get(bucket, h.n_cpu)) > 0:
                     return True
         return False
+
+    def _build_route_signatures(self) -> None:
+        """Assign stable ids to compile-visible COTS route geometries.
+
+        The dispatch bucket selects the Planner row and native slabs. The
+        route signature captures only Python-visible geometry that can change
+        the traced graph: CPU/prefetch slice sizes and therefore branch/scatter
+        structure. Buckets with identical geometry share a signature so
+        torch.compile does not build redundant variants.
+        """
+        signature_for_geometry: dict[tuple[tuple[str, int, int], ...], int] = {}
+        route_signature_by_bucket: dict[int, int] = {}
+        for bucket in self._dispatch_buckets:
+            geometry = tuple(
+                (
+                    h.role,
+                    int(h.n_prefetch_by_bucket.get(bucket, 0)),
+                    int(h.n_cpu_compute_by_bucket.get(bucket, h.n_cpu)),
+                )
+                for h in self._handles
+            )
+            signature = signature_for_geometry.get(geometry)
+            if signature is None:
+                signature = len(signature_for_geometry) + 1
+                signature_for_geometry[geometry] = signature
+            route_signature_by_bucket[int(bucket)] = int(signature)
+        self._route_signature_by_bucket = route_signature_by_bucket
+
+    def _route_signature_for_bucket(self, bucket: int) -> int:
+        if not self._route_signature_by_bucket and self._handles:
+            self._build_route_signatures()
+        return int(self._route_signature_by_bucket.get(int(bucket), int(bucket)))
 
     def _build_native_slab_specs(self) -> list[NativeWeightSlabSpec]:
         """Build the per-(layer, bucket, op_kind) slab specs that
@@ -704,7 +774,7 @@ class CotsOffloader(BaseOffloader):
                 continue
             assert h.w_cpu is not None
             op_kind = LINEAR_OP_KIND_BY_ROLE[h.role]
-            for bucket in self._capture_buckets:
+            for bucket in self._dispatch_buckets:
                 n_pref = h.n_prefetch_by_bucket.get(bucket, 0)
                 n_cpu = h.n_cpu_compute_by_bucket.get(bucket, h.n_cpu)
                 if n_cpu == 0:
@@ -728,7 +798,7 @@ class CotsOffloader(BaseOffloader):
             assert gu_h.w_cpu is not None
             assert dn_h.w_cpu is not None
             n_cpu_per_half_total = gu_h.n_cpu // 2
-            for bucket in self._capture_buckets:
+            for bucket in self._dispatch_buckets:
                 gu_n_pref = gu_h.n_prefetch_by_bucket.get(bucket, 0)
                 dn_n_pref = dn_h.n_prefetch_by_bucket.get(bucket, 0)
                 dn_n_cpu = dn_h.n_cpu_compute_by_bucket.get(bucket, dn_h.n_cpu)
@@ -831,20 +901,72 @@ class CotsOffloader(BaseOffloader):
 
         layer.forward = forward
 
-    def _bucket_for(self, num_tokens: int) -> int:
-        """Round-up lookup on `_capture_buckets`. Returns the bucket key
-        (matches `lookup_dispatch`'s rounding semantics). Out-of-range returns
-        the largest captured bucket.
+    def _dispatch_bucket_for(self, num_tokens: int) -> int:
+        """Round-up lookup on `_dispatch_buckets`.
+
+        Returns the Planner/COTS dispatch bucket key that should select routing
+        geometry and native runner slabs. Out-of-range returns the largest
+        dispatch bucket.
 
         This used to call `bisect.bisect_left`, but the C builtin was not
         Dynamo-friendly when bucket repair lived in a traced pre-hook. Keeping
         the simple linear scan avoids reintroducing that constraint, and this
         runs once per forward boundary rather than per GEMM.
         """
-        for bucket in self._capture_buckets:
+        for bucket in self._dispatch_buckets:
             if num_tokens <= bucket:
                 return bucket
-        return self._capture_buckets[-1]
+        return self._dispatch_buckets[-1]
+
+    def _bucket_for(self, num_tokens: int) -> int:
+        """Compatibility helper for existing direct tests.
+
+        Runtime code should use `_dispatch_bucket_for` so the name keeps graph
+        capture shape separate from COTS route selection.
+        """
+        for bucket in self._dispatch_buckets:
+            if num_tokens <= bucket:
+                return bucket
+        return self._dispatch_buckets[-1]
+
+    def _dispatch_bucket_from_descriptor(self, batch_descriptor) -> int:
+        bucket = getattr(batch_descriptor, "cots_dispatch_bucket", None)
+        if bucket is None:
+            return self._dispatch_bucket_for(int(batch_descriptor.num_tokens))
+        bucket = int(bucket)
+        if bucket not in self._dispatch_buckets:
+            raise RuntimeError(
+                "CotsOffloader: BatchDescriptor carries unknown "
+                f"cots_dispatch_bucket={bucket}; known dispatch buckets are "
+                f"{self._dispatch_buckets}."
+            )
+        return bucket
+
+    def decorate_batch_descriptor(
+        self, batch_descriptor: BatchDescriptor
+    ) -> BatchDescriptor:
+        if not self._dispatch_buckets:
+            self._resolve_bucket_sets()
+        bucket = self._dispatch_bucket_for(int(batch_descriptor.num_tokens))
+        signature = self._route_signature_for_bucket(bucket)
+        if (
+            batch_descriptor.cots_dispatch_bucket == bucket
+            and batch_descriptor.cots_route_signature == signature
+        ):
+            return batch_descriptor
+        return replace(
+            batch_descriptor,
+            cots_dispatch_bucket=bucket,
+            cots_route_signature=signature,
+        )
+
+    def _prepare_before_forward_bucket(self, num_tokens: int, bucket: int) -> None:
+        self._current_bucket = int(bucket)
+        if self._streamer is None:
+            return
+        self._streamer.current_bucket = int(bucket)
+        if self._layer_handles:
+            self._streamer.prepare_for_forward_bucket(0, self._layer_handles[0])
 
     # --- BaseOffloader lifecycle delegation ---
 
@@ -864,12 +986,9 @@ class CotsOffloader(BaseOffloader):
         paths. The C++ runtime token row cap is pushed separately by
         `on_dispatch`, outside captured graphs.
         """
-        self._current_bucket = self._bucket_for(num_tokens)
-        if self._streamer is None:
-            return
-        self._streamer.set_current_bucket(num_tokens, self._bucket_for)
-        if self._layer_handles:
-            self._streamer.prepare_for_forward_bucket(0, self._layer_handles[0])
+        self._prepare_before_forward_bucket(
+            num_tokens, self._dispatch_bucket_for(num_tokens)
+        )
 
     def _operator_bucket(self, x_rows: int) -> int:
         """Return the operator routing bucket for the active forward.
@@ -888,7 +1007,7 @@ class CotsOffloader(BaseOffloader):
                 "must call CotsOffloader.on_dispatch before native COTS "
                 "operators execute or capture."
             )
-        return self._bucket_for(x_rows)
+        return self._dispatch_bucket_for(x_rows)
 
     def set_live_num_tokens(self, live_num_tokens: int) -> None:
         """Push the live unpadded token count to the C++ worker.
@@ -937,10 +1056,8 @@ class CotsOffloader(BaseOffloader):
         """
         num_tokens_padded = int(info.batch_descriptor.num_tokens)
         num_tokens_unpadded = int(info.num_tokens_unpadded)
-        self.prepare_before_forward(num_tokens_padded)
-        active_bucket = self._current_bucket
-        if active_bucket is None:
-            active_bucket = self._bucket_for(num_tokens_padded)
+        active_bucket = self._dispatch_bucket_from_descriptor(info.batch_descriptor)
+        self._prepare_before_forward_bucket(num_tokens_padded, active_bucket)
         if self._has_cpu_compute_work and isinstance(
             self._runner, NativeCotsWeightRunner
         ):
@@ -968,6 +1085,23 @@ class CotsOffloader(BaseOffloader):
         """Drain and release the shared CPU runner at worker shutdown."""
         if self._runner is None:
             return
+        if os.environ.get("VLLM_COTS_DUMP_COUNTERS_ON_SHUTDOWN", "0") == "1":
+            import json
+
+            from vllm.model_executor.offloader import cots_ops
+
+            if (
+                torch.cuda.is_available()
+                and torch.cuda.is_initialized()
+                and isinstance(self._runner, NativeCotsWeightRunner)
+            ):
+                torch.cuda.current_stream().synchronize()
+                cots_ops.sync_blocking(self._runner._runner_id)
+            counters = cots_ops.get_all_counters()
+            logger.info(
+                "[CotsOffloader] counters: %s",
+                json.dumps(counters, sort_keys=True),
+            )
         self._runner.close()
         self._runner = None
 
@@ -987,9 +1121,9 @@ class CotsOffloader(BaseOffloader):
         if self._streamer is not None:
             self._streamer.join_after_forward()
 
-    # --- Capture-bucket resolution ---
+    # --- Graph/dispatch bucket resolution ---
 
-    def _resolve_capture_buckets(self) -> None:
+    def _resolve_bucket_sets(self) -> None:
         from vllm.config import get_current_vllm_config
 
         vllm_config = get_current_vllm_config()
@@ -997,11 +1131,90 @@ class CotsOffloader(BaseOffloader):
         capture_sizes = list(
             vllm_config.compilation_config.cudagraph_capture_sizes or []
         )
-        if not capture_sizes:
-            capture_sizes = [self._max_num_tokens]
-        # Tuple (not list) so Dynamo treats `_capture_buckets` as a constant
-        # container during graph capture.
-        self._capture_buckets = tuple(sorted(set(capture_sizes)))
+        self._graph_capture_buckets = tuple(sorted(set(capture_sizes)))
+
+        configured = self._configured_dispatch_buckets()
+        dispatch_sizes = configured or self._default_dispatch_buckets(vllm_config)
+        if not dispatch_sizes:
+            dispatch_sizes = [self._max_num_tokens]
+        # Tuple (not list) so Dynamo treats the bucket container as constant if
+        # a direct-test Python fallback ever reaches `_dispatch_bucket_for` while
+        # tracing. Normal native forwards publish the active bucket OOG.
+        self._dispatch_buckets = tuple(sorted(set(int(b) for b in dispatch_sizes)))
+
+    def _configured_dispatch_buckets(self) -> list[int]:
+        """Return explicit Planner bucket keys, if any were provided."""
+        keys: set[int] = set()
+        if self.config.dispatch_table is not None:
+            keys.update(int(bucket) for bucket in self.config.dispatch_table)
+        if self.config.dispatch_table_by_module is not None:
+            for table in self.config.dispatch_table_by_module.values():
+                keys.update(int(bucket) for bucket in table)
+        return sorted(keys)
+
+    def _default_dispatch_buckets(self, vllm_config) -> list[int]:
+        """Default Planner bucket grid for COTS dispatch.
+
+        In graph mode this starts from vLLM's actual CUDA graph capture sizes.
+        In eager mode vLLM intentionally clears those sizes, so COTS rebuilds
+        the same would-have-been decode grid. Both modes add a small set of
+        larger fallback buckets for non-captured prefill/mixed forwards.
+        """
+        if self._graph_capture_buckets:
+            buckets = list(self._graph_capture_buckets)
+        else:
+            buckets = self._would_have_been_graph_buckets(vllm_config)
+        buckets.extend(self._large_dispatch_fallback_buckets(self._max_num_tokens))
+        return sorted(set(buckets))
+
+    @staticmethod
+    def _would_have_been_graph_buckets(vllm_config) -> list[int]:
+        scheduler_config = vllm_config.scheduler_config
+        compilation_config = vllm_config.compilation_config
+        max_num_tokens = int(scheduler_config.max_num_batched_tokens)
+        max_capture_size = compilation_config.max_cudagraph_capture_size
+        if max_capture_size is None or int(max_capture_size) <= 0:
+            decode_query_len = 1
+            speculative_config = getattr(vllm_config, "speculative_config", None)
+            if speculative_config and speculative_config.num_speculative_tokens:
+                decode_query_len += int(speculative_config.num_speculative_tokens)
+            max_capture_size = min(
+                int(scheduler_config.max_num_seqs) * decode_query_len * 2,
+                512,
+            )
+        max_capture_size = min(max_num_tokens, int(max_capture_size))
+        if max_capture_size < 1:
+            return []
+
+        performance_mode = getattr(vllm_config, "performance_mode", None)
+        if performance_mode == "interactivity":
+            interactivity_max = min(max_capture_size, 32)
+            buckets = list(range(1, interactivity_max + 1))
+        else:
+            buckets = [i for i in (1, 2, 4) if i <= max_capture_size]
+        if max_capture_size >= 8:
+            buckets.extend(range(8, min(max_capture_size + 1, 256), 8))
+        if max_capture_size >= 256:
+            buckets.extend(range(256, max_capture_size + 1, 16))
+        return sorted(set(buckets))
+
+    @staticmethod
+    def _large_dispatch_fallback_buckets(max_num_tokens: int) -> list[int]:
+        candidates = (768, 1024, 1536, 2048, 3072, 4096, 6144, 8192)
+        buckets = [b for b in candidates if b <= max_num_tokens]
+        if max_num_tokens > 0:
+            buckets.append(int(max_num_tokens))
+        return buckets
+
+    def _validate_graph_capture_dispatch_coverage(self) -> None:
+        missing = sorted(set(self._graph_capture_buckets) - set(self._dispatch_buckets))
+        if missing:
+            raise ValueError(
+                "CotsOffloader: COTS dispatch buckets are missing CUDA graph "
+                f"capture buckets: {missing}. Captured graph buckets must map "
+                "1:1 to dispatch rows so graph replay cannot use a different "
+                "routing policy from capture."
+            )
 
     # --- Activation buffer allocation ---
 
@@ -1156,28 +1369,7 @@ class CotsOffloader(BaseOffloader):
                     f"ImportError: {e}"
                 ) from e
 
-        cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
-        has_full_cudagraphs = (
-            cudagraph_mode is not None and cudagraph_mode.has_full_cudagraphs()
-        )
-        if (
-            cpu_runner == "native"
-            and not vllm_config.model_config.enforce_eager
-            and has_full_cudagraphs
-            and not self._native_routing_uniform_across_buckets()
-        ):
-            raise RuntimeError(
-                "CotsOffloader: native FULL CUDA Graph mode requires uniform "
-                "COTS routing geometry across capture buckets. The native "
-                "custom ops now resolve slab task_id from OOG dispatch state, "
-                "but Python-side routing geometry (n_prefetch/n_cpu_compute "
-                "and scatter shape) is still compile-visible. Use "
-                "enforce_eager=True, disable FULL cudagraphs, or use a "
-                "uniform dispatch table until routing geometry is moved "
-                "behind the same structural dispatch boundary."
-            )
-
-        self._eager_fallback_entry = self._dispatch_table[self._capture_buckets[-1]]
+        self._eager_fallback_entry = self._dispatch_table[self._dispatch_buckets[-1]]
 
         # Install the runner's per-(layer, bucket, op_kind) work table after
         # the underlying CPU and pinned storages are stable.
@@ -1234,7 +1426,7 @@ class CotsOffloader(BaseOffloader):
             "linears=%d, mlp_blocks=%d, wo_ops=%d, weights_saved=%.4f GB, "
             "buffers=%.4f GB "
             "pinned_in + %.4f GB pinned_out + %.4f GB gpu_uva, "
-            "prefetch_pool=%.4f GB, buckets=%s",
+            "prefetch_pool=%.4f GB, graph_buckets=%s, dispatch_buckets=%s",
             cpu_runner,
             weight_capture_sync_mode,
             sorted(self.weight_modules),
@@ -1246,14 +1438,15 @@ class CotsOffloader(BaseOffloader):
             y_pinned_gb,
             y_gpu_gb,
             prefetch_gb,
-            self._capture_buckets,
+            self._graph_capture_buckets,
+            self._dispatch_buckets,
         )
 
         # Effective routing breakdown — actual bytes routed through each
         # path, accounting for head-aligned snapping and per-role geometry.
-        # Reported at the largest capture bucket (worst case for prefetch
+        # Reported at the largest dispatch bucket (worst case for prefetch
         # buffer sizing).
-        bucket = self._capture_buckets[-1]
+        bucket = self._dispatch_buckets[-1]
         elem = self._handles[0].dtype.itemsize
         per_role_pref = {"qkv": 0, "mlp_col": 0, "mlp_row": 0, "wo": 0}
         per_role_cpu = {"qkv": 0, "mlp_col": 0, "mlp_row": 0, "wo": 0}
@@ -1294,7 +1487,7 @@ class CotsOffloader(BaseOffloader):
     # --- Runtime: dispatch lookup ---
 
     def lookup_dispatch(self, num_tokens: int) -> tuple[float, float]:
-        """Round `num_tokens` up to the nearest capture bucket."""
-        if num_tokens > self._capture_buckets[-1]:
+        """Round `num_tokens` up to the nearest COTS dispatch bucket."""
+        if num_tokens > self._dispatch_buckets[-1]:
             return self._eager_fallback_entry
-        return self._dispatch_table[self._bucket_for(num_tokens)]
+        return self._dispatch_table[self._dispatch_bucket_for(num_tokens)]

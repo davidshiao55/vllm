@@ -36,6 +36,10 @@ class ForwardDispatchInfo:
     - `num_tokens_unpadded` is the live row count. Graph/slab sizes
       remain bucket-capacity sized; offloaders may use this value to
       avoid doing CPU work for padded rows.
+    - `batch_descriptor.cots_dispatch_bucket`, when present, is the
+      planner route bucket associated with the graph/compile variant.
+      Offloaders may use it instead of deriving route selection from
+      `batch_descriptor.num_tokens`.
     """
 
     batch_descriptor: "BatchDescriptor"
@@ -119,6 +123,17 @@ class BaseOffloader(ABC):
         self.prepare_before_forward(info.batch_descriptor.num_tokens)
         self.sync_prev_onload()
         self.set_live_num_tokens(info.num_tokens_unpadded)
+
+    def decorate_batch_descriptor(self, batch_descriptor: "BatchDescriptor"):
+        """Add offloader-specific graph/compile route identity.
+
+        CUDAGraph dispatchers call this when they construct a runtime/capture
+        `BatchDescriptor`. Most offloaders leave it unchanged. COTS uses it to
+        attach the planner dispatch bucket and compile-visible route signature
+        so CUDA graph and torch.compile variants are selected by the same
+        structural route that the runtime will execute.
+        """
+        return batch_descriptor
 
     def post_cudagraph_capture(self) -> None:  # noqa: B027
         """One-shot hook fired by `cudagraph_utils.CudaGraphManager.capture`
@@ -251,20 +266,45 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
                 for bucket, pair in cots.dispatch_table.items()
             }
 
-            def dispatch_table_factory(capture_buckets):
-                missing = sorted(set(capture_buckets) - set(configured_table))
+            def dispatch_table_factory(dispatch_buckets):
+                missing = sorted(set(dispatch_buckets) - set(configured_table))
                 if missing:
                     raise ValueError(
-                        f"cots.dispatch_table is missing captured buckets: {missing}"
+                        f"cots.dispatch_table is missing dispatch buckets: {missing}"
                     )
                 return {
                     int(bucket): configured_table[int(bucket)]
-                    for bucket in capture_buckets
+                    for bucket in dispatch_buckets
                 }
+
+        module_dispatch_table_factory = None
+        if cots.dispatch_table_by_module is not None:
+            configured_by_module = {
+                str(module): {
+                    int(bucket): (float(pair[0]), float(pair[1]))
+                    for bucket, pair in table.items()
+                }
+                for module, table in cots.dispatch_table_by_module.items()
+            }
+
+            def module_dispatch_table_factory(dispatch_buckets):
+                resolved = {}
+                for module, table in configured_by_module.items():
+                    missing = sorted(set(dispatch_buckets) - set(table))
+                    if missing:
+                        raise ValueError(
+                            "cots.dispatch_table_by_module "
+                            f"{module!r} is missing dispatch buckets: {missing}"
+                        )
+                    resolved[module] = {
+                        int(bucket): table[int(bucket)] for bucket in dispatch_buckets
+                    }
+                return resolved
 
         return CotsOffloader(
             config=cots,
             dispatch_table_factory=dispatch_table_factory,
+            module_dispatch_table_factory=module_dispatch_table_factory,
         )
     else:
         return NoopOffloader()
