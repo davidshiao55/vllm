@@ -28,18 +28,17 @@ class ForwardDispatchInfo:
     on the active runner path, and by legacy cudagraph utilities when
     they drive forwards directly.
 
-    - `batch_descriptor.num_tokens` is the authoritative dispatched
-      bucket (padded). Replaces the in-graph pre-hook's
-      `anchor.shape[0]` inference, which saturated to the persistent
-      input-buffer size under FULL CUDA Graph capture and made
-      per-bucket Planner outputs ineffective at runtime.
+    - `batch_descriptor.num_tokens` is the padded forward shape / CUDA graph
+      replay capacity. It replaces the in-graph pre-hook's `anchor.shape[0]`
+      inference, which saturated to the persistent input-buffer size under FULL
+      CUDA Graph capture.
     - `num_tokens_unpadded` is the live row count. Graph/slab sizes
       remain bucket-capacity sized; offloaders may use this value to
       avoid doing CPU work for padded rows.
     - `batch_descriptor.cots_dispatch_bucket`, when present, is the
-      planner route bucket associated with the graph/compile variant.
-      Offloaders may use it instead of deriving route selection from
-      `batch_descriptor.num_tokens`.
+      authoritative planner route bucket associated with the graph/compile
+      variant. Offloaders should use it for route selection instead of treating
+      `batch_descriptor.num_tokens` as a dispatch bucket.
     """
 
     batch_descriptor: "BatchDescriptor"

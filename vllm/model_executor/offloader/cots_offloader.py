@@ -918,17 +918,6 @@ class CotsOffloader(BaseOffloader):
                 return bucket
         return self._dispatch_buckets[-1]
 
-    def _bucket_for(self, num_tokens: int) -> int:
-        """Compatibility helper for existing direct tests.
-
-        Runtime code should use `_dispatch_bucket_for` so the name keeps graph
-        capture shape separate from COTS route selection.
-        """
-        for bucket in self._dispatch_buckets:
-            if num_tokens <= bucket:
-                return bucket
-        return self._dispatch_buckets[-1]
-
     def _dispatch_bucket_from_descriptor(self, batch_descriptor) -> int:
         bucket = getattr(batch_descriptor, "cots_dispatch_bucket", None)
         if bucket is None:

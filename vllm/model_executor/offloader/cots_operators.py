@@ -115,7 +115,7 @@ class CotsOutputSplitLinearOp:
         # on `b`). If prefetch is inactive (`max_n_prefetch == 0`)
         # every bucket has n_pref=0 and n_cpu_compute=h.n_cpu, so we
         # can use h.n_cpu directly. Python-runner tests that bypass
-        # on_dispatch may still fall back to `_bucket_for(x_rows)`;
+        # on_dispatch may still fall back to `_dispatch_bucket_for(x_rows)`;
         # native forwards require the explicit OOG dispatch boundary.
         # §1c.19: resolve bucket to a non-None int up-front. The runner
         # facade does NOT carry a `bucket_for_fallback` callable anymore
