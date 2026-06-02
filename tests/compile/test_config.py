@@ -306,11 +306,36 @@ def test_cots_auto_graph_split_does_not_mutate_shared_cots_config():
     assert cots.weight_capture_sync_mode == "host_callback"
 
 
-def test_cots_auto_graph_split_can_be_disabled():
+def test_cots_auto_graph_split_can_be_disabled_for_full_graph_cpu_compute():
     config = VllmConfig(
         offload_config=OffloadConfig(
             offload_backend="cots",
             cots=CotsOffloadConfig(f_cpu_store=0.05, auto_graph_split=False),
+        ),
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE,
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        ),
+    )
+
+    from vllm.compilation.decorators import _uses_native_cots_weight_graph
+
+    assert config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
+    assert config.offload_config.cots.weight_capture_sync_mode == "host_callback"
+    assert _uses_native_cots_weight_graph(config)
+    for op in CompilationConfig.cots_splitting_ops():
+        assert op not in config.compilation_config.splitting_ops
+
+
+def test_cots_auto_graph_split_can_be_disabled_for_pure_prefetch():
+    config = VllmConfig(
+        offload_config=OffloadConfig(
+            offload_backend="cots",
+            cots=CotsOffloadConfig(
+                f_cpu_store=0.05,
+                f_prefetch=0.05,
+                auto_graph_split=False,
+            ),
         ),
         compilation_config=CompilationConfig(
             mode=CompilationMode.VLLM_COMPILE,

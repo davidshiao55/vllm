@@ -647,6 +647,21 @@ def wrap_with_cudagraph_if_needed(
     # CUDAGraphWrapper for piecewise_backend, to distinguish
     # it from the FULL cudagraph runtime mode, no matter it
     # is wrapped on a full or piecewise fx graph.
+    cots_config = vllm_config.offload_config.cots
+    native_cots_weight_graph = (
+        vllm_config.offload_config.offload_backend == "cots"
+        and cots_config.f_cpu_store > 0
+        and cots_config.cpu_runner == "native"
+    )
+    splitting_ops = {str(op) for op in compilation_config.splitting_ops or []}
+    cots_prefetch_split = {
+        "vllm::wait_prefetch",
+        "vllm::start_prefetch",
+        "vllm::cots_submit_gemm",
+        "vllm::cots_sync_then_uva",
+    }.issubset(splitting_ops) and native_cots_weight_graph
+    # COTS prefetch hooks run out of graph and carry their own event waits.
+    # A wrapper-level wait_stream before every piece would serialize H2D.
     return static_graph_wrapper_class(
         runnable=piecewise_backend,
         vllm_config=vllm_config,
@@ -655,6 +670,9 @@ def wrap_with_cudagraph_if_needed(
             debug_log_enable=is_first_graph,
             gc_disable=not is_first_graph,
             weak_ref_output=is_last_graph,
+            sync_offloader_before_capture=not cots_prefetch_split,
+            sync_offloader_before_replay=not cots_prefetch_split,
+            join_offloader_after_capture=not cots_prefetch_split,
         ),
     )
 

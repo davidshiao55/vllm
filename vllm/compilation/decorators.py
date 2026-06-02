@@ -19,6 +19,7 @@ from vllm.compilation.counter import compilation_counter
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 from vllm.config import (
     CompilationMode,
+    CUDAGraphMode,
     VllmConfig,
     get_current_vllm_config,
     set_current_vllm_config,
@@ -47,20 +48,19 @@ IGNORE_COMPILE_KEY = "_ignore_compile_vllm"
 _T = TypeVar("_T", bound=nn.Module)
 
 
-def _uses_fast_cots_piecewise_split(vllm_config: VllmConfig) -> bool:
+def _uses_native_cots_weight_graph(vllm_config: VllmConfig) -> bool:
+    # Native COTS weight routes can change the custom-op surface
+    # (pure prefetch vs CPU submit/sync). AOT artifacts are not keyed by
+    # BatchDescriptor.cots_route_signature, so CUDA graph capture must go
+    # through TorchCompileWithNoGuardsWrapper's route-specialized variants.
     compilation_config = vllm_config.compilation_config
-    splitting_ops = {str(op) for op in compilation_config.splitting_ops}
-    has_cots_boundary = bool(
-        {
-            "vllm::cots_submit_gemm",
-            "vllm::cots_sync_then_uva",
-        }
-        & splitting_ops
-    )
+    cots_config = vllm_config.offload_config.cots
     return (
-        has_cots_boundary
-        and getattr(compilation_config.cudagraph_mode, "name", "") == "PIECEWISE"
-        and compilation_config.use_inductor_graph_partition is False
+        vllm_config.offload_config.offload_backend == "cots"
+        and cots_config.f_cpu_store > 0
+        and cots_config.cpu_runner == "native"
+        and compilation_config.mode == CompilationMode.VLLM_COMPILE
+        and compilation_config.cudagraph_mode != CUDAGraphMode.NONE
     )
 
 
@@ -484,8 +484,10 @@ def _support_torch_compile(
         ds_type = self.compilation_config.dynamic_shapes_config.type
         cache_dir = None
         aot_compilation_path = None
-        disable_aot_for_fast_cots = _uses_fast_cots_piecewise_split(self.vllm_config)
-        if envs.VLLM_USE_AOT_COMPILE and not disable_aot_for_fast_cots:
+        disable_aot_for_cots_weight_graph = _uses_native_cots_weight_graph(
+            self.vllm_config
+        )
+        if envs.VLLM_USE_AOT_COMPILE and not disable_aot_for_cots_weight_graph:
             """
             When using torch.compile in AOT mode, we store the cache artifacts
             under VLLM_CACHE_ROOT/torch_compile_cache/torch_aot_compile/{hash}
@@ -529,7 +531,7 @@ def _support_torch_compile(
         if self.compiled:
             assert (
                 not envs.VLLM_USE_AOT_COMPILE
-                or disable_aot_for_fast_cots
+                or disable_aot_for_cots_weight_graph
                 or self.vllm_config.compilation_config.backend == "eager"
             )
             return TorchCompileWithNoGuardsWrapper.__call__(self, *args, **kwargs)  # type: ignore[arg-type]
@@ -607,10 +609,10 @@ def _support_torch_compile(
             if self.vllm_config.compilation_config.backend == "eager":
                 logger.warning("Detected eager backend, disabling AOT compile.")
                 use_aot_compile = False
-            if use_aot_compile and disable_aot_for_fast_cots:
+            if use_aot_compile and disable_aot_for_cots_weight_graph:
                 logger.warning_once(
-                    "Disabling AOT compile for COTS fast piecewise split because "
-                    "PyTorch cannot serialize all nested standalone subgraphs.",
+                    "Disabling AOT compile for native COTS weight graph because "
+                    "COTS graph capture needs route-specialized compile variants.",
                     scope="local",
                 )
                 use_aot_compile = False

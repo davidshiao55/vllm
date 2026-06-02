@@ -421,11 +421,11 @@ class ModelCudaGraphManager(CudaGraphManager):
             )
 
             def forward_fn(cg_mode: CUDAGraphMode) -> None:
-                batch_descriptor = (
-                    _batch_descriptor_from_execution(desc)
-                    if cg_mode == CUDAGraphMode.PIECEWISE
-                    else None
-                )
+                # Keep the decorated descriptor available even when this helper
+                # captures FULL graphs by asking the model to run with runtime
+                # mode NONE inside the outer torch.cuda.graph. Native COTS uses
+                # it for route-specialized torch.compile variants.
+                batch_descriptor = _batch_descriptor_from_execution(desc)
                 with set_forward_context(
                     attn_metadata if cg_mode != CUDAGraphMode.PIECEWISE else None,
                     self.vllm_config,

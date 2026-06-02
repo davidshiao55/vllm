@@ -140,6 +140,9 @@ class CUDAGraphOptions:
     debug_log_enable: bool = True
     gc_disable: bool = False
     weak_ref_output: bool = True
+    sync_offloader_before_capture: bool = True
+    sync_offloader_before_replay: bool = True
+    join_offloader_after_capture: bool = True
 
 
 class CUDAGraphWrapper:
@@ -300,9 +303,11 @@ class CUDAGraphWrapper:
                 else:
                     set_graph_pool_id(current_platform.graph_pool_handle())
 
-                # Sync offloader's copy stream before capture.
-                # Ensure any pre-capture prefetches from offloader are complete.
-                get_offloader().sync_prev_onload()
+                if self.cudagraph_options.sync_offloader_before_capture:
+                    # Sync offloader's copy stream before capture. COTS
+                    # fast piecewise graphs split prefetch hooks out of the
+                    # graph and rely on those hooks for layer-local waits.
+                    get_offloader().sync_prev_onload()
 
                 # mind-exploding: carefully manage the reference and memory.
                 with torch.cuda.graph(
@@ -312,11 +317,11 @@ class CUDAGraphWrapper:
                 ):
                     # `output` is managed by pytorch's cudagraph pool
                     output = self.runnable(*args, **kwargs)
-                    # Join offloader's copy stream after forward to avoid
-                    # unjoined stream error. The last layer's start_prefetch
-                    # forks copy_stream, but wait_prefetch only happens in
-                    # the next forward pass.
-                    get_offloader().join_after_forward()
+                    if self.cudagraph_options.join_offloader_after_capture:
+                        # Join offloader's copy stream after forward to avoid
+                        # unjoined stream error for prefetches captured inside
+                        # this graph.
+                        get_offloader().join_after_forward()
                     if self.cudagraph_options.weak_ref_output:
                         # by converting it to weak ref,
                         # the original `output` will immediately be released
@@ -349,8 +354,9 @@ class CUDAGraphWrapper:
                 f"got {new_input_addresses}"
             )
 
-        # Sync offloader before replay - ensures any external dependencies
-        # from pre-capture prefetches are satisfied.
-        get_offloader().sync_prev_onload()
+        if self.cudagraph_options.sync_offloader_before_replay:
+            # Sync offloader before replay - ensures any external dependencies
+            # from pre-capture prefetches are satisfied.
+            get_offloader().sync_prev_onload()
         entry.cudagraph.replay()
         return entry.output

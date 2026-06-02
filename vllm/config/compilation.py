@@ -719,6 +719,8 @@ class CompilationConfig:
 
     # COTS graph-boundary ops; used by the thesis COTS fast split default.
     _cots_ops: ClassVar[list[str]] = [
+        "vllm::wait_prefetch",
+        "vllm::start_prefetch",
         "vllm::cots_submit_gemm",
         "vllm::cots_sync_then_uva",
     ]
