@@ -7229,12 +7229,14 @@ class GPUModelRunner(
         self.cots_runtime.set_hybrid_kv(self.cots_hybrid_kv)
         logger.info(
             "Initialized COTS hybrid CPU KV store: split_blocks=%d, "
-            "block_size=%d, split_tokens=%d, cpu_blocks=%d, layers=%d",
+            "block_size=%d, split_tokens=%d, cpu_blocks=%d, layers=%d, "
+            "cpu_pool_bytes=%d",
             self.cots_hybrid_kv.split_blocks,
             self.cots_hybrid_kv.block_size,
             self.cots_hybrid_kv.split_tokens,
             self.cots_hybrid_kv.num_cpu_blocks,
             len(layer_names),
+            cots_config.kv_cpu_pool_bytes,
         )
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(

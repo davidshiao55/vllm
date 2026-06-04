@@ -442,7 +442,12 @@ class CotsSwiGLUMLPOp:
                 self._runner.wait_and_uva(y2_gpu, gpu_a, gpu_b, x, desc)
             # When CPU is the sole contributor, clone — y2_gpu is a shared
             # activation buffer and would be clobbered by the next layer.
-            out_gpu = y2_gpu.clone() if out_gpu is None else out_gpu.add_(y2_gpu)
+            #
+            # Keep the mixed GPU+CPU merge out-of-place. `out_gpu` was just
+            # passed as a mutating ordering anchor to cots_sync_then_uva; doing
+            # a second in-place mutation on the same tensor is fragile under
+            # torch.compile + CUDA graph capture for no-prefetch routes.
+            out_gpu = y2_gpu.clone() if out_gpu is None else out_gpu + y2_gpu
 
         if out_gpu is None:
             # Dry-run/full-offload corner: CPU and prefetched contributions are

@@ -497,9 +497,11 @@ class CotsLinearHandle:
             self.prefetch_indices_cuda_by_bucket[bucket] = pref_idx.to(device)
             self.cpu_compute_indices_cuda_by_bucket[bucket] = cpu_idx.to(device)
 
-        self.max_n_prefetch = (
-            max(self.n_prefetch_by_bucket.values()) if dispatch_table else 0
-        )
+        # Planner option-A accounting reserves full CPU-stored prefetch slot
+        # capacity for a placement fraction, independent of the per-bucket
+        # dispatch table. Runtime copies still narrow to
+        # `n_prefetch_by_bucket[b]`, so this only changes reserved capacity.
+        self.max_n_prefetch = self.n_cpu if dispatch_table else 0
 
     def _compute_bucket_split(
         self, f_prefetch: float
@@ -720,7 +722,8 @@ class CotsLinearHandle:
 #   input split  : (max_n_prefetch, out_dim)  — prefetch dim 0
 # MLP gate/up slots are filled in active-bucket-adjacent layout
 # `[gate_active | up_active]`.
-# Sized to `max_n_prefetch` (max across buckets); per-forward H2D narrows.
+# Sized to the full CPU-stored slice (`max_n_prefetch == n_cpu`);
+# per-forward H2D narrows to the active bucket's `n_prefetch_by_bucket[b]`.
 # ---------------------------------------------------------------------------
 class CotsPrefetchBufferPool:
     """K=2 slot rotation. K slots PER UNIQUE shape, SHARED across layers.

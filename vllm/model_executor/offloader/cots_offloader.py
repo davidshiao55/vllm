@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Callable, Generator, Sequence
 from dataclasses import replace
@@ -237,9 +238,10 @@ class CotsOffloader(BaseOffloader):
         # skip these pinned/GPU scratch buffers entirely.
         if self._has_cpu_compute_work:
             self._allocate_activation_buffers()
-        # Install based on effective dispatch table, not config knob — a
-        # Planner-emitted table can request prefetch even when config
-        # f_prefetch == 0.
+        # Install based on option-A reserved capacity, not the config fallback
+        # knob. A Planner-emitted table can request prefetch even when config
+        # f_prefetch == 0, and zero-prefetch tables still reserve full-store
+        # slots so runtime accounting matches planner GPU buffer accounting.
         if any(h.max_n_prefetch > 0 for h in self._handles):
             self._install_prefetch_machinery()
         logger.debug(
@@ -867,6 +869,79 @@ class CotsOffloader(BaseOffloader):
                     mask |= 1 << int(cpu_id)
                 cots_ops.set_worker_affinity(self._runner._runner_id, mask)
 
+    def _cots_snap_payload(
+        self,
+        *,
+        cpu_weight_bytes: int,
+        gpu_output_scratch_bytes: int,
+        gpu_prefetch_pool_bytes: int,
+    ) -> dict[str, object]:
+        """Structured runtime realization for profiler/planner handoff."""
+
+        gpu_buffer_bytes = int(gpu_output_scratch_bytes + gpu_prefetch_pool_bytes)
+        storage_key = f"{float(self.f_cpu_store):.12g}"
+        payload: dict[str, object] = {
+            "schema_version": 1,
+            "snap_model": "cots_snap_v1",
+            "storage_by_store_fraction": {
+                storage_key: {
+                    "cpu_weight_bytes": int(cpu_weight_bytes),
+                    "gpu_buffer_bytes": gpu_buffer_bytes,
+                    "gpu_output_scratch_bytes": int(gpu_output_scratch_bytes),
+                    "gpu_prefetch_pool_bytes": int(gpu_prefetch_pool_bytes),
+                }
+            },
+            "modules": sorted(self.weight_modules),
+            "linears": len(self._handles),
+            "mlp_blocks": len(self._fused_ops),
+            "wo_ops": len(self._wo_ops),
+            "graph_buckets": list(self._graph_capture_buckets),
+            "dispatch_buckets": list(self._dispatch_buckets),
+        }
+        if self._handles:
+            payload["dtype"] = str(self._handles[0].dtype).replace("torch.", "")
+
+        role_names = {
+            QKV_ROLE: "qkv",
+            MLP_GATE_UP_ROLE: "mlp_gate_up",
+            MLP_DOWN_ROLE: "mlp_down",
+            WO_ROLE: "wo",
+        }
+        dispatch_by_bucket: dict[str, object] = {}
+        for bucket in self._dispatch_buckets:
+            by_role: dict[str, dict[str, int]] = {}
+            total_prefetch = 0
+            total_cpu_compute = 0
+            for h in self._handles:
+                role = role_names[h.role]
+                n_prefetch = h.n_prefetch_by_bucket.get(bucket, 0)
+                n_cpu_compute = h.n_cpu_compute_by_bucket.get(bucket, 0)
+                other_dim = h.in_dim if h.split_axis != INPUT_SPLIT_AXIS else h.out_dim
+                element_size = h.dtype.itemsize
+                prefetch_bytes = int(n_prefetch * other_dim * element_size)
+                cpu_compute_bytes = int(n_cpu_compute * other_dim * element_size)
+                row = by_role.setdefault(
+                    role,
+                    {
+                        "prefetch_weight_bytes": 0,
+                        "cpu_compute_weight_bytes": 0,
+                    },
+                )
+                row["prefetch_weight_bytes"] += prefetch_bytes
+                row["cpu_compute_weight_bytes"] += cpu_compute_bytes
+                total_prefetch += prefetch_bytes
+                total_cpu_compute += cpu_compute_bytes
+            f_cpu, f_prefetch = self._dispatch_table.get(bucket, (0.0, 0.0))
+            dispatch_by_bucket[str(bucket)] = {
+                "requested_f_cpu_compute": round(float(f_cpu), 12),
+                "requested_f_prefetch_compute": round(float(f_prefetch), 12),
+                "prefetch_weight_bytes": total_prefetch,
+                "cpu_compute_weight_bytes": total_cpu_compute,
+                "by_role": by_role,
+            }
+        payload["dispatch_by_bucket"] = dispatch_by_bucket
+        return payload
+
     def _hook_layer_forward(self, index: int, layer: nn.Module) -> None:
         """Wrap the decoder layer's `forward` with pre-compute scheduling.
 
@@ -1075,8 +1150,6 @@ class CotsOffloader(BaseOffloader):
         if self._runner is None:
             return
         if os.environ.get("VLLM_COTS_DUMP_COUNTERS_ON_SHUTDOWN", "0") == "1":
-            import json
-
             from vllm.model_executor.offloader import cots_ops
 
             if (
@@ -1360,6 +1433,25 @@ class CotsOffloader(BaseOffloader):
 
         self._eager_fallback_entry = self._dispatch_table[self._dispatch_buckets[-1]]
 
+        dispatch_policy = {
+            int(bucket): (round(float(f_cpu), 6), round(float(f_prefetch), 6))
+            for bucket, (f_cpu, f_prefetch) in sorted(self._dispatch_table.items())
+        }
+        module_dispatch_policy = {
+            str(module): {
+                int(bucket): (round(float(f_cpu), 6), round(float(f_prefetch), 6))
+                for bucket, (f_cpu, f_prefetch) in sorted(table.items())
+            }
+            for module, table in sorted(self._dispatch_table_by_module.items())
+        }
+        logger.info(
+            "[CotsOffloader] dispatch policy: f_cpu_store=%.6f, "
+            "dispatch_table=%s, dispatch_table_by_module=%s",
+            self.f_cpu_store,
+            dispatch_policy,
+            module_dispatch_policy,
+        )
+
         # Install the runner's per-(layer, bucket, op_kind) work table after
         # the underlying CPU and pinned storages are stable.
         self._install_runner()
@@ -1388,27 +1480,27 @@ class CotsOffloader(BaseOffloader):
             for h in self._handles
             if h.w_cpu is not None
         )
-        x_pinned_gb = (
-            0.0
+        x_pinned_bytes = (
+            0
             if self._x_pinned is None
-            else self._x_pinned.numel() * self._x_pinned.element_size() / 1e9
+            else self._x_pinned.numel() * self._x_pinned.element_size()
         )
-        y_pinned_gb = (
-            0.0
+        y_pinned_bytes = (
+            0
             if self._y_pinned is None
-            else self._y_pinned.numel() * self._y_pinned.element_size() / 1e9
+            else self._y_pinned.numel() * self._y_pinned.element_size()
         )
-        y_gpu_gb = (
-            0.0
+        y_gpu_bytes = (
+            0
             if self._y_gpu is None
-            else self._y_gpu.numel() * self._y_gpu.element_size() / 1e9
+            else self._y_gpu.numel() * self._y_gpu.element_size()
         )
 
         # Prefetch summary (zero / disabled when f_prefetch == 0).
         if self._prefetch_buffer_pool is not None:
-            prefetch_gb = self._prefetch_buffer_pool.total_bytes / 1e9
+            prefetch_bytes = self._prefetch_buffer_pool.total_bytes
         else:
-            prefetch_gb = 0.0
+            prefetch_bytes = 0
 
         logger.info(
             "[CotsOffloader] ready: runner=%s, sync=%s, modules=%s, "
@@ -1423,12 +1515,23 @@ class CotsOffloader(BaseOffloader):
             len(self._fused_ops),
             len(self._wo_ops),
             total_offloaded / 1e9,
-            x_pinned_gb,
-            y_pinned_gb,
-            y_gpu_gb,
-            prefetch_gb,
+            x_pinned_bytes / 1e9,
+            y_pinned_bytes / 1e9,
+            y_gpu_bytes / 1e9,
+            prefetch_bytes / 1e9,
             self._graph_capture_buckets,
             self._dispatch_buckets,
+        )
+        logger.info(
+            "[CotsOffloader] cots_snap: %s",
+            json.dumps(
+                self._cots_snap_payload(
+                    cpu_weight_bytes=total_offloaded,
+                    gpu_output_scratch_bytes=y_gpu_bytes,
+                    gpu_prefetch_pool_bytes=prefetch_bytes,
+                ),
+                sort_keys=True,
+            ),
         )
 
         # Effective routing breakdown — actual bytes routed through each

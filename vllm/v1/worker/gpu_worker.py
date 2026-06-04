@@ -348,15 +348,16 @@ class Worker(WorkerBase):
 
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
-                f"GiB, reserved {format_gib(kv_cache_memory_bytes)} GiB memory for "
-                "KV Cache as specified by kv_cache_memory_bytes config and "
-                "skipped memory profiling. This does not respect the "
-                "gpu_memory_utilization config. Only use kv_cache_memory_bytes "
-                "config when you want manual control of KV cache memory "
-                "size. If OOM'ed, check the difference of initial free "
-                "memory between the current run and the previous run "
-                "where kv_cache_memory_bytes is suggested and update it "
-                "correspondingly."
+                f"GiB, reserved {format_gib(kv_cache_memory_bytes)} GiB "
+                f"(kv_cache_memory_bytes={kv_cache_memory_bytes}) memory for "
+                "KV Cache as "
+                "specified by kv_cache_memory_bytes config and skipped memory "
+                "profiling. This does not respect the gpu_memory_utilization "
+                "config. Only use kv_cache_memory_bytes config when you want "
+                "manual control of KV cache memory size. If OOM'ed, check the "
+                "difference of initial free memory between the current run and "
+                "the previous run where kv_cache_memory_bytes is suggested and "
+                "update it correspondingly."
             )
             logger.info(msg)
             return kv_cache_memory_bytes
