@@ -203,37 +203,26 @@ def _qkv_kv_biased_counts(
     n_cpu_cols: int,
     *,
     head_dim: int,
-    kv_biased: bool = True,
 ) -> tuple[int, int, int]:
     """Return (n_q_tail, n_k, n_v) — per-shard CPU column counts.
 
-    For `kv_biased=True`, all three of n_q_tail / n_k / n_v are multiples of
-    `head_dim`, n_k == n_v (paired KV head groups), and Q tail is whole heads
-    (`weight_offload_design.md §201-205`,
-    `phase0/bench_split_correctness.py:103,147`). The actual on-CPU count
-    `n_q_tail + n_k + n_v` may differ from the requested `n_cpu_cols` due to
-    head-boundary snapping.
-
-    For `kv_biased=False`, TP-style proportional split (no head alignment).
+    Production WQKV split is always K/V-biased and floors to head-aligned
+    quanta. All three of n_q_tail / n_k / n_v are multiples of `head_dim`,
+    n_k == n_v (paired K/V head groups), and Q tail is whole heads.
     """
     total = q_size + 2 * kv_size
     if not (0 <= n_cpu_cols <= total):
         raise ValueError(f"n_cpu_cols={n_cpu_cols} out of range [0, {total}]")
 
-    if not kv_biased:
-        n_k = round(n_cpu_cols * kv_size / total)
-        n_v = round(n_cpu_cols * kv_size / total)
-        return (n_cpu_cols - n_k - n_v, n_k, n_v)
-
     kv_total = 2 * kv_size
     if n_cpu_cols <= kv_total:
         n_kv_heads = kv_size // head_dim
-        n_pairs = min(round(n_cpu_cols / (2 * head_dim)), n_kv_heads)
+        n_pairs = min(n_cpu_cols // (2 * head_dim), n_kv_heads)
         n_k = n_v = n_pairs * head_dim
         return (0, n_k, n_v)
 
     n_q_tail_raw = n_cpu_cols - kv_total
-    n_q_heads = min(round(n_q_tail_raw / head_dim), q_size // head_dim)
+    n_q_heads = min(n_q_tail_raw // head_dim, q_size // head_dim)
     return (n_q_heads * head_dim, kv_size, kv_size)
 
 
@@ -243,7 +232,6 @@ def _qkv_kv_biased_indices(
     n_cpu_cols: int,
     *,
     head_dim: int,
-    kv_biased: bool = True,
 ) -> torch.Tensor:
     """CPU column indices in `[Q | K | V]` layout. Picks LAST cols of each
     shard (matches TP loader's narrow-on-rank-0-keeps-FIRST-cols).
@@ -252,7 +240,7 @@ def _qkv_kv_biased_indices(
     matching the row layout `_w_cpu` uses.
     """
     n_q_tail, n_k, n_v = _qkv_kv_biased_counts(
-        q_size, kv_size, n_cpu_cols, head_dim=head_dim, kv_biased=kv_biased
+        q_size, kv_size, n_cpu_cols, head_dim=head_dim
     )
     idx_q_tail = torch.arange(q_size - n_q_tail, q_size, dtype=torch.long, device="cpu")
     idx_k = torch.arange(

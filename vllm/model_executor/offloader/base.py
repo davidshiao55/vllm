@@ -276,34 +276,9 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
                     for bucket in dispatch_buckets
                 }
 
-        module_dispatch_table_factory = None
-        if cots.dispatch_table_by_module is not None:
-            configured_by_module = {
-                str(module): {
-                    int(bucket): (float(pair[0]), float(pair[1]))
-                    for bucket, pair in table.items()
-                }
-                for module, table in cots.dispatch_table_by_module.items()
-            }
-
-            def module_dispatch_table_factory(dispatch_buckets):
-                resolved = {}
-                for module, table in configured_by_module.items():
-                    missing = sorted(set(dispatch_buckets) - set(table))
-                    if missing:
-                        raise ValueError(
-                            "cots.dispatch_table_by_module "
-                            f"{module!r} is missing dispatch buckets: {missing}"
-                        )
-                    resolved[module] = {
-                        int(bucket): table[int(bucket)] for bucket in dispatch_buckets
-                    }
-                return resolved
-
         return CotsOffloader(
             config=cots,
             dispatch_table_factory=dispatch_table_factory,
-            module_dispatch_table_factory=module_dispatch_table_factory,
         )
     else:
         return NoopOffloader()

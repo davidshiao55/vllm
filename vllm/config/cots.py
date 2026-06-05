@@ -11,7 +11,7 @@ CotsWeightModule = Literal["qkv", "mlp", "wo"]
 
 COTS_WEIGHT_MODULE_ORDER: tuple[str, ...] = ("qkv", "mlp", "wo")
 VALID_COTS_WEIGHT_MODULES: frozenset[str] = frozenset(COTS_WEIGHT_MODULE_ORDER)
-DEFAULT_COTS_WEIGHT_MODULES: frozenset[str] = frozenset(("qkv", "mlp"))
+DEFAULT_COTS_WEIGHT_MODULES: frozenset[str] = frozenset(COTS_WEIGHT_MODULE_ORDER)
 
 COTS_WEIGHT_MODULE_SUFFIXES: dict[str, tuple[str, ...]] = {
     "qkv": ("qkv_proj",),

@@ -38,24 +38,31 @@ ROLE_SPLIT_AXIS: dict[CotsLinearRole, SplitAxis] = {
 MLP_CHANNEL_GRANULARITY = 64
 """Planner/COTS MLP snap grid: channels per gate/up half and down input."""
 
-DEFAULT_OUTPUT_CHANNEL_GRANULARITY = 128
-"""Fallback dense output-split alignment when no QKV head size is available.
+DEFAULT_QKVO_HEAD_DIM = 128
+"""Fallback attention head dimension when no QKV module is available.
 
-Production WO gets this from the layer's QKV head_size so its output split uses
-the same granularity as the WQKV picker. The fallback keeps synthetic WO-only
-unit tests and unusual module slices deterministic.
+Production QKV/WO gets this from the layer's QKV head_size so dense WO output
+splits use the same K/V-pair quantum as WQKV. The fallback keeps synthetic
+WO-only unit tests and unusual module slices deterministic.
+"""
+
+WO_QKVO_GRANULARITY_MULTIPLIER = 2
+"""Production WO snap multiplier over the QKVO K/V-pair row quantum.
+
+WO has a separate per-layer CPU task and sync boundary, so its dense output
+split starts at two QKVO quanta to avoid the small-slice latency cliff.
 """
 
 
-def _snap_channels(requested: float, limit: int, granularity: int) -> int:
-    """Snap a channel count to a positive grid, preserving exact full size."""
+def _floor_channels(requested: float, limit: int, granularity: int) -> int:
+    """Floor a channel count to a positive grid, preserving exact full size."""
     if granularity <= 0:
         raise ValueError(f"granularity must be positive, got {granularity}")
     if requested <= 0:
         return 0
     if requested >= limit:
         return limit
-    snapped = int(((requested + granularity / 2) // granularity) * granularity)
+    snapped = int(requested // granularity) * granularity
     return min(snapped, limit)
 
 
@@ -64,11 +71,10 @@ def _snap_mlp_channels(requested: float, limit: int) -> int:
 
     MLP offload uses matched channel counts for gate, up, and down. The
     profiler found narrow arbitrary sizes such as 96 channels can hit bad GEMM
-    shapes; multiples of 64 avoid that cliff on Qwen2.5-7B. Round to the
-    nearest grid point, break ties upward, and allow the exact full-size limit
-    even when a future model's intermediate size is not divisible by 64.
+    shapes; multiples of 64 avoid that cliff on Qwen2.5-7B. Production floors
+    to the largest valid grid point not exceeding the requested fraction.
     """
-    return _snap_channels(requested, limit, MLP_CHANNEL_GRANULARITY)
+    return _floor_channels(requested, limit, MLP_CHANNEL_GRANULARITY)
 
 
 def _snap_qkv_output_channels(
@@ -77,31 +83,44 @@ def _snap_qkv_output_channels(
     q_size: int,
     kv_size: int,
     head_dim: int,
-    kv_biased: bool,
 ) -> int:
-    """Snap WQKV output channels through the head-aware WQKV picker."""
+    """Floor WQKV output channels through the K/V-biased WQKV picker."""
     n_q_tail, n_k, n_v = _qkv_kv_biased_counts(
         q_size,
         kv_size,
         requested,
         head_dim=head_dim,
-        kv_biased=kv_biased,
     )
     return n_q_tail + n_k + n_v
 
 
-def _snap_dense_output_channels(
+def _qkvo_output_granularity(head_dim: int) -> int:
+    """QKVO output-row quantum.
+
+    QKV's smallest K/V-biased structural unit is one K/V pair:
+    `K_head + V_head`, or `2 * head_dim` output rows.
+    """
+    if head_dim <= 0:
+        raise ValueError(f"head_dim must be positive, got {head_dim}")
+    return 2 * head_dim
+
+
+def _snap_qkvo_dense_output_channels(
     requested: float,
     limit: int,
     *,
-    output_granularity: int,
+    head_dim: int,
+    qkvo_multiplier: int = 1,
 ) -> int:
-    """Snap dense output-split channels to the WQKV output alignment.
+    """Snap WO dense output rows to the shared QKVO quantum.
 
-    WO has no semantic heads, but using the attention head size keeps its
-    output-channel split on the same grid as WQKV.
+    The returned count is a dense tail of WO rows, while QKV still uses its
+    K/V-biased picker for the actual row identities.
     """
-    return _snap_channels(requested, limit, output_granularity)
+    if qkvo_multiplier < 1:
+        raise ValueError(f"qkvo_multiplier must be >= 1, got {qkvo_multiplier}")
+    granularity = qkvo_multiplier * _qkvo_output_granularity(head_dim)
+    return _floor_channels(requested, limit, granularity)
 
 
 class CotsLinearHandle:
@@ -138,11 +157,10 @@ class CotsLinearHandle:
         q_size: int | None = None,
         kv_size: int | None = None,
         head_dim: int | None = None,
-        kv_biased: bool = True,
         # Merged-col-only metadata:
         merged_partition_sizes: tuple[int, int] | None = None,
         # Dense-output-only metadata:
-        output_granularity: int = DEFAULT_OUTPUT_CHANNEL_GRANULARITY,
+        qkvo_head_dim: int = DEFAULT_QKVO_HEAD_DIM,
     ):
         if role not in ROLE_SPLIT_AXIS:
             raise ValueError(f"unknown role: {role}")
@@ -179,9 +197,8 @@ class CotsLinearHandle:
         self.q_size = q_size
         self.kv_size = kv_size
         self.head_dim = head_dim
-        self.kv_biased = kv_biased
         self.merged_partition_sizes = merged_partition_sizes
-        self.output_granularity = output_granularity
+        self.qkvo_head_dim = qkvo_head_dim
         self.n_q_tail = 0
         self.n_k = 0
         self.n_v = 0
@@ -194,7 +211,6 @@ class CotsLinearHandle:
                 kv_size,
                 n_cpu,
                 head_dim=head_dim,
-                kv_biased=kv_biased,
             )
             assert self.n_q_tail + self.n_k + self.n_v == n_cpu, (
                 f"QKV count mismatch at {qualified_name}: n_cpu={n_cpu} != "
@@ -263,7 +279,6 @@ class CotsLinearHandle:
         qualified_name: str,
         *,
         head_dim: int,
-        kv_biased: bool,
         f_cpu_store: float,
     ) -> CotsLinearHandle | None:
         out_dim, in_dim = tuple(linear.weight.shape)
@@ -276,13 +291,12 @@ class CotsLinearHandle:
         assert k_part % head_dim == 0, (
             f"QKV: kv_size={k_part} not a multiple of head_dim={head_dim}"
         )
-        requested = int(round(f_cpu_store * out_dim))
+        requested = int(f_cpu_store * out_dim)
         n_cpu = _snap_qkv_output_channels(
             requested,
             q_size=q_part,
             kv_size=k_part,
             head_dim=head_dim,
-            kv_biased=kv_biased,
         )
         if n_cpu == 0:
             return None
@@ -291,7 +305,6 @@ class CotsLinearHandle:
             k_part,
             n_cpu,
             head_dim=head_dim,
-            kv_biased=kv_biased,
         )
         return cls(
             role=QKV_ROLE,
@@ -306,7 +319,6 @@ class CotsLinearHandle:
             q_size=q_part,
             kv_size=k_part,
             head_dim=head_dim,
-            kv_biased=kv_biased,
         )
 
     @classmethod
@@ -380,7 +392,7 @@ class CotsLinearHandle:
         qualified_name: str,
         *,
         f_cpu_store: float,
-        output_granularity: int = DEFAULT_OUTPUT_CHANNEL_GRANULARITY,
+        qkvo_head_dim: int = DEFAULT_QKVO_HEAD_DIM,
     ) -> CotsLinearHandle | None:
         """WO dense output-row split.
 
@@ -389,10 +401,11 @@ class CotsLinearHandle:
         structure, so its selected output channels are just a dense tail.
         """
         out_dim, in_dim = tuple(linear.weight.shape)
-        n_cpu = _snap_dense_output_channels(
+        n_cpu = _snap_qkvo_dense_output_channels(
             f_cpu_store * out_dim,
             out_dim,
-            output_granularity=output_granularity,
+            head_dim=qkvo_head_dim,
+            qkvo_multiplier=WO_QKVO_GRANULARITY_MULTIPLIER,
         )
         if n_cpu == 0:
             return None
@@ -409,7 +422,7 @@ class CotsLinearHandle:
             cpu_indices=cpu_indices,
             gpu_indices=_complement(cpu_indices, out_dim),
             dtype=linear.weight.dtype,
-            output_granularity=output_granularity,
+            qkvo_head_dim=qkvo_head_dim,
         )
 
     # ------------------------------------------------------------------
@@ -534,13 +547,12 @@ class CotsLinearHandle:
         if self.role == QKV_ROLE:
             assert self.q_size is not None and self.kv_size is not None
             assert self.head_dim is not None
-            requested = int(round(f_prefetch * self.out_dim))
+            requested = int(f_prefetch * self.out_dim)
             n_pref = _snap_qkv_output_channels(
                 requested,
                 q_size=self.q_size,
                 kv_size=self.kv_size,
                 head_dim=self.head_dim,
-                kv_biased=self.kv_biased,
             )
             n_pref = min(n_pref, cap)
         elif self.role == MLP_GATE_UP_ROLE:
@@ -552,10 +564,11 @@ class CotsLinearHandle:
             n_pref = 2 * n_pref_per_half
         elif self.role == WO_ROLE:
             n_pref = min(
-                _snap_dense_output_channels(
+                _snap_qkvo_dense_output_channels(
                     f_prefetch * self.out_dim,
                     self.out_dim,
-                    output_granularity=self.output_granularity,
+                    head_dim=self.qkvo_head_dim,
+                    qkvo_multiplier=WO_QKVO_GRANULARITY_MULTIPLIER,
                 ),
                 cap,
             )

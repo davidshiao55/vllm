@@ -95,8 +95,9 @@ class CotsOffloadConfig:
     fraction `f_cpu_store` of the bytes lives in pinned CPU memory and is
     GEMM'd on the CPU each forward pass, in parallel with the GPU's compute on
     the GPU-resident slice. Activation returns from CPU use an SM-issued UVA
-    copy kernel that bypasses the H2D copy engine. The default module set is
-    WQKV + MLP; WO (`o_proj`) is opt-in for forced-fit experiments.
+    copy kernel that bypasses the H2D copy engine. The production module set
+    covers WQKV, MLP, and WO with a single storage fraction and fixed snapping
+    policy.
 
     See `David/Docs/implementation_roadmap.md` and `David/Docs/phase0_findings.md`
     for the full design and the empirical numbers that justify it.
@@ -104,8 +105,8 @@ class CotsOffloadConfig:
 
     f_cpu_store: float = Field(default=0.0, ge=0.0, le=1.0)
     """Fraction of enabled COTS weight bytes resident on CPU. Single uniform
-    scalar applied to the selected module set (default WQKV / MLP1 / MLP2;
-    optional WO). The matched-index invariant between MLP1 col-parallel and
+    scalar applied to the selected module set (default WQKV / MLP1 / MLP2 /
+    WO). The matched-index invariant between MLP1 col-parallel and
     MLP2 row-parallel is automatic under uniform dispatch. Default 0.0 means no
     offload. Typical thesis value at 7B B=1 decode is ~0.09 ("free" regime per
     phase0 §0.3.3)."""
@@ -131,26 +132,6 @@ class CotsOffloadConfig:
     storage budget and may provide a table; vLLM still owns snapping, bucket
     validation, and tensor geometry."""
 
-    dispatch_table_by_module: (
-        dict[CotsWeightModule | str, dict[int, tuple[float, float]]] | None
-    ) = Field(default=None)
-    """Optional module-specific COTS dispatch table. Top-level keys are COTS
-    weight module names (`"qkv"`, `"mlp"`, `"wo"`); values have the same
-    per-bucket `(f_cpu_compute, f_prefetch_compute)` shape as
-    `dispatch_table`. Missing module keys fall back to `dispatch_table`, or to
-    the uniform `f_prefetch` fallback when no global table is configured.
-
-    This is intended for Planner policies where, for example, decode MLP stays
-    CPU-computed while QKV uses prefetch."""
-
-    kv_biased: bool = Field(default=True)
-    """If True, the WQKV column picker is biased toward K/V: K+V column groups
-    are assigned to CPU before any Q columns. Preserves the suffix-cache layout
-    and minimizes H2D contention with weight prefetch. See
-    `weight_offload_design.md §WQKV Column Choice`. If False, columns are
-    picked from the front of WQKV's output (Q first), useful only for
-    controlled diagnostics."""
-
     weight_modules: set[CotsWeightModule | str] = Field(
         default_factory=lambda: set(DEFAULT_COTS_WEIGHT_MODULES)
     )
@@ -158,9 +139,9 @@ class CotsOffloadConfig:
     * `"qkv"`: WQKV output split using the WQKV-specific KV-biased picker.
     * `"mlp"`: fused MLP block (`gate_up_proj` col split + `down_proj` row
       split) with matched intermediate indices.
-    * `"wo"`: opt-in WO (`o_proj`) output split for forced-fit/E2E
-      experiments. Disabled by default because current 7B measurements do not
-      justify the extra post-attention communication."""
+    * `"wo"`: WO (`o_proj`) dense output split using a larger production snap
+      quantum so the first CPU-compute slice amortizes WO's extra per-layer
+      task/sync cost."""
 
     kv_split_blocks: int = Field(default=0, ge=0)
     """Phase 2 hybrid-KV split point in KV-cache blocks. Blocks before this
@@ -335,25 +316,6 @@ class CotsOffloadConfig:
         if self.dispatch_table is not None:
             validate_table("cots.dispatch_table", self.dispatch_table)
 
-        if self.dispatch_table_by_module is not None:
-            normalized: dict[str, dict[int, tuple[float, float]]] = {}
-            for raw_module, table in self.dispatch_table_by_module.items():
-                modules = normalize_cots_weight_modules({raw_module}, default=())
-                if len(modules) != 1:
-                    raise ValueError(
-                        "cots.dispatch_table_by_module keys must be single "
-                        f"module names; got {raw_module!r}"
-                    )
-                module = next(iter(modules))
-                if module not in self.weight_modules:
-                    raise ValueError(
-                        "cots.dispatch_table_by_module contains module "
-                        f"{module!r}, but cots.weight_modules is "
-                        f"{sorted(self.weight_modules)}"
-                    )
-                validate_table(f"cots.dispatch_table_by_module[{module!r}]", table)
-                normalized[module] = table
-            self.dispatch_table_by_module = normalized
         return self
 
 

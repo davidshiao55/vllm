@@ -39,11 +39,12 @@ from vllm.model_executor.offloader.cots_runners import (
     _NativeWeightSlabSpecMlp,
 )
 from vllm.model_executor.offloader.cots_storage import (
-    DEFAULT_OUTPUT_CHANNEL_GRANULARITY,
+    DEFAULT_QKVO_HEAD_DIM,
     INPUT_SPLIT_AXIS,
     MLP_DOWN_ROLE,
     MLP_GATE_UP_ROLE,
     QKV_ROLE,
+    WO_QKVO_GRANULARITY_MULTIPLIER,
     WO_ROLE,
     CotsLinearHandle,
     CotsPrefetchBufferPool,
@@ -83,15 +84,10 @@ class CotsOffloader(BaseOffloader):
             [Sequence[int]], dict[int, tuple[float, float]]
         ]
         | None = None,
-        module_dispatch_table_factory: Callable[
-            [Sequence[int]], dict[str, dict[int, tuple[float, float]]]
-        ]
-        | None = None,
     ):
         self.config = config
         self.f_cpu_store = float(config.f_cpu_store)
         self.f_prefetch = float(config.f_prefetch)
-        self.kv_biased = bool(config.kv_biased)
         self.weight_modules = frozenset(
             normalize_cots_weight_modules(getattr(config, "weight_modules", None))
         )
@@ -99,7 +95,6 @@ class CotsOffloader(BaseOffloader):
         # Optional injection point for the Planner. None → uniform fill
         # from config in `post_init`.
         self._dispatch_table_factory = dispatch_table_factory
-        self._module_dispatch_table_factory = module_dispatch_table_factory
         if not (0.0 <= self.f_cpu_store <= 1.0):
             raise ValueError(f"f_cpu_store must be in [0, 1], got {self.f_cpu_store}")
         if self.f_prefetch > self.f_cpu_store:
@@ -138,7 +133,6 @@ class CotsOffloader(BaseOffloader):
         # Dispatch table populated in wrap_modules (Phase 1b: needed before
         # the prefetch buffer pool is sized).
         self._dispatch_table: dict[int, tuple[float, float]] = {}
-        self._dispatch_table_by_module: dict[str, dict[int, tuple[float, float]]] = {}
         # CUDA graph capture buckets and Planner dispatch buckets are related
         # but distinct. Graph buckets describe replay shapes. Dispatch buckets
         # describe the COTS route selected from BatchDescriptor.num_tokens and
@@ -229,7 +223,7 @@ class CotsOffloader(BaseOffloader):
         # leaves all of this no-op'd.
         self._build_dispatch_table()
         for h in self._handles:
-            h.apply_prefetch_split_per_bucket(self._dispatch_table_for_role(h.role))
+            h.apply_prefetch_split_per_bucket(self._dispatch_table)
         self._has_cpu_compute_work = self._compute_has_cpu_compute_work()
         self._build_route_signatures()
 
@@ -247,14 +241,13 @@ class CotsOffloader(BaseOffloader):
         logger.debug(
             "CotsOffloader: wrapped %d linear modules, %d fused MLP blocks, "
             "and %d WO ops (modules=%s, f_cpu_store=%.4f, f_prefetch=%.4f, "
-            "kv_biased=%s, cpu_num_threads=%d, dry_run=%s).",
+            "cpu_num_threads=%d, dry_run=%s).",
             len(self._handles),
             len(self._fused_ops),
             len(self._wo_ops),
             sorted(self.weight_modules),
             self.f_cpu_store,
             self.f_prefetch,
-            self.kv_biased,
             self.config.cpu_num_threads,
             self.dry_run,
         )
@@ -272,9 +265,7 @@ class CotsOffloader(BaseOffloader):
         )
 
         layer_handles: list[CotsLinearHandle] = []
-        output_granularity = self._dense_output_granularity_for_layer(
-            layer, QKVParallelLinear
-        )
+        qkvo_head_dim = self._qkvo_head_dim_for_layer(layer, QKVParallelLinear)
         for qualified_name, child in layer.named_modules():
             module = self._module_for_qualified_name(qualified_name)
             if module is None:
@@ -291,7 +282,6 @@ class CotsOffloader(BaseOffloader):
                     child,
                     qualified_name,
                     head_dim=int(child.head_size),
-                    kv_biased=self.kv_biased,
                     f_cpu_store=self.f_cpu_store,
                 )
             elif module == "mlp" and isinstance(child, MergedColumnParallelLinear):
@@ -311,7 +301,7 @@ class CotsOffloader(BaseOffloader):
                     child,
                     qualified_name,
                     f_cpu_store=self.f_cpu_store,
-                    output_granularity=output_granularity,
+                    qkvo_head_dim=qkvo_head_dim,
                 )
             else:
                 raise RuntimeError(
@@ -331,21 +321,21 @@ class CotsOffloader(BaseOffloader):
         return cots_weight_module_for_name(self.weight_modules, qualified_name)
 
     @staticmethod
-    def _dense_output_granularity_for_layer(
+    def _qkvo_head_dim_for_layer(
         layer: nn.Module,
         qkv_cls: type[nn.Module],
     ) -> int:
-        """Use the layer's WQKV head size as dense output-split alignment.
+        """Use the layer's WQKV head size as the QKVO snap base.
 
-        WO has no semantic heads, but aligning its output-channel split to the
-        same grid as WQKV keeps the storage and prefetch policy consistent.
+        WO has no semantic heads, but its dense output split uses the same
+        `2 * head_dim` K/V-pair quantum as WQKV so QKVO starts on one grid.
         Synthetic WO-only tests may not include a QKV module, so they fall back
         to the common Qwen/Llama 128-channel head grid.
         """
         for _, child in layer.named_modules():
             if isinstance(child, qkv_cls):
                 return int(child.head_size)
-        return DEFAULT_OUTPUT_CHANNEL_GRANULARITY
+        return DEFAULT_QKVO_HEAD_DIM
 
     # --- Pass 2a: QKV operator install ---
 
@@ -515,38 +505,13 @@ class CotsOffloader(BaseOffloader):
     # --- Phase 1b: dispatch table + prefetch machinery installation ---
 
     def _build_dispatch_table(self) -> None:
-        """Construct dispatch tables.
-
-        `_dispatch_table` is the global/default table. Module-specific tables
-        override it for Python-side handle geometry when the Planner provides
-        per-module dispatch.
-        """
+        """Construct the uniform Planner dispatch table."""
         if self._dispatch_table_factory is not None:
             self._dispatch_table = self._dispatch_table_factory(self._dispatch_buckets)
         else:
             pair = (self.f_cpu_store - self.f_prefetch, self.f_prefetch)
             self._dispatch_table = {b: pair for b in self._dispatch_buckets}
-        if self._module_dispatch_table_factory is not None:
-            self._dispatch_table_by_module = self._module_dispatch_table_factory(
-                self._dispatch_buckets
-            )
-        else:
-            self._dispatch_table_by_module = {}
         self._validate_graph_capture_dispatch_coverage()
-
-    @staticmethod
-    def _module_for_role(role: str) -> str:
-        if role == QKV_ROLE:
-            return "qkv"
-        if role in (MLP_GATE_UP_ROLE, MLP_DOWN_ROLE):
-            return "mlp"
-        if role == WO_ROLE:
-            return "wo"
-        raise ValueError(f"unknown COTS role: {role}")
-
-    def _dispatch_table_for_role(self, role: str) -> dict[int, tuple[float, float]]:
-        module = self._module_for_role(role)
-        return self._dispatch_table_by_module.get(module, self._dispatch_table)
 
     def _install_prefetch_machinery(self) -> None:
         """Allocate prefetch buffers and install layer-level prefetch hooks."""
@@ -883,6 +848,7 @@ class CotsOffloader(BaseOffloader):
         payload: dict[str, object] = {
             "schema_version": 1,
             "snap_model": "cots_snap_v1",
+            "wo_qkvo_granularity_multiplier": WO_QKVO_GRANULARITY_MULTIPLIER,
             "storage_by_store_fraction": {
                 storage_key: {
                     "cpu_weight_bytes": int(cpu_weight_bytes),
@@ -1209,9 +1175,6 @@ class CotsOffloader(BaseOffloader):
         keys: set[int] = set()
         if self.config.dispatch_table is not None:
             keys.update(int(bucket) for bucket in self.config.dispatch_table)
-        if self.config.dispatch_table_by_module is not None:
-            for table in self.config.dispatch_table_by_module.values():
-                keys.update(int(bucket) for bucket in table)
         return sorted(keys)
 
     def _default_dispatch_buckets(self, vllm_config) -> list[int]:
@@ -1437,19 +1400,10 @@ class CotsOffloader(BaseOffloader):
             int(bucket): (round(float(f_cpu), 6), round(float(f_prefetch), 6))
             for bucket, (f_cpu, f_prefetch) in sorted(self._dispatch_table.items())
         }
-        module_dispatch_policy = {
-            str(module): {
-                int(bucket): (round(float(f_cpu), 6), round(float(f_prefetch), 6))
-                for bucket, (f_cpu, f_prefetch) in sorted(table.items())
-            }
-            for module, table in sorted(self._dispatch_table_by_module.items())
-        }
         logger.info(
-            "[CotsOffloader] dispatch policy: f_cpu_store=%.6f, "
-            "dispatch_table=%s, dispatch_table_by_module=%s",
+            "[CotsOffloader] dispatch policy: f_cpu_store=%.6f, dispatch_table=%s",
             self.f_cpu_store,
             dispatch_policy,
-            module_dispatch_policy,
         )
 
         # Install the runner's per-(layer, bucket, op_kind) work table after
@@ -1504,6 +1458,7 @@ class CotsOffloader(BaseOffloader):
 
         logger.info(
             "[CotsOffloader] ready: runner=%s, sync=%s, modules=%s, "
+            "wo_qkvo_granularity_multiplier=%d, "
             "linears=%d, mlp_blocks=%d, wo_ops=%d, weights_saved=%.4f GB, "
             "buffers=%.4f GB "
             "pinned_in + %.4f GB pinned_out + %.4f GB gpu_uva, "
@@ -1511,6 +1466,7 @@ class CotsOffloader(BaseOffloader):
             cpu_runner,
             weight_capture_sync_mode,
             sorted(self.weight_modules),
+            WO_QKVO_GRANULARITY_MULTIPLIER,
             len(self._handles),
             len(self._fused_ops),
             len(self._wo_ops),
