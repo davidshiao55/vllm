@@ -207,12 +207,20 @@ def _qkv_kv_biased_counts(
     """Return (n_q_tail, n_k, n_v) — per-shard CPU column counts.
 
     Production WQKV split is always K/V-biased and floors to head-aligned
-    quanta. All three of n_q_tail / n_k / n_v are multiples of `head_dim`,
-    n_k == n_v (paired K/V head groups), and Q tail is whole heads.
+    `2 * head_dim` quanta, preserving exact full placement. K/V head groups
+    are assigned first; Q tail is used only after all K/V rows are selected.
     """
     total = q_size + 2 * kv_size
     if not (0 <= n_cpu_cols <= total):
         raise ValueError(f"n_cpu_cols={n_cpu_cols} out of range [0, {total}]")
+
+    qkvo_quantum = 2 * head_dim
+    if n_cpu_cols <= 0:
+        n_cpu_cols = 0
+    elif n_cpu_cols < total:
+        n_cpu_cols = (n_cpu_cols // qkvo_quantum) * qkvo_quantum
+    else:
+        n_cpu_cols = total
 
     kv_total = 2 * kv_size
     if n_cpu_cols <= kv_total:
@@ -222,8 +230,7 @@ def _qkv_kv_biased_counts(
         return (0, n_k, n_v)
 
     n_q_tail_raw = n_cpu_cols - kv_total
-    n_q_heads = min(n_q_tail_raw // head_dim, q_size // head_dim)
-    return (n_q_heads * head_dim, kv_size, kv_size)
+    return (min(n_q_tail_raw, q_size), kv_size, kv_size)
 
 
 def _qkv_kv_biased_indices(

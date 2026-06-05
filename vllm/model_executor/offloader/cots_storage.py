@@ -503,10 +503,11 @@ class CotsLinearHandle:
         self.prefetch_indices_cuda_by_bucket.clear()
         self.cpu_compute_indices_cuda_by_bucket.clear()
 
-        for bucket, (_, f_prefetch) in dispatch_table.items():
-            n_pref, pref_idx, cpu_idx = self._compute_bucket_split(f_prefetch)
+        for bucket, (f_cpu_compute, _) in dispatch_table.items():
+            n_cpu, pref_idx, cpu_idx = self._compute_bucket_split(f_cpu_compute)
+            n_pref = self.n_cpu - n_cpu
             self.n_prefetch_by_bucket[bucket] = n_pref
-            self.n_cpu_compute_by_bucket[bucket] = self.n_cpu - n_pref
+            self.n_cpu_compute_by_bucket[bucket] = n_cpu
             self.prefetch_indices_cuda_by_bucket[bucket] = pref_idx.to(device)
             self.cpu_compute_indices_cuda_by_bucket[bucket] = cpu_idx.to(device)
 
@@ -517,12 +518,14 @@ class CotsLinearHandle:
         self.max_n_prefetch = self.n_cpu if dispatch_table else 0
 
     def _compute_bucket_split(
-        self, f_prefetch: float
+        self, f_cpu_compute: float
     ) -> tuple[int, torch.Tensor, torch.Tensor]:
         """Split `cpu_indices` into prefetched and CPU-computed subsets.
 
-        Returns `(n_prefetch, prefetch_indices_cpu, cpu_compute_indices_cpu)`.
-        Indices are still on CPU; the caller moves them to the device.
+        Returns `(n_cpu_compute, prefetch_indices_cpu,
+        cpu_compute_indices_cpu)`. Indices are still on CPU; the caller moves
+        them to the device. Runtime snaps the CPU-compute side down to a valid
+        module quantum and assigns the remaining CPU-stored rows to prefetch.
 
         Layout invariants:
           qkv: `cpu_indices` order is `[Q_tail | K_cpu | V_cpu]`. Prefetch
@@ -535,37 +538,36 @@ class CotsLinearHandle:
             takes the first `n_pref` of those.
           wo: dense output-tail split. Prefetch takes the first `n_pref` rows.
 
-        For qkv, n_pref is snapped via the same picker as n_cpu so its
-        snap grid matches: at f_prefetch == f_cpu_store the picker sees
-        identical input → returns identical (n_q, n_k, n_v) → n_pref ==
-        n_cpu by construction, no residual leak. MLP gate/up and down use the
-        shared 64-channel MLP snap grid; WO uses the dense output granularity.
-        Both clamp n_pref to the CPU-stored cap.
+        For qkv, n_cpu_compute is snapped via the same `2 * head_dim` QKVO
+        grid as storage. MLP gate/up and down use the shared 64-channel MLP
+        snap grid; WO uses the coarse dense output granularity. All roles
+        clamp CPU compute to the CPU-stored cap. Therefore below-boundary
+        runtime remainder goes to prefetch, not CPU compute.
         """
         cap = self.n_cpu
 
         if self.role == QKV_ROLE:
             assert self.q_size is not None and self.kv_size is not None
             assert self.head_dim is not None
-            requested = int(f_prefetch * self.out_dim)
-            n_pref = _snap_qkv_output_channels(
+            requested = int(f_cpu_compute * self.out_dim)
+            n_cpu_compute = _snap_qkv_output_channels(
                 requested,
                 q_size=self.q_size,
                 kv_size=self.kv_size,
                 head_dim=self.head_dim,
             )
-            n_pref = min(n_pref, cap)
+            n_cpu_compute = min(n_cpu_compute, cap)
         elif self.role == MLP_GATE_UP_ROLE:
             half = self.out_dim // 2
-            n_pref_per_half = min(
-                _snap_mlp_channels(f_prefetch * half, half),
+            n_cpu_compute_per_half = min(
+                _snap_mlp_channels(f_cpu_compute * half, half),
                 self.n_cpu_per_half,
             )
-            n_pref = 2 * n_pref_per_half
+            n_cpu_compute = 2 * n_cpu_compute_per_half
         elif self.role == WO_ROLE:
-            n_pref = min(
+            n_cpu_compute = min(
                 _snap_qkvo_dense_output_channels(
-                    f_prefetch * self.out_dim,
+                    f_cpu_compute * self.out_dim,
                     self.out_dim,
                     head_dim=self.qkvo_head_dim,
                     qkvo_multiplier=WO_QKVO_GRANULARITY_MULTIPLIER,
@@ -573,8 +575,8 @@ class CotsLinearHandle:
                 cap,
             )
         elif self.role == MLP_DOWN_ROLE:
-            n_pref = min(
-                _snap_mlp_channels(f_prefetch * self.in_dim, self.in_dim),
+            n_cpu_compute = min(
+                _snap_mlp_channels(f_cpu_compute * self.in_dim, self.in_dim),
                 cap,
             )
         else:
@@ -582,8 +584,9 @@ class CotsLinearHandle:
 
         # Index extraction is per role and depends on `cpu_indices`'s layout.
         if self.role == MLP_GATE_UP_ROLE:
-            n_pref_per_half = n_pref // 2
+            n_cpu_compute_per_half = n_cpu_compute // 2
             ncph = self.n_cpu_per_half
+            n_pref_per_half = ncph - n_cpu_compute_per_half
             pref_idx = torch.cat(
                 [
                     self.cpu_indices[:n_pref_per_half],
@@ -596,10 +599,15 @@ class CotsLinearHandle:
                     self.cpu_indices[ncph + n_pref_per_half :],
                 ]
             )
-            return n_pref, pref_idx, cpu_idx
+            return n_cpu_compute, pref_idx, cpu_idx
 
         # qkv / wo / mlp_down: prefetch is a contiguous prefix of cpu_indices.
-        return n_pref, self.cpu_indices[:n_pref], self.cpu_indices[n_pref:]
+        n_prefetch = self.n_cpu - n_cpu_compute
+        return (
+            n_cpu_compute,
+            self.cpu_indices[:n_prefetch],
+            self.cpu_indices[n_prefetch:],
+        )
 
     # --- Loader closures (per role, accessing self by closure) ---
 

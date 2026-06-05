@@ -492,7 +492,7 @@ def _scatter_col_outputs_three_way(
     """Combine GPU permanent, GPU prefetched, and CPU-on-GPU column slices
     into the canonical layer output. All three slices are optional:
       `out_perm is None`     → skipped (f_cpu_store=1.0; permanent slice empty).
-      `out_pref is None`     → skipped (f_prefetch=0).
+      `out_pref is None`     → skipped (active n_prefetch=0).
       `out_cpu_on_gpu is None` → skipped (n_cpu_compute=0)."""
     # §1c.25 note: a Python-side NVTX scope here would only fire at
     # trace time, not on captured-graph replay (NVTX range_push/pop

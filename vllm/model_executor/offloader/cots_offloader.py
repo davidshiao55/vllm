@@ -144,9 +144,9 @@ class CotsOffloader(BaseOffloader):
         self._eager_fallback_entry: tuple[float, float] = (0.0, 0.0)
         self._has_cpu_compute_work: bool = False
 
-        # Prefetch infrastructure — allocated in wrap_modules iff
-        # `f_prefetch > 0`. Phase 1a behavior (`f_prefetch == 0`) leaves
-        # both at None and skips hook installation.
+        # Prefetch infrastructure — allocated in wrap_modules when the
+        # dispatch table reserves any prefetch capacity. Active buckets may
+        # still have zero prefetched rows after runtime snapping.
         self._prefetch_buffer_pool: CotsPrefetchBufferPool | None = None
         self._streamer: WeightPrefetchStreamer | None = None
 
@@ -217,10 +217,10 @@ class CotsOffloader(BaseOffloader):
             )
             return modules
 
-        # Phase 1b: build dispatch table, populate per-handle prefetch
-        # geometry, and (if f_prefetch > 0) allocate the streamer + buffer
-        # pool and install layer-level prefetch hooks. Phase 1a (f_prefetch=0)
-        # leaves all of this no-op'd.
+        # Phase 1b: build dispatch table, populate per-handle dispatch
+        # geometry, and allocate option-A prefetch capacity when the table
+        # may need it. A bucket with raw f_prefetch=0 still routes all stored
+        # rows to CPU compute, but the pool can exist for planner accounting.
         self._build_dispatch_table()
         for h in self._handles:
             h.apply_prefetch_split_per_bucket(self._dispatch_table)
@@ -1006,8 +1006,8 @@ class CotsOffloader(BaseOffloader):
         Always sets `_current_bucket` (plan §design-decision 11) so the
         operator slab/closure lookup has a valid bucket regardless of
         whether prefetch is active. Layer-0 slot repair and streamer
-        bucket mirroring run only when the streamer exists
-        (`f_prefetch > 0`). Steady-state next-layer prefetches are
+        bucket mirroring run only when the option-A streamer exists.
+        Steady-state next-layer prefetches are
         emitted inside each layer wrapper so FULL CUDA graph capture
         records them as graph nodes rather than relying on replay-time
         Python state.
@@ -1450,7 +1450,8 @@ class CotsOffloader(BaseOffloader):
             else self._y_gpu.numel() * self._y_gpu.element_size()
         )
 
-        # Prefetch summary (zero / disabled when f_prefetch == 0).
+        # Prefetch summary. Option-A accounting can reserve this pool even
+        # when a particular bucket has zero active prefetched rows.
         if self._prefetch_buffer_pool is not None:
             prefetch_bytes = self._prefetch_buffer_pool.total_bytes
         else:

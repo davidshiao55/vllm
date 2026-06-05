@@ -306,9 +306,16 @@ class CotsOffloadConfig:
                         f"{label} fractions must be non-negative; "
                         f"got {entry} for bucket {bucket}"
                     )
-                if f_cpu_compute + f_prefetch_compute > self.f_cpu_store + 1e-9:
+                total = f_cpu_compute + f_prefetch_compute
+                if total > self.f_cpu_store + 1e-9:
                     raise ValueError(
                         f"{label} entry exceeds f_cpu_store: "
+                        f"bucket={bucket}, entry={entry}, "
+                        f"f_cpu_store={self.f_cpu_store}"
+                    )
+                if total < self.f_cpu_store - 1e-9:
+                    raise ValueError(
+                        f"{label} entry must sum to f_cpu_store: "
                         f"bucket={bucket}, entry={entry}, "
                         f"f_cpu_store={self.f_cpu_store}"
                     )
