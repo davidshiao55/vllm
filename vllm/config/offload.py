@@ -99,7 +99,7 @@ class CotsOffloadConfig:
     covers WQKV, MLP, and WO with a single storage fraction and fixed snapping
     policy.
 
-    See `David/Docs/implementation_roadmap.md` and `David/Docs/phase0_findings.md`
+    See `docs/implementation_roadmap.md` and `docs/phase0_findings.md`
     for the full design and the empirical numbers that justify it.
     """
 
@@ -213,8 +213,8 @@ class CotsOffloadConfig:
       `enforce_eager=True` and is rejected at engine launch
       otherwise.
 
-    See `David/Docs/implementation_roadmap.md` Phase 1c and
-    `David/Docs/phase1c_findings.md` for the capture-gap
+    See `docs/implementation_roadmap.md` Phase 1c and
+    `docs/phase1c_findings.md` for the capture-gap
     measurements that motivate the split-graph default."""
 
     dry_run: bool = Field(default=False)

@@ -505,7 +505,7 @@ void CotsWeightTaskRunner::run_at_linear_inline(at::Tensor x, at::Tensor w,
   // No TaskQueue, no host callback. Lets the test compare wall-clock
   // against Python `F.linear` on bit-identical tensors and catch the
   // catastrophic-scalar-fallback path documented in
-  // `David/Docs/phase0_findings.md §0.3.2`.
+  // `docs/phase0_findings.md §0.3.2`.
   c10::InferenceMode g;
   // c10::AutoDispatchBelowAutograd is implied by InferenceMode.
   y_out.copy_(at::linear(x, w));

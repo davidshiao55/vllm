@@ -5,8 +5,8 @@
 // CPU backend with WorkerPool removed (oneDNN/ATen own intra-op threading) and
 // a slab-based task dispatch added.
 //
-// See David/Docs/implementation_roadmap.md Phase 1c and
-// David/Docs/phase1a_findings.md §1.14 for the substrate motivation.
+// See docs/implementation_roadmap.md Phase 1c and
+// docs/phase1a_findings.md §1.14 for the substrate motivation.
 
 #ifndef VLLM_COTS_WEIGHT_TASK_RUNNER_H_
 #define VLLM_COTS_WEIGHT_TASK_RUNNER_H_

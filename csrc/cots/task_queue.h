@@ -3,8 +3,8 @@
 //
 // Direct port of KTransformers `kt-kernel/cpu_backend/task_queue.h`
 // (commit reference in /TTC/Reference_Frameworks/ktransformers/), adapted
-// into the vllm::cots namespace. See David/Docs/implementation_roadmap.md
-// Phase 1c and David/Docs/phase1c_findings.md for the design rationale.
+// into the vllm::cots namespace. See docs/implementation_roadmap.md
+// Phase 1c and docs/phase1c_findings.md for the design rationale.
 
 #ifndef VLLM_COTS_TASK_QUEUE_H_
 #define VLLM_COTS_TASK_QUEUE_H_
