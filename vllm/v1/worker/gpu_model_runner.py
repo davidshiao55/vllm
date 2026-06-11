@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import json
 import threading
 import time
 from collections import defaultdict
@@ -176,7 +177,11 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
-from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
+from vllm.v1.utils import (
+    CpuGpuBuffer,
+    compute_iteration_details,
+    record_function_or_nullcontext,
+)
 from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.cots_hybrid_kv import CotsHybridKVStore
 from vllm.v1.worker.cots_runtime import CotsRuntime
@@ -4037,6 +4042,7 @@ class GPUModelRunner(
         self,
         batch_descriptor: BatchDescriptor,
         num_tokens_unpadded: int,
+        trace_context: dict[str, Any] | None = None,
     ) -> None:
         """Push per-forward dispatch state before any model forward.
 
@@ -4053,6 +4059,7 @@ class GPUModelRunner(
             positions_have_suffix=getattr(
                 self, "cots_hybrid_has_suffix_positions", None
             ),
+            trace_context=trace_context,
         )
 
     @torch.inference_mode()
@@ -4337,8 +4344,37 @@ class GPUModelRunner(
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
 
+        trace_context = None
+        trace_forward_start = 0.0
+        if envs.VLLM_COTS_DISPATCH_TRACE:
+            trace_iter = getattr(self, "_cots_dispatch_trace_iter", 0)
+            self._cots_dispatch_trace_iter = trace_iter + 1
+            details = compute_iteration_details(scheduler_output)
+            trace_context = {
+                "step": int(trace_iter),
+                "source": "execute_model",
+                "ctx_req": int(details.num_ctx_requests),
+                "ctx_tok": int(details.num_ctx_tokens),
+                "gen_req": int(details.num_generation_requests),
+                "gen_tok": int(details.num_generation_tokens),
+                "num_reqs": int(num_reqs),
+                "num_reqs_padded": int(num_reqs_padded),
+                "max_query_len": int(max_num_scheduled_tokens),
+                "num_tokens_unpadded": int(num_tokens_unpadded),
+                "num_tokens_padded": int(num_tokens_padded),
+                "cudagraph_mode": cudagraph_mode.name,
+                "should_ubatch": bool(should_ubatch),
+                "pad_attn": bool(pad_attn),
+                "hybrid_kv": bool(self.cots_hybrid_kv is not None),
+            }
+            trace_forward_start = time.perf_counter()
+
         # Run the model.
-        self._publish_forward_dispatch(batch_desc, num_tokens_unpadded)
+        self._publish_forward_dispatch(
+            batch_desc,
+            num_tokens_unpadded,
+            trace_context=trace_context,
+        )
         _cots_submit_mark("publish_dispatch_ms")
 
         # Use persistent buffers for CUDA graphs.
@@ -4474,6 +4510,15 @@ class GPUModelRunner(
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
         _cots_submit_mark("deferred_corrections_ms")
+
+        if trace_context is not None:
+            payload = {
+                **trace_context,
+                "event": "cots_forward_trace",
+                "forward_submit_ms": (time.perf_counter() - trace_forward_start)
+                * 1000.0,
+            }
+            logger.info("COTS_FORWARD_TRACE %s", json.dumps(payload, sort_keys=True))
 
         if cots_submit_timing:
             cots_submit_total_ms = (time.perf_counter() - cots_submit_start) * 1000.0

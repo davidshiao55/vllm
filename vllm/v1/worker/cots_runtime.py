@@ -11,8 +11,8 @@ store remains responsible for suffix attention live/scatter counts.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING, Any
 
 from vllm.forward_context import BatchDescriptor
 from vllm.model_executor.offloader import ForwardDispatchInfo, get_offloader
@@ -37,6 +37,7 @@ class CotsRuntime:
         num_tokens_unpadded: int,
         positions_cpu: Sequence[int] | None = None,
         positions_have_suffix: bool | None = None,
+        trace_context: Mapping[str, Any] | None = None,
     ) -> ForwardDispatchInfo:
         """Publish all COTS per-forward OOG state.
 
@@ -49,6 +50,7 @@ class CotsRuntime:
         dispatch_info = ForwardDispatchInfo(
             batch_descriptor=batch_descriptor,
             num_tokens_unpadded=int(num_tokens_unpadded),
+            trace_context=trace_context,
         )
         get_offloader().on_dispatch(dispatch_info)
         if self.hybrid_kv is not None:

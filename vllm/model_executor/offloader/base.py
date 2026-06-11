@@ -5,9 +5,9 @@
 """Base classes for model parameter offloading."""
 
 from abc import ABC, abstractmethod
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch.nn as nn
 
@@ -43,6 +43,7 @@ class ForwardDispatchInfo:
 
     batch_descriptor: "BatchDescriptor"
     num_tokens_unpadded: int
+    trace_context: Mapping[str, Any] | None = None
 
 
 logger = init_logger(__name__)

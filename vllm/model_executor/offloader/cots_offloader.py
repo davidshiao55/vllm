@@ -1061,6 +1061,48 @@ class CotsOffloader(BaseOffloader):
 
         cots_ops.set_live_num_tokens(self._runner._runner_id, int(live_num_tokens))
 
+    def _log_dispatch_trace(
+        self,
+        info: ForwardDispatchInfo,
+        *,
+        num_tokens_padded: int,
+        num_tokens_unpadded: int,
+        active_bucket: int,
+    ) -> None:
+        if (
+            info.trace_context is None
+            or os.environ.get("VLLM_COTS_DISPATCH_TRACE", "0") != "1"
+        ):
+            return
+
+        f_cpu_compute, f_prefetch_compute = self._dispatch_table.get(
+            active_bucket, (0.0, 0.0)
+        )
+        descriptor_bucket = getattr(info.batch_descriptor, "cots_dispatch_bucket", None)
+        payload = {
+            **dict(info.trace_context),
+            "event": "cots_dispatch_trace",
+            "pid": os.getpid(),
+            "num_tokens_padded": int(num_tokens_padded),
+            "num_tokens_unpadded": int(num_tokens_unpadded),
+            "cots_dispatch_bucket": int(active_bucket),
+            "dispatch_bucket_source": (
+                "descriptor" if descriptor_bucket is not None else "num_tokens"
+            ),
+            "descriptor_dispatch_bucket": (
+                None if descriptor_bucket is None else int(descriptor_bucket)
+            ),
+            "cots_route_signature": getattr(
+                info.batch_descriptor, "cots_route_signature", None
+            ),
+            "f_cpu_store": float(self.f_cpu_store),
+            "f_cpu_compute": float(f_cpu_compute),
+            "f_prefetch_compute": float(f_prefetch_compute),
+            "has_cpu_compute_work": bool(self._has_cpu_compute_work),
+            "has_prefetch_buffer": bool(self._prefetch_buffer_pool is not None),
+        }
+        logger.info("COTS_DISPATCH_TRACE %s", json.dumps(payload, sort_keys=True))
+
     def on_dispatch(self, info: ForwardDispatchInfo) -> None:
         """OOG per-forward entry. Owns ALL pre-forward state setup that
         was previously split between the in-graph pre-hook (bucket +
@@ -1087,6 +1129,12 @@ class CotsOffloader(BaseOffloader):
         num_tokens_padded = int(info.batch_descriptor.num_tokens)
         num_tokens_unpadded = int(info.num_tokens_unpadded)
         active_bucket = self._dispatch_bucket_from_descriptor(info.batch_descriptor)
+        self._log_dispatch_trace(
+            info,
+            num_tokens_padded=num_tokens_padded,
+            num_tokens_unpadded=num_tokens_unpadded,
+            active_bucket=active_bucket,
+        )
         self._prepare_before_forward_bucket(num_tokens_padded, active_bucket)
         if self._has_cpu_compute_work and isinstance(
             self._runner, NativeCotsWeightRunner

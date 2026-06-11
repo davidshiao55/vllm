@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     VLLM_COTS_SUFFIX_WAIT_KERNEL_DIAG: bool = False
     VLLM_COTS_HYBRID_CUDA_TIMING: bool = False
     VLLM_COTS_HYBRID_SUBMIT_TIMING: bool = False
+    VLLM_COTS_DISPATCH_TRACE: bool = False
     VLLM_COTS_HYBRID_COALESCED_PREFIX: bool = True
     VLLM_USE_FLASHINFER_SAMPLER: bool | None = None
     VLLM_PP_LAYER_PARTITION: str | None = None
@@ -735,6 +736,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_COTS_HYBRID_SUBMIT_TIMING": lambda: os.getenv(
         "VLLM_COTS_HYBRID_SUBMIT_TIMING", "0"
     )
+    == "1",
+    "VLLM_COTS_DISPATCH_TRACE": lambda: os.getenv("VLLM_COTS_DISPATCH_TRACE", "0")
     == "1",
     "VLLM_COTS_HYBRID_ENGINE_TIMING": lambda: os.getenv(
         "VLLM_COTS_HYBRID_ENGINE_TIMING", "0"
