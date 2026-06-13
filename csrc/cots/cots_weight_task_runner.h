@@ -328,6 +328,13 @@ class CotsWeightTaskRunner {
   void run_bf16_gemm_natural_inline(at::Tensor x, at::Tensor w,
                                     at::Tensor y_out);
 
+  // Inline call to the production fused MLP CPU kernel:
+  // gate/up GEMM + SwiGLU into BF16 scratch + transposed down GEMM.
+  // Weight layouts match populate_slab_mlp: gate/up are (I, H), down is
+  // transposed storage (I, O). Caller-managed tensors; no TaskQueue.
+  void run_bf16_mlp_inline(at::Tensor x, at::Tensor w_gate, at::Tensor w_up,
+                           at::Tensor w_down, at::Tensor y_out);
+
   // §1c.20: produce an `at::from_blob` CPU tensor view over the slab's
   // pinned output buffer for the given task. Trusted: the y_pinned_ptr
   // came from `_y_pinned`, which was allocated with `pin_memory=True`

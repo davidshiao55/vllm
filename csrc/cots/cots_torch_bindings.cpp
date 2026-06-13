@@ -185,6 +185,10 @@ PYBIND11_MODULE(_cots_C, m) {
       .def("run_bf16_gemm_natural_inline",
            &CotsWeightTaskRunner::run_bf16_gemm_natural_inline, py::arg("x"),
            py::arg("w"), py::arg("y_out"))
+      // Production fused MLP CPU kernel: gate/up + SwiGLU + down.
+      .def("run_bf16_mlp_inline", &CotsWeightTaskRunner::run_bf16_mlp_inline,
+           py::arg("x"), py::arg("w_gate"), py::arg("w_up"), py::arg("w_down"),
+           py::arg("y_out"))
       .def("y_pinned_view", &CotsWeightTaskRunner::y_pinned_view,
            py::arg("task_id"), py::arg("num_tokens"))
       .def("set_live_num_tokens", &CotsWeightTaskRunner::set_live_num_tokens,

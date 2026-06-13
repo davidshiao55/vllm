@@ -533,6 +533,53 @@ void CotsWeightTaskRunner::run_bf16_gemm_natural_inline(at::Tensor x,
   bf16_gemm_natural_at(x, w, y_out);
 }
 
+void CotsWeightTaskRunner::run_bf16_mlp_inline(at::Tensor x, at::Tensor w_gate,
+                                               at::Tensor w_up,
+                                               at::Tensor w_down,
+                                               at::Tensor y_out) {
+  c10::InferenceMode g;
+  TORCH_CHECK(x.device().is_cpu() && w_gate.device().is_cpu() &&
+                  w_up.device().is_cpu() && w_down.device().is_cpu() &&
+                  y_out.device().is_cpu(),
+              "run_bf16_mlp_inline: all tensors must be CPU tensors");
+  TORCH_CHECK(x.scalar_type() == at::kBFloat16 &&
+                  w_gate.scalar_type() == at::kBFloat16 &&
+                  w_up.scalar_type() == at::kBFloat16 &&
+                  w_down.scalar_type() == at::kBFloat16 &&
+                  y_out.scalar_type() == at::kBFloat16,
+              "run_bf16_mlp_inline: all tensors must be bfloat16");
+  TORCH_CHECK(x.is_contiguous() && w_gate.is_contiguous() &&
+                  w_up.is_contiguous() && w_down.is_contiguous() &&
+                  y_out.is_contiguous(),
+              "run_bf16_mlp_inline: all tensors must be contiguous");
+  TORCH_CHECK(x.dim() == 2 && w_gate.dim() == 2 && w_up.dim() == 2 &&
+                  w_down.dim() == 2 && y_out.dim() == 2,
+              "run_bf16_mlp_inline: all tensors must be rank-2");
+
+  const int64_t M = x.size(0);
+  const int64_t H = x.size(1);
+  const int64_t I = w_gate.size(0);
+  const int64_t O = w_down.size(1);
+  TORCH_CHECK(w_gate.size(1) == H,
+              "run_bf16_mlp_inline: w_gate shape must be (I, H)");
+  TORCH_CHECK(w_up.size(0) == I && w_up.size(1) == H,
+              "run_bf16_mlp_inline: w_up shape must match w_gate");
+  TORCH_CHECK(w_down.size(0) == I,
+              "run_bf16_mlp_inline: w_down shape must be (I, O)");
+  TORCH_CHECK(y_out.size(0) == M && y_out.size(1) == O,
+              "run_bf16_mlp_inline: y_out shape must be (M, O)");
+
+  const int64_t z_elems = M * I;
+  mlp_scratch_bf16_.resize(static_cast<size_t>(std::max<int64_t>(z_elems, 0)));
+  bf16_mlp_gate_up_silu_down(
+      reinterpret_cast<const uint16_t*>(x.data_ptr()),
+      reinterpret_cast<const uint16_t*>(w_gate.data_ptr()),
+      reinterpret_cast<const uint16_t*>(w_up.data_ptr()),
+      reinterpret_cast<const uint16_t*>(w_down.data_ptr()),
+      reinterpret_cast<uint16_t*>(y_out.data_ptr()), mlp_scratch_bf16_.data(),
+      M, H, I, O);
+}
+
 at::Tensor CotsWeightTaskRunner::y_pinned_view(int64_t task_id,
                                                int32_t num_tokens) const {
   // §1c.20: build an `at::from_blob` CPU tensor view over the slab's
