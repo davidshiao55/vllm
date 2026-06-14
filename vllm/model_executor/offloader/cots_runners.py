@@ -570,13 +570,9 @@ class NativeCotsWeightRunner:
 def _make_runner(
     config: CotsOffloadConfig,
 ) -> PythonCotsWeightRunner | NativeCotsWeightRunner:
-    """Construct the offloader's single runner per `config.cpu_runner`.
-
-    New config objects always carry `cpu_runner`. A small fallback remains for
-    older test stubs that predate the native runner field.
-    """
-    cpu_runner = getattr(config, "cpu_runner", "python")
-    dry_run = bool(getattr(config, "dry_run", False))
+    """Construct the offloader's single runner per `config.cpu_runner`."""
+    cpu_runner = config.cpu_runner
+    dry_run = bool(config.dry_run)
     if cpu_runner == "python":
         return PythonCotsWeightRunner(dry_run=dry_run)
     if cpu_runner == "native":
