@@ -7,6 +7,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
+from cots.snap import qkv_kv_biased_counts as _shared_qkv_kv_biased_counts
 
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
@@ -210,27 +211,12 @@ def _qkv_kv_biased_counts(
     `2 * head_dim` quanta, preserving exact full placement. K/V head groups
     are assigned first; Q tail is used only after all K/V rows are selected.
     """
-    total = q_size + 2 * kv_size
-    if not (0 <= n_cpu_cols <= total):
-        raise ValueError(f"n_cpu_cols={n_cpu_cols} out of range [0, {total}]")
-
-    qkvo_quantum = 2 * head_dim
-    if n_cpu_cols <= 0:
-        n_cpu_cols = 0
-    elif n_cpu_cols < total:
-        n_cpu_cols = (n_cpu_cols // qkvo_quantum) * qkvo_quantum
-    else:
-        n_cpu_cols = total
-
-    kv_total = 2 * kv_size
-    if n_cpu_cols <= kv_total:
-        n_kv_heads = kv_size // head_dim
-        n_pairs = min(n_cpu_cols // (2 * head_dim), n_kv_heads)
-        n_k = n_v = n_pairs * head_dim
-        return (0, n_k, n_v)
-
-    n_q_tail_raw = n_cpu_cols - kv_total
-    return (min(n_q_tail_raw, q_size), kv_size, kv_size)
+    return _shared_qkv_kv_biased_counts(
+        q_size,
+        kv_size,
+        n_cpu_cols,
+        head_dim=head_dim,
+    )
 
 
 def _qkv_kv_biased_indices(

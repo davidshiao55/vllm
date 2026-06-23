@@ -9,10 +9,25 @@ from typing import Literal
 
 import torch
 import torch.nn as nn
+from cots.snap import (
+    DEFAULT_QKVO_HEAD_DIM,
+    WO_QKVO_GRANULARITY_MULTIPLIER,
+)
+from cots.snap import (
+    qkv_kv_biased_counts as _qkv_kv_biased_counts,
+)
+from cots.snap import (
+    snap_mlp_channels as _snap_mlp_channels,
+)
+from cots.snap import (
+    snap_qkv_output_channels as _snap_qkv_output_channels,
+)
+from cots.snap import (
+    snap_qkvo_dense_output_channels as _snap_qkvo_dense_output_channels,
+)
 
 from vllm.model_executor.offloader.cots_utils import (
     _complement,
-    _qkv_kv_biased_counts,
     _qkv_kv_biased_indices,
 )
 from vllm.utils.platform_utils import is_pin_memory_available
@@ -34,93 +49,6 @@ ROLE_SPLIT_AXIS: dict[CotsLinearRole, SplitAxis] = {
     MLP_DOWN_ROLE: INPUT_SPLIT_AXIS,
     WO_ROLE: OUTPUT_SPLIT_AXIS,
 }
-
-MLP_CHANNEL_GRANULARITY = 64
-"""Planner/COTS MLP snap grid: channels per gate/up half and down input."""
-
-DEFAULT_QKVO_HEAD_DIM = 128
-"""Fallback attention head dimension when no QKV module is available.
-
-Production QKV/WO gets this from the layer's QKV head_size so dense WO output
-splits use the same K/V-pair quantum as WQKV. The fallback keeps synthetic
-WO-only unit tests and unusual module slices deterministic.
-"""
-
-WO_QKVO_GRANULARITY_MULTIPLIER = 2
-"""Production WO snap multiplier over the QKVO K/V-pair row quantum.
-
-WO has a separate per-layer CPU task and sync boundary, so its dense output
-split starts at two QKVO quanta to avoid the small-slice latency cliff.
-"""
-
-
-def _floor_channels(requested: float, limit: int, granularity: int) -> int:
-    """Floor a channel count to a positive grid, preserving exact full size."""
-    if granularity <= 0:
-        raise ValueError(f"granularity must be positive, got {granularity}")
-    if requested <= 0:
-        return 0
-    if requested >= limit:
-        return limit
-    snapped = int(requested // granularity) * granularity
-    return min(snapped, limit)
-
-
-def _snap_mlp_channels(requested: float, limit: int) -> int:
-    """Snap an MLP channel count to the kernel-friendly Phase-1 grid.
-
-    MLP offload uses matched channel counts for gate, up, and down. The
-    profiler found narrow arbitrary sizes such as 96 channels can hit bad GEMM
-    shapes; multiples of 64 avoid that cliff on Qwen2.5-7B. Production floors
-    to the largest valid grid point not exceeding the requested fraction.
-    """
-    return _floor_channels(requested, limit, MLP_CHANNEL_GRANULARITY)
-
-
-def _snap_qkv_output_channels(
-    requested: int,
-    *,
-    q_size: int,
-    kv_size: int,
-    head_dim: int,
-) -> int:
-    """Floor WQKV output channels through the K/V-biased WQKV picker."""
-    n_q_tail, n_k, n_v = _qkv_kv_biased_counts(
-        q_size,
-        kv_size,
-        requested,
-        head_dim=head_dim,
-    )
-    return n_q_tail + n_k + n_v
-
-
-def _qkvo_output_granularity(head_dim: int) -> int:
-    """QKVO output-row quantum.
-
-    QKV's smallest K/V-biased structural unit is one K/V pair:
-    `K_head + V_head`, or `2 * head_dim` output rows.
-    """
-    if head_dim <= 0:
-        raise ValueError(f"head_dim must be positive, got {head_dim}")
-    return 2 * head_dim
-
-
-def _snap_qkvo_dense_output_channels(
-    requested: float,
-    limit: int,
-    *,
-    head_dim: int,
-    qkvo_multiplier: int = 1,
-) -> int:
-    """Snap WO dense output rows to the shared QKVO quantum.
-
-    The returned count is a dense tail of WO rows, while QKV still uses its
-    K/V-biased picker for the actual row identities.
-    """
-    if qkvo_multiplier < 1:
-        raise ValueError(f"qkvo_multiplier must be >= 1, got {qkvo_multiplier}")
-    granularity = qkvo_multiplier * _qkvo_output_granularity(head_dim)
-    return _floor_channels(requested, limit, granularity)
 
 
 class CotsLinearHandle:
