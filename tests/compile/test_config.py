@@ -352,6 +352,7 @@ def test_cots_auto_graph_split_can_be_disabled_for_pure_prefetch():
 def test_cots_hybrid_kv_config_is_derived_and_graph_piecewise():
     cots = CotsOffloadConfig(kv_split_blocks=128, kv_cpu_pool_bytes=1 << 30)
     assert cots.hybrid_kv_enabled
+    assert cots.kv_mode == "prefix_suffix"
 
     config = VllmConfig(
         offload_config=OffloadConfig(offload_backend="cots", cots=cots),
@@ -376,6 +377,31 @@ def test_cots_hybrid_kv_config_is_derived_and_graph_piecewise():
         VllmConfig(
             offload_config=OffloadConfig(offload_backend="cots", cots=cots),
             scheduler_config=SchedulerConfig.default_factory(async_scheduling=True),
+            compilation_config=CompilationConfig(cudagraph_mode=CUDAGraphMode.NONE),
+        )
+
+
+def test_cots_head_split_kv_mode_is_scaffold_only():
+    disabled_head_split = CotsOffloadConfig(kv_mode="head_split")
+    assert not disabled_head_split.hybrid_kv_enabled
+
+    VllmConfig(
+        offload_config=OffloadConfig(offload_backend="cots", cots=disabled_head_split),
+        compilation_config=CompilationConfig(cudagraph_mode=CUDAGraphMode.NONE),
+    )
+
+    enabled_head_split = CotsOffloadConfig(
+        kv_split_blocks=128,
+        kv_cpu_pool_bytes=1 << 30,
+        kv_mode="head_split",
+    )
+    assert enabled_head_split.hybrid_kv_enabled
+
+    with pytest.raises(ValueError, match="head_split.*scaffold"):
+        VllmConfig(
+            offload_config=OffloadConfig(
+                offload_backend="cots", cots=enabled_head_split
+            ),
             compilation_config=CompilationConfig(cudagraph_mode=CUDAGraphMode.NONE),
         )
 

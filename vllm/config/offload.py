@@ -152,6 +152,14 @@ class CotsOffloadConfig:
     """Phase 2 CPU suffix KV pool size in bytes. This is planner-owned
     capacity, distinct from vLLM's native prefix-cache KV offload feature."""
 
+    kv_mode: Literal["prefix_suffix", "head_split"] = "prefix_suffix"
+    """Experimental COTS KV topology selector.
+
+    * `"prefix_suffix"` keeps the Phase 2 position-split implementation:
+      GPU prefix KV, CPU suffix KV, and online-softmax merge.
+    * `"head_split"` reserves a TP-style KV redesign entry point. It is a
+      branch-only scaffold until a runtime is implemented."""
+
     kv_h2d_mode: Literal["uva"] = "uva"
     """Phase 2 CPU->GPU artifact path. MVP supports only UVA so small CPU
     attention outputs/LSE and CPU-produced prefix K/V do not use the explicit

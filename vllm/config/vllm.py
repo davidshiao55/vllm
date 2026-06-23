@@ -1329,6 +1329,12 @@ class VllmConfig:
             or not cots_config.hybrid_kv_enabled
         ):
             return
+        if cots_config.kv_mode != "prefix_suffix":
+            raise ValueError(
+                "COTS KV mode 'head_split' is a redesign scaffold only; "
+                "disable COTS KV or use cots_kv_mode='prefix_suffix' until "
+                "the head-split runtime is implemented."
+            )
         graph_enabled = self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
         if graph_enabled and (
             self.model_config is None or not self.model_config.enforce_eager
