@@ -103,6 +103,59 @@ class _NativeWeightSlabSpecLinear(NativeWeightSlabSpec):
         )
 
 
+class _NativeWeightSlabSpecInputSplitLinear(NativeWeightSlabSpec):
+    def __init__(
+        self,
+        op_descriptor: tuple[int, int, str],
+        *,
+        n_threads: int,
+        x_pinned_ptr: int,
+        in_dim: int,
+        x_col_offset: int,
+        y_pinned_ptr: int,
+        cpu_out_dim: int,
+        w_cpu_ptr: int,
+        w_cpu_rows: int,
+        w_cpu_cols: int,
+    ) -> None:
+        super().__init__(op_descriptor)
+        self.n_threads = n_threads
+        self.x_pinned_ptr = x_pinned_ptr
+        self.in_dim = in_dim
+        self.x_col_offset = x_col_offset
+        self.y_pinned_ptr = y_pinned_ptr
+        self.cpu_out_dim = cpu_out_dim
+        self.w_cpu_ptr = w_cpu_ptr
+        self.w_cpu_rows = w_cpu_rows
+        self.w_cpu_cols = w_cpu_cols
+
+    def populate(self, runner_handle: object, task_id: int, *, dry_run: bool) -> None:
+        bucket_capacity_tokens = int(self.op_descriptor[1])
+        if dry_run:
+            runner_handle.populate_slab_dryrun(  # type: ignore[attr-defined]
+                task_id=task_id,
+                bucket_capacity_tokens=bucket_capacity_tokens,
+                x_pinned_ptr=self.x_pinned_ptr,
+                in_dim=self.in_dim,
+                y_pinned_ptr=self.y_pinned_ptr,
+                cpu_out_dim=self.cpu_out_dim,
+            )
+            return
+        runner_handle.populate_slab_wo_input(  # type: ignore[attr-defined]
+            task_id=task_id,
+            n_threads=self.n_threads,
+            bucket_capacity_tokens=bucket_capacity_tokens,
+            x_pinned_ptr=self.x_pinned_ptr,
+            in_dim=self.in_dim,
+            x_col_offset=self.x_col_offset,
+            y_pinned_ptr=self.y_pinned_ptr,
+            cpu_out_dim=self.cpu_out_dim,
+            w_cpu_ptr=self.w_cpu_ptr,
+            w_cpu_rows=self.w_cpu_rows,
+            w_cpu_cols=self.w_cpu_cols,
+        )
+
+
 class _NativeWeightSlabSpecMlp(NativeWeightSlabSpec):
     def __init__(
         self,

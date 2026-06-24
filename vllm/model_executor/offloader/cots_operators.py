@@ -15,10 +15,12 @@ from vllm.model_executor.offloader.cots_runners import (
     PythonCotsWeightRunner,
 )
 from vllm.model_executor.offloader.cots_storage import (
+    INPUT_SPLIT_AXIS,
     MLP_DOWN_ROLE,
     MLP_GATE_UP_ROLE,
     OUTPUT_SPLIT_AXIS,
     QKV_ROLE,
+    WO_INPUT_ROLE,
     WO_ROLE,
     CotsLinearHandle,
 )
@@ -267,6 +269,120 @@ class CotsWOOp(CotsOutputSplitLinearOp):
             op_kind="wo",
             expected_role=WO_ROLE,
         )
+
+
+class CotsWOInputSplitOp:
+    """WO operator for head_split's TP-style input-row split.
+
+    GPU permanent, GPU-prefetched, and CPU-computed paths each produce a full
+    hidden-size partial. The merge is therefore summation, not output-channel
+    scatter.
+    """
+
+    def __init__(
+        self,
+        handle: CotsLinearHandle,
+        runner: PythonCotsWeightRunner | NativeCotsWeightRunner,
+        offloader: CotsOffloader,
+        original_quant_method,
+    ):
+        assert handle.role == WO_INPUT_ROLE
+        assert handle.split_axis == INPUT_SPLIT_AXIS
+        self._handle = handle
+        self._runner = runner
+        self._offloader = offloader
+        self._original = original_quant_method
+        self._op_kind = "wo"
+
+    def __getattr__(self, name):
+        return getattr(self._original, name)
+
+    def apply(
+        self,
+        layer: nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        offloader = self._offloader
+        dry_run = offloader.dry_run
+        h = self._handle
+        assert h.w_cpu is not None
+
+        num_tokens = x.shape[0]
+        b = offloader._operator_bucket(num_tokens)
+        if h.max_n_prefetch == 0:
+            n_pref = 0
+            n_cpu = h.n_cpu
+            pref_start = 0
+            cpu_start = h.cpu_compute_input_start_by_bucket.get(b, 0)
+            if n_cpu > 0 and cpu_start == 0:
+                cpu_start = int(h.cpu_indices[0].item())
+        else:
+            n_pref = h.n_prefetch_by_bucket[b]
+            n_cpu = h.n_cpu_compute_by_bucket[b]
+            pref_start = h.prefetch_input_start_by_bucket[b]
+            cpu_start = h.cpu_compute_input_start_by_bucket[b]
+            if n_pref > 0 and not dry_run:
+                _assert_prefetch_slot_ready(
+                    h,
+                    n_pref,
+                    underfilled_name="row slot",
+                )
+
+        y_dst: torch.Tensor | None = None
+        if n_cpu > 0 and not dry_run:
+            assert self._runner is not None
+            assert offloader._y_gpu is not None
+            desc = (h.layer_idx, b, self._op_kind)
+            y_dst = offloader._y_gpu[: num_tokens * h.out_dim].view(
+                num_tokens, h.out_dim
+            )
+            if isinstance(self._runner, NativeCotsWeightRunner):
+                self._runner.submit_with_d2h(x, h.layer_idx, self._op_kind)
+            else:
+                assert offloader._x_pinned is not None
+                assert offloader._y_pinned is not None
+                x_in = offloader._x_pinned[: num_tokens * n_cpu].view(num_tokens, n_cpu)
+                y_out = offloader._y_pinned[: num_tokens * h.out_dim].view(
+                    num_tokens, h.out_dim
+                )
+                self._runner.submit_with_d2h(
+                    x.narrow(1, cpu_start, n_cpu),
+                    x_in,
+                    y_out,
+                    desc,
+                )
+
+        out_gpu: torch.Tensor | None = None
+        keep_gpu = layer.weight.shape[1]
+        if keep_gpu > 0:
+            out_gpu = F.linear(x.narrow(1, 0, keep_gpu), layer.weight, None)
+
+        if n_pref > 0 and h.w_prefetch_slots and not dry_run:
+            slot_view = h.w_prefetch_slots[h.slot_idx].narrow(0, 0, n_pref)
+            pref_input = x.narrow(1, pref_start, n_pref)
+            pref_out = pref_input.matmul(slot_view)
+            out_gpu = pref_out if out_gpu is None else out_gpu + pref_out
+
+        if n_cpu > 0 and not dry_run:
+            assert y_dst is not None
+            assert offloader._dummy_gpu_anchor_a is not None
+            assert offloader._dummy_gpu_anchor_b is not None
+            gpu_a = out_gpu if out_gpu is not None else offloader._dummy_gpu_anchor_a
+            gpu_b = offloader._dummy_gpu_anchor_b
+            if isinstance(self._runner, NativeCotsWeightRunner):
+                self._runner.wait_and_uva(
+                    y_dst, gpu_a, gpu_b, x, h.layer_idx, self._op_kind
+                )
+            else:
+                self._runner.wait_and_uva(y_dst, gpu_a, gpu_b, x, desc)
+            out_gpu = y_dst.clone() if out_gpu is None else out_gpu + y_dst
+
+        if out_gpu is None:
+            out_gpu = x.new_empty((num_tokens, h.out_dim))
+        if bias is not None:
+            out_gpu = out_gpu + bias
+        return out_gpu
 
 
 class CotsSwiGLUMLPOp:

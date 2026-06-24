@@ -157,8 +157,9 @@ class CotsOffloadConfig:
 
     * `"prefix_suffix"` keeps the Phase 2 position-split implementation:
       GPU prefix KV, CPU suffix KV, and online-softmax merge.
-    * `"head_split"` reserves a TP-style KV redesign entry point. It is a
-      branch-only scaffold until a runtime is implemented."""
+    * `"head_split"` enables TP-style GQA-group weight placement for QKV/WO
+      and reserves the matching KV redesign entry point. The KV runtime remains
+      scaffolded until implemented."""
 
     kv_h2d_mode: Literal["uva"] = "uva"
     """Phase 2 CPU->GPU artifact path. MVP supports only UVA so small CPU

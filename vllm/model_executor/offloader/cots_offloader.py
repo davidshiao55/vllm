@@ -26,6 +26,7 @@ from vllm.model_executor.offloader.base import BaseOffloader, ForwardDispatchInf
 from vllm.model_executor.offloader.cots_operators import (
     CotsQKVOp,
     CotsSwiGLUMLPOp,
+    CotsWOInputSplitOp,
     CotsWOOp,
     _RaiseOnDirectCall,
 )
@@ -35,6 +36,7 @@ from vllm.model_executor.offloader.cots_runners import (
     PyCotsWeightCallback,
     PythonCotsWeightRunner,
     _make_runner,
+    _NativeWeightSlabSpecInputSplitLinear,
     _NativeWeightSlabSpecLinear,
     _NativeWeightSlabSpecMlp,
 )
@@ -44,6 +46,7 @@ from vllm.model_executor.offloader.cots_storage import (
     MLP_DOWN_ROLE,
     MLP_GATE_UP_ROLE,
     QKV_ROLE,
+    WO_INPUT_ROLE,
     WO_QKVO_GRANULARITY_MULTIPLIER,
     WO_ROLE,
     CotsLinearHandle,
@@ -61,6 +64,7 @@ logger = init_logger(__name__)
 LINEAR_OP_KIND_BY_ROLE = {
     QKV_ROLE: "qkv",
     WO_ROLE: "wo",
+    WO_INPUT_ROLE: "wo",
 }
 
 
@@ -88,6 +92,7 @@ class CotsOffloader(BaseOffloader):
         self.config = config
         self.f_cpu_store = float(config.f_cpu_store)
         self.f_prefetch = float(config.f_prefetch)
+        self.kv_mode = str(getattr(config, "kv_mode", "prefix_suffix"))
         self.weight_modules = frozenset(
             normalize_cots_weight_modules(getattr(config, "weight_modules", None))
         )
@@ -114,7 +119,7 @@ class CotsOffloader(BaseOffloader):
         # opt-in output-split WO adapters.
         self._handles: list[CotsLinearHandle] = []
         self._fused_ops: list[CotsSwiGLUMLPOp] = []
-        self._wo_ops: list[CotsWOOp] = []
+        self._wo_ops: list[CotsWOOp | CotsWOInputSplitOp] = []
 
         # Per-layer tracking for prefetch hook installation. `_layer_modules[i]`
         # is the i-th offloaded decoder layer; `_layer_handles[i]` is its
@@ -240,12 +245,13 @@ class CotsOffloader(BaseOffloader):
             self._install_prefetch_machinery()
         logger.debug(
             "CotsOffloader: wrapped %d linear modules, %d fused MLP blocks, "
-            "and %d WO ops (modules=%s, f_cpu_store=%.4f, f_prefetch=%.4f, "
-            "cpu_num_threads=%d, dry_run=%s).",
+            "and %d WO ops (modules=%s, kv_mode=%s, f_cpu_store=%.4f, "
+            "f_prefetch=%.4f, cpu_num_threads=%d, dry_run=%s).",
             len(self._handles),
             len(self._fused_ops),
             len(self._wo_ops),
             sorted(self.weight_modules),
+            self.kv_mode,
             self.f_cpu_store,
             self.f_prefetch,
             self.config.cpu_num_threads,
@@ -266,6 +272,11 @@ class CotsOffloader(BaseOffloader):
 
         layer_handles: list[CotsLinearHandle] = []
         qkvo_head_dim = self._qkvo_head_dim_for_layer(layer, QKVParallelLinear)
+        gqa_shape = (
+            self._gqa_shape_for_layer(layer, QKVParallelLinear)
+            if self.kv_mode == "head_split"
+            else None
+        )
         for qualified_name, child in layer.named_modules():
             module = self._module_for_qualified_name(qualified_name)
             if module is None:
@@ -278,12 +289,20 @@ class CotsOffloader(BaseOffloader):
                 )
             self._check_dtype_is_bfloat16(child, qualified_name)
             if module == "qkv" and isinstance(child, QKVParallelLinear):
-                handle = CotsLinearHandle.for_qkv(
-                    child,
-                    qualified_name,
-                    head_dim=int(child.head_size),
-                    f_cpu_store=self.f_cpu_store,
-                )
+                if self.kv_mode == "head_split":
+                    handle = CotsLinearHandle.for_qkv_gqa_groups(
+                        child,
+                        qualified_name,
+                        head_dim=int(child.head_size),
+                        f_cpu_store=self.f_cpu_store,
+                    )
+                else:
+                    handle = CotsLinearHandle.for_qkv(
+                        child,
+                        qualified_name,
+                        head_dim=int(child.head_size),
+                        f_cpu_store=self.f_cpu_store,
+                    )
             elif module == "mlp" and isinstance(child, MergedColumnParallelLinear):
                 handle = CotsLinearHandle.for_mlp_gate_up(
                     child,
@@ -297,12 +316,24 @@ class CotsOffloader(BaseOffloader):
                     f_cpu_store=self.f_cpu_store,
                 )
             elif module == "wo" and isinstance(child, RowParallelLinear):
-                handle = CotsLinearHandle.for_wo(
-                    child,
-                    qualified_name,
-                    f_cpu_store=self.f_cpu_store,
-                    qkvo_head_dim=qkvo_head_dim,
-                )
+                if self.kv_mode == "head_split":
+                    assert gqa_shape is not None
+                    num_q_heads, num_kv_heads, head_dim = gqa_shape
+                    handle = CotsLinearHandle.for_wo_gqa_input(
+                        child,
+                        qualified_name,
+                        num_q_heads=num_q_heads,
+                        num_kv_heads=num_kv_heads,
+                        head_dim=head_dim,
+                        f_cpu_store=self.f_cpu_store,
+                    )
+                else:
+                    handle = CotsLinearHandle.for_wo(
+                        child,
+                        qualified_name,
+                        f_cpu_store=self.f_cpu_store,
+                        qkvo_head_dim=qkvo_head_dim,
+                    )
             else:
                 raise RuntimeError(
                     f"CotsOffloader: {qualified_name} matched enabled COTS "
@@ -337,6 +368,26 @@ class CotsOffloader(BaseOffloader):
                 return int(child.head_size)
         return DEFAULT_QKVO_HEAD_DIM
 
+    @staticmethod
+    def _gqa_shape_for_layer(
+        layer: nn.Module,
+        qkv_cls: type[nn.Module],
+    ) -> tuple[int, int, int]:
+        for _, child in layer.named_modules():
+            if isinstance(child, qkv_cls):
+                parts = child.output_partition_sizes
+                assert len(parts) == 3, f"QKV expected 3 partitions, got {parts}"
+                q_part, k_part, v_part = parts
+                head_dim = int(child.head_size)
+                assert k_part == v_part, (
+                    f"QKV expected k_part == v_part, got k={k_part}, v={v_part}"
+                )
+                return q_part // head_dim, k_part // head_dim, head_dim
+        raise RuntimeError(
+            "CotsOffloader head_split mode requires a QKVParallelLinear in "
+            "each offloaded attention layer so WO can align to GQA groups."
+        )
+
     # --- Pass 2a: QKV operator install ---
 
     def _install_qkv_ops(self, handles: list[CotsLinearHandle]) -> None:
@@ -361,14 +412,22 @@ class CotsOffloader(BaseOffloader):
             "_install_wo_ops called with f_cpu_store=0 — runner not constructed"
         )
         for h in handles:
-            if h.role != WO_ROLE:
+            if h.role not in (WO_ROLE, WO_INPUT_ROLE):
                 continue
-            h.linear.quant_method = CotsWOOp(
-                handle=h,
-                runner=self._runner,
-                offloader=self,
-                original_quant_method=h.linear.quant_method,
-            )
+            if h.role == WO_INPUT_ROLE:
+                h.linear.quant_method = CotsWOInputSplitOp(
+                    handle=h,
+                    runner=self._runner,
+                    offloader=self,
+                    original_quant_method=h.linear.quant_method,
+                )
+            else:
+                h.linear.quant_method = CotsWOOp(
+                    handle=h,
+                    runner=self._runner,
+                    offloader=self,
+                    original_quant_method=h.linear.quant_method,
+                )
             self._wo_ops.append(h.linear.quant_method)
 
     # --- Pass 2b: MLP block operator install ---
@@ -552,6 +611,26 @@ class CotsOffloader(BaseOffloader):
         return cb
 
     @staticmethod
+    def _make_input_split_python_callback(
+        w_cpu: torch.Tensor,
+    ) -> PyCotsWeightCallback:
+        """Build a closure for row-parallel standalone WO.
+
+        The operator passes a compact activation slice whose columns already
+        match ``w_cpu``'s rows, so the CPU work is one ``x @ w`` matmul.
+        """
+
+        def cb(
+            event: torch.cuda.Event,
+            x_pinned: torch.Tensor,
+            y_pinned: torch.Tensor,
+        ) -> None:
+            event.synchronize()
+            y_pinned.copy_(torch.matmul(x_pinned, w_cpu))
+
+        return cb
+
+    @staticmethod
     def _make_mlp_python_callback(
         w_gate: torch.Tensor, w_up: torch.Tensor, w_down: torch.Tensor
     ) -> PyCotsWeightCallback:
@@ -584,7 +663,7 @@ class CotsOffloader(BaseOffloader):
         """
         callbacks: dict[tuple[int, int, str], PyCotsWeightCallback] = {}
         for h in self._handles:
-            if h.role not in (QKV_ROLE, WO_ROLE):
+            if h.role not in (QKV_ROLE, WO_ROLE, WO_INPUT_ROLE):
                 continue
             assert h.w_cpu is not None
             op_kind = LINEAR_OP_KIND_BY_ROLE[h.role]
@@ -594,9 +673,14 @@ class CotsOffloader(BaseOffloader):
                 if n_cpu == 0:
                     continue
                 w_view = h.w_cpu.narrow(0, n_pref, n_cpu)
-                callbacks[(h.layer_idx, bucket, op_kind)] = (
-                    self._make_output_split_python_callback(w_view)
-                )
+                if h.role == WO_INPUT_ROLE:
+                    callbacks[(h.layer_idx, bucket, op_kind)] = (
+                        self._make_input_split_python_callback(w_view)
+                    )
+                else:
+                    callbacks[(h.layer_idx, bucket, op_kind)] = (
+                        self._make_output_split_python_callback(w_view)
+                    )
         for fop in self._fused_ops:
             gu_h = fop._gate_up
             dn_h = fop._down
@@ -737,7 +821,7 @@ class CotsOffloader(BaseOffloader):
         y_pinned_ptr = int(self._y_pinned.data_ptr())
         specs: list[NativeWeightSlabSpec] = []
         for h in self._handles:
-            if h.role not in (QKV_ROLE, WO_ROLE):
+            if h.role not in (QKV_ROLE, WO_ROLE, WO_INPUT_ROLE):
                 continue
             assert h.w_cpu is not None
             op_kind = LINEAR_OP_KIND_BY_ROLE[h.role]
@@ -747,18 +831,36 @@ class CotsOffloader(BaseOffloader):
                 if n_cpu == 0:
                     continue
                 w_view = h.w_cpu.narrow(0, n_pref, n_cpu)
-                specs.append(
-                    _NativeWeightSlabSpecLinear(
-                        op_descriptor=(h.layer_idx, bucket, op_kind),
-                        n_threads=self._n_threads_for(bucket),
-                        x_pinned_ptr=x_pinned_ptr,
-                        in_dim=int(h.in_dim),
-                        y_pinned_ptr=y_pinned_ptr,
-                        cpu_out_dim=int(n_cpu),
-                        w_cpu_ptr=int(w_view.data_ptr()),
-                        w_cpu_rows=int(w_view.shape[0]),
+                if h.role == WO_INPUT_ROLE:
+                    specs.append(
+                        _NativeWeightSlabSpecInputSplitLinear(
+                            op_descriptor=(h.layer_idx, bucket, op_kind),
+                            n_threads=self._n_threads_for(bucket),
+                            x_pinned_ptr=x_pinned_ptr,
+                            in_dim=int(n_cpu),
+                            x_col_offset=int(
+                                h.cpu_compute_input_start_by_bucket[bucket]
+                            ),
+                            y_pinned_ptr=y_pinned_ptr,
+                            cpu_out_dim=int(h.out_dim),
+                            w_cpu_ptr=int(w_view.data_ptr()),
+                            w_cpu_rows=int(w_view.shape[0]),
+                            w_cpu_cols=int(w_view.shape[1]),
+                        )
                     )
-                )
+                else:
+                    specs.append(
+                        _NativeWeightSlabSpecLinear(
+                            op_descriptor=(h.layer_idx, bucket, op_kind),
+                            n_threads=self._n_threads_for(bucket),
+                            x_pinned_ptr=x_pinned_ptr,
+                            in_dim=int(h.in_dim),
+                            y_pinned_ptr=y_pinned_ptr,
+                            cpu_out_dim=int(n_cpu),
+                            w_cpu_ptr=int(w_view.data_ptr()),
+                            w_cpu_rows=int(w_view.shape[0]),
+                        )
+                    )
         for fop in self._fused_ops:
             gu_h = fop._gate_up
             dn_h = fop._down
@@ -848,6 +950,7 @@ class CotsOffloader(BaseOffloader):
         payload: dict[str, object] = {
             "schema_version": 1,
             "snap_model": "cots_snap_v1",
+            "kv_mode": self.kv_mode,
             "wo_qkvo_granularity_multiplier": WO_QKVO_GRANULARITY_MULTIPLIER,
             "storage_by_store_fraction": {
                 storage_key: {
@@ -872,6 +975,7 @@ class CotsOffloader(BaseOffloader):
             MLP_GATE_UP_ROLE: "mlp_gate_up",
             MLP_DOWN_ROLE: "mlp_down",
             WO_ROLE: "wo",
+            WO_INPUT_ROLE: "wo",
         }
         dispatch_by_bucket: dict[str, object] = {}
         for bucket in self._dispatch_buckets:
@@ -1556,6 +1660,7 @@ class CotsOffloader(BaseOffloader):
                 MLP_GATE_UP_ROLE: "mlp_col",
                 MLP_DOWN_ROLE: "mlp_row",
                 WO_ROLE: "wo",
+                WO_INPUT_ROLE: "wo",
             }[h.role]
             per_role_pref[key] += n_pref * other_dim * elem
             per_role_cpu[key] += n_cpu * other_dim * elem

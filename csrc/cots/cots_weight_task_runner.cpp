@@ -225,6 +225,34 @@ void CotsWeightTaskRunner::populate_slab_mlp(
   s.w_down_cols = w_down_cols;
 }
 
+void CotsWeightTaskRunner::populate_slab_wo_input(
+    int64_t task_id, int32_t n_threads, int32_t bucket_capacity_tokens,
+    uintptr_t x_pinned_ptr, int32_t in_dim, int32_t x_col_offset,
+    uintptr_t y_pinned_ptr, int32_t cpu_out_dim, uintptr_t w_cpu_ptr,
+    int32_t w_cpu_rows, int32_t w_cpu_cols) {
+  check_error();
+  TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
+              "populate_slab_wo_input: task_id ", task_id, " out of range");
+  TORCH_CHECK(bucket_capacity_tokens >= 0,
+              "populate_slab_wo_input: bucket_capacity_tokens=",
+              bucket_capacity_tokens, " < 0");
+  TORCH_CHECK(in_dim >= 0, "populate_slab_wo_input: in_dim=", in_dim, " < 0");
+  TORCH_CHECK(x_col_offset >= 0,
+              "populate_slab_wo_input: x_col_offset=", x_col_offset, " < 0");
+  TaskSlab& s = slabs_[task_id];
+  s.op_kind = TaskSlab::kWoInput;
+  s.n_threads = n_threads;
+  s.bucket_capacity_tokens = bucket_capacity_tokens;
+  s.x_pinned_ptr = reinterpret_cast<void*>(x_pinned_ptr);
+  s.in_dim = in_dim;
+  s.x_col_offset = x_col_offset;
+  s.y_pinned_ptr = reinterpret_cast<void*>(y_pinned_ptr);
+  s.cpu_out_dim = cpu_out_dim;
+  s.w_down_ptr = reinterpret_cast<void*>(w_cpu_ptr);
+  s.w_down_rows = w_cpu_rows;
+  s.w_down_cols = w_cpu_cols;
+}
+
 void CotsWeightTaskRunner::populate_slab_dryrun(
     int64_t task_id, int32_t bucket_capacity_tokens, uintptr_t x_pinned_ptr,
     int32_t in_dim, uintptr_t y_pinned_ptr, int32_t cpu_out_dim) {
@@ -241,6 +269,7 @@ void CotsWeightTaskRunner::populate_slab_dryrun(
   // submit_on_stream's D2H and sync's y_pinned_view both resolve.
   s.x_pinned_ptr = reinterpret_cast<void*>(x_pinned_ptr);
   s.in_dim = in_dim;
+  s.x_col_offset = 0;
   s.y_pinned_ptr = reinterpret_cast<void*>(y_pinned_ptr);
   s.cpu_out_dim = cpu_out_dim;
 }
@@ -305,6 +334,7 @@ void CotsWeightTaskRunner::submit_on_stream(int64_t task_id, int32_t num_tokens,
       hist_bin = 7;
     switch (slab->op_kind) {
       case TaskSlab::kQkv:
+      case TaskSlab::kWoInput:
         submit_count_qkv_.fetch_add(1, std::memory_order_relaxed);
         nt_hist_qkv_[hist_bin].fetch_add(1, std::memory_order_relaxed);
         break;
@@ -330,9 +360,13 @@ void CotsWeightTaskRunner::submit_on_stream(int64_t task_id, int32_t num_tokens,
                 task_id, " (slab not populated?)");
     TORCH_CHECK(slab->in_dim > 0, "submit_on_stream: slab.in_dim is ",
                 slab->in_dim, " at task_id=", task_id);
-    TORCH_CHECK(
-        x_cols == slab->in_dim, "submit_on_stream: x_gpu.shape[1]=", x_cols,
-        " disagrees with slab.in_dim=", slab->in_dim, " at task_id=", task_id);
+    TORCH_CHECK(slab->x_col_offset >= 0,
+                "submit_on_stream: slab.x_col_offset=", slab->x_col_offset,
+                " at task_id=", task_id);
+    TORCH_CHECK(x_cols >= slab->x_col_offset + slab->in_dim,
+                "submit_on_stream: x_gpu.shape[1]=", x_cols,
+                " is too small for slab.x_col_offset=", slab->x_col_offset,
+                " plus slab.in_dim=", slab->in_dim, " at task_id=", task_id);
     TORCH_CHECK(x_stride1 == 1, "submit_on_stream: x_gpu.stride(1)=", x_stride1,
                 " (must be 1 — no transposed-stride layouts; only "
                 "row-strided contiguous-along-feature inputs are "
@@ -347,7 +381,11 @@ void CotsWeightTaskRunner::submit_on_stream(int64_t task_id, int32_t num_tokens,
     // §1c.34 cleanup C: D2H byte/count counters are diagnostic only;
     // diag-gate them so the hot path skips the atomic adds.
     const bool d2h_diag = cots_diag::counters_enabled();
-    if (x_stride0 == x_cols) {
+    auto* src_ptr =
+        reinterpret_cast<char*>(x_gpu_ptr) +
+        static_cast<size_t>(slab->x_col_offset) * sizeof(at::BFloat16);
+    if (x_stride0 == x_cols && slab->x_col_offset == 0 &&
+        slab->in_dim == x_cols) {
       // Contiguous row layout — single 1D copy is fastest.
       const size_t bytes = static_cast<size_t>(num_tokens) * width_bytes;
       if (d2h_diag) {
@@ -355,8 +393,7 @@ void CotsWeightTaskRunner::submit_on_stream(int64_t task_id, int32_t num_tokens,
         d2h_record_bytes_1d_.fetch_add(static_cast<int64_t>(bytes),
                                        std::memory_order_relaxed);
       }
-      copy_err = cudaMemcpyAsync(slab->x_pinned_ptr,
-                                 reinterpret_cast<void*>(x_gpu_ptr), bytes,
+      copy_err = cudaMemcpyAsync(slab->x_pinned_ptr, src_ptr, bytes,
                                  cudaMemcpyDeviceToHost, stream);
     } else {
       // Row-strided (e.g., a `[:, :hidden_dim]` slice over a wider
@@ -372,8 +409,8 @@ void CotsWeightTaskRunner::submit_on_stream(int64_t task_id, int32_t num_tokens,
                                        std::memory_order_relaxed);
       }
       copy_err = cudaMemcpy2DAsync(
-          slab->x_pinned_ptr, /*dpitch=*/width_bytes,
-          reinterpret_cast<void*>(x_gpu_ptr), /*spitch=*/src_pitch,
+          slab->x_pinned_ptr, /*dpitch=*/width_bytes, src_ptr,
+          /*spitch=*/src_pitch,
           /*width=*/width_bytes, /*height=*/static_cast<size_t>(num_tokens),
           cudaMemcpyDeviceToHost, stream);
     }
@@ -730,6 +767,9 @@ void CotsWeightTaskRunner::RunSlabOnWorker(TaskSlab* slab, uint32_t seq) {
     case TaskSlab::kMlpBlock:
       nvtx_name = "cots:worker_mlp";
       break;
+    case TaskSlab::kWoInput:
+      nvtx_name = "cots:worker_wo_input";
+      break;
     case TaskSlab::kDryrunNoop:
       nvtx_name = "cots:worker_dryrun";
       break;
@@ -865,6 +905,23 @@ void CotsWeightTaskRunner::RunSlabOnWorker(TaskSlab* slab, uint32_t seq) {
         auto y_view =
             ContigCpuViewFromBlob(slab->y_pinned_ptr, n, slab->cpu_out_dim);
         bf16_gemm_natural_at(x_view, w_view, y_view);
+        break;
+      }
+      case TaskSlab::kWoInput: {
+        TORCH_CHECK(slab->w_down_rows == slab->in_dim,
+                    "WO input CPU path requires weight K to match compact "
+                    "input dim, got w_rows=",
+                    slab->w_down_rows, " in_dim=", slab->in_dim);
+        TORCH_CHECK(slab->w_down_cols == slab->cpu_out_dim,
+                    "WO input CPU path output dim mismatch: w_cols=",
+                    slab->w_down_cols, " cpu_out_dim=", slab->cpu_out_dim);
+        auto x_view =
+            ContigCpuViewFromBlob(slab->x_pinned_ptr, n, slab->in_dim);
+        auto w_view = ContigCpuViewFromBlob(slab->w_down_ptr, slab->w_down_rows,
+                                            slab->w_down_cols);
+        auto y_view =
+            ContigCpuViewFromBlob(slab->y_pinned_ptr, n, slab->cpu_out_dim);
+        bf16_gemm_transposed_at(x_view, w_view, y_view);
         break;
       }
       case TaskSlab::kMlpBlock: {
