@@ -1038,9 +1038,9 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     "csrc/cots/bf16_gemm_natural.cpp"
     # CPU MLP block fast path: gate/up/SwiGLU into BF16 scratch, then down.
     "csrc/cots/bf16_mlp_gate_up_silu.cpp"
-    # Phase 2 CPU suffix attention kernel: BF16 grouped-query decode
-    # attention with output+LSE for online-softmax merge.
-    "csrc/cots/cpu_suffix_attention.cpp"
+    # CPU GQA attention kernels: suffix decode baseline plus TP-style
+    # decode/prefill paths with output+LSE for online-softmax merge.
+    "csrc/cots/cpu_gqa_attention.cpp"
     # §1c.29 wait kernel — compiled as CUDA so nvcc handles
     # the __global__ kernel and PTX inline asm. The other
     # sources stay C++ host code; nvcc compiles them
@@ -1104,7 +1104,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     "csrc/cots/bf16_mlp_gate_up_silu.cpp"
     PROPERTIES COMPILE_FLAGS "-mavx2 -mfma -fopenmp")
   set_source_files_properties(
-    "csrc/cots/cpu_suffix_attention.cpp"
+    "csrc/cots/cpu_gqa_attention.cpp"
     PROPERTIES COMPILE_FLAGS "-mavx2 -mfma -fopenmp")
 
   message(STATUS "Enabling cots_C extension.")

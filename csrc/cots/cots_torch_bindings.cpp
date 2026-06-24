@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
-// pybind11 bindings for the COTS native task runners. Exposes the
-// weight and suffix-attention task-runner classes; no torch.ops.* registration
-// in C++ — the torch.ops.vllm.cots_* ops are registered Python-side in
-// vllm/model_executor/offloader/cots_ops.py via direct_register_custom_op.
+// pybind11 bindings for COTS native task runners and CPU GQA attention ops.
+// No torch.ops.* registration in C++ — the torch.ops.vllm.cots_* ops are
+// registered Python-side in vllm/model_executor/offloader/cots_ops.py via
+// direct_register_custom_op.
 
 #include <torch/extension.h>
 
@@ -22,6 +22,19 @@ void gqa_bf16_suffix_attention_at(const at::Tensor& query,
                                   const at::Tensor& block_table,
                                   const at::Tensor& seq_lens, double scale,
                                   at::Tensor& output, at::Tensor& output_lse);
+void gqa_bf16_decode_attention_at(const at::Tensor& query,
+                                  const at::Tensor& key_cache,
+                                  const at::Tensor& value_cache,
+                                  const at::Tensor& block_table,
+                                  const at::Tensor& seq_lens, double scale,
+                                  at::Tensor& output, at::Tensor& output_lse);
+void gqa_bf16_prefill_attention_at(const at::Tensor& query,
+                                   const at::Tensor& key_cache,
+                                   const at::Tensor& value_cache,
+                                   const at::Tensor& block_table,
+                                   const at::Tensor& query_to_seq,
+                                   const at::Tensor& seq_lens, double scale,
+                                   at::Tensor& output, at::Tensor& output_lse);
 void gqa_bf16_scatter_suffix_kv_at(const at::Tensor& key,
                                    const at::Tensor& value,
                                    const at::Tensor& block_ids,
@@ -36,6 +49,15 @@ PYBIND11_MODULE(_cots_C, m) {
   m.def("gqa_bf16_suffix_attention", &vllm::cots::gqa_bf16_suffix_attention_at,
         py::arg("query"), py::arg("key_cache"), py::arg("value_cache"),
         py::arg("block_table"), py::arg("seq_lens"), py::arg("scale"),
+        py::arg("output"), py::arg("output_lse"));
+  m.def("gqa_bf16_decode_attention", &vllm::cots::gqa_bf16_decode_attention_at,
+        py::arg("query"), py::arg("key_cache"), py::arg("value_cache"),
+        py::arg("block_table"), py::arg("seq_lens"), py::arg("scale"),
+        py::arg("output"), py::arg("output_lse"));
+  m.def("gqa_bf16_prefill_attention",
+        &vllm::cots::gqa_bf16_prefill_attention_at, py::arg("query"),
+        py::arg("key_cache"), py::arg("value_cache"), py::arg("block_table"),
+        py::arg("query_to_seq"), py::arg("seq_lens"), py::arg("scale"),
         py::arg("output"), py::arg("output_lse"));
   m.def("gqa_bf16_scatter_suffix_kv",
         &vllm::cots::gqa_bf16_scatter_suffix_kv_at, py::arg("key"),
