@@ -43,11 +43,17 @@ here.
 from __future__ import annotations
 
 import itertools
+import threading
 from typing import TYPE_CHECKING, Any
 
 import torch
 
-from vllm.utils.cots_diag import NVTX_ENABLED as _COTS_NVTX_ENABLED
+from vllm.utils.cots_diag import (
+    COUNTERS_ENABLED as _COTS_COUNTERS_ENABLED,
+)
+from vllm.utils.cots_diag import (
+    NVTX_ENABLED as _COTS_NVTX_ENABLED,
+)
 from vllm.utils.torch_utils import direct_register_custom_op
 
 if TYPE_CHECKING:
@@ -63,6 +69,8 @@ _COTS_WEIGHT_RUNNERS: dict[int, Any] = {}
 _COTS_WEIGHT_ACTIVE_DISPATCH: dict[int, tuple[int, int]] = {}
 _COTS_WEIGHT_TASK_ID_FOR: dict[int, dict[tuple[int, int, str], int]] = {}
 _NEXT_WEIGHT_RUNNER_ID = itertools.count(1)
+_COTS_PY_COUNTERS: dict[str, int] = {}
+_COTS_PY_COUNTER_LOCK = threading.Lock()
 
 _OP_KIND_TO_CODE: dict[str, int] = {
     "qkv": 1,
@@ -263,6 +271,8 @@ def reset_all_counters() -> None:
     """Zero every registered CotsWeightTaskRunner counter."""
     import contextlib
 
+    with _COTS_PY_COUNTER_LOCK:
+        _COTS_PY_COUNTERS.clear()
     for runner in _COTS_WEIGHT_RUNNERS.values():
         # Best-effort — a stale runner shouldn't break the reset
         # for the rest.
@@ -273,10 +283,34 @@ def reset_all_counters() -> None:
 def get_all_counters() -> dict[int, dict[str, int]]:
     """Return diagnostic counters for every registered weight runner."""
     out: dict[int, dict[str, int]] = {}
+    with _COTS_PY_COUNTER_LOCK:
+        if _COTS_PY_COUNTERS:
+            out[-1] = dict(_COTS_PY_COUNTERS)
     for runner_id, runner in _COTS_WEIGHT_RUNNERS.items():
         counters = runner.get_counters()
         out[int(runner_id)] = {str(k): int(v) for k, v in counters.items()}
     return out
+
+
+def add_python_counter(name: str, value: int = 1) -> None:
+    """Add an env-gated Python-side diagnostic counter.
+
+    Runner-native counters cover the C++ weight worker. The experimental
+    head-split KV path is still Python orchestrated, so it uses this tiny
+    shared counter bucket when ``VLLM_COTS_COUNTERS=1``.
+    """
+
+    if not _COTS_COUNTERS_ENABLED:
+        return
+    with _COTS_PY_COUNTER_LOCK:
+        _COTS_PY_COUNTERS[name] = _COTS_PY_COUNTERS.get(name, 0) + int(value)
+
+
+def add_python_timing(name: str, elapsed_ns: int, *, count: int = 1) -> None:
+    if not _COTS_COUNTERS_ENABLED:
+        return
+    add_python_counter(f"{name}_total_ns", int(elapsed_ns))
+    add_python_counter(f"{name}_count", int(count))
 
 
 def set_live_num_tokens(runner_id: int, n: int) -> None:

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 import torch
@@ -13,8 +14,37 @@ from vllm._custom_ops import (
     cots_gqa_bf16_prefill_attention,
     cots_gqa_bf16_scatter_suffix_kv,
 )
+from vllm.utils.cots_diag import COUNTERS_ENABLED as _COTS_COUNTERS_ENABLED
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 from vllm.v1.attention.backends.fa_utils import reshape_and_cache_flash
+
+
+def _timer_start() -> int:
+    return time.perf_counter_ns() if _COTS_COUNTERS_ENABLED else 0
+
+
+def _timing(name: str, start_ns: int) -> None:
+    if start_ns == 0:
+        return
+    from vllm.model_executor.offloader import cots_ops
+
+    cots_ops.add_python_timing(name, time.perf_counter_ns() - start_ns)
+
+
+def _counter(name: str, value: int = 1) -> None:
+    if not _COTS_COUNTERS_ENABLED:
+        return
+    from vllm.model_executor.offloader import cots_ops
+
+    cots_ops.add_python_counter(name, int(value))
+
+
+def _dtype_nbytes(dtype: torch.dtype) -> int:
+    return int(torch.empty((), dtype=dtype).element_size())
+
+
+def _phase_for_tokens(num_tokens: int) -> str:
+    return "decode" if int(num_tokens) <= 128 else "prefill"
 
 
 @dataclass
@@ -29,6 +59,7 @@ class CotsHeadSplitAttentionMetadata:
     cpu_key_cache: torch.Tensor
     cpu_value_cache: torch.Tensor
     cpu_block_table: torch.Tensor
+    cpu_slot_mapping: torch.Tensor
     cpu_seq_lens: torch.Tensor
     gpu_kv_heads: int
     cpu_kv_heads: int
@@ -64,16 +95,27 @@ def cots_head_split_kv_cache_update(
 ) -> None:
     """Store CPU-owned trailing GQA groups in the CPU head-split cache."""
 
-    num_tokens = int(slot_mapping.shape[0])
+    total_start = _timer_start()
+    del slot_mapping
+    num_tokens = int(metadata.num_actual_tokens)
     if num_tokens <= 0:
         return
+    prepare_start = _timer_start()
+    used_routed_kv = (
+        metadata.routed_key_cpu is not None and metadata.routed_value_cpu is not None
+    )
     if metadata.routed_key_cpu is not None and metadata.routed_value_cpu is not None:
         key_cpu = metadata.routed_key_cpu[:num_tokens].contiguous()
         value_cpu = metadata.routed_value_cpu[:num_tokens].contiguous()
     else:
         key_cpu = _copy_cpu_head_slice(key[:num_tokens], metadata).contiguous()
         value_cpu = _copy_cpu_head_slice(value[:num_tokens], metadata).contiguous()
-    slot_cpu = slot_mapping[:num_tokens].detach().to(device="cpu", dtype=torch.long)
+    slot_cpu = metadata.cpu_slot_mapping[:num_tokens]
+    if slot_cpu.device.type != "cpu":
+        raise RuntimeError(
+            "COTS head-split CPU KV update requires CPU slot mapping, "
+            f"got {slot_cpu.device}"
+        )
     valid = slot_cpu >= 0
     if not bool(valid.any().item()):
         return
@@ -81,10 +123,12 @@ def cots_head_split_kv_cache_update(
         key_cpu = key_cpu[valid].contiguous()
         value_cpu = value_cpu[valid].contiguous()
         slot_cpu = slot_cpu[valid].contiguous()
+    _timing("head_split_kv_update_prepare", prepare_start)
 
     block_size = int(metadata.cpu_key_cache.shape[2])
     block_ids = torch.div(slot_cpu, block_size, rounding_mode="floor").contiguous()
     block_offsets = torch.remainder(slot_cpu, block_size).contiguous()
+    scatter_start = _timer_start()
     cots_gqa_bf16_scatter_suffix_kv(
         key_cpu,
         value_cpu,
@@ -93,6 +137,35 @@ def cots_head_split_kv_cache_update(
         metadata.cpu_key_cache,
         metadata.cpu_value_cache,
     )
+    _timing("head_split_kv_scatter", scatter_start)
+    if _COTS_COUNTERS_ENABLED:
+        phase = _phase_for_tokens(num_tokens)
+        element_bytes = _dtype_nbytes(key_cpu.dtype)
+        kv_bytes = (
+            int(key_cpu.shape[0])
+            * int(metadata.cpu_kv_heads)
+            * int(metadata.cpu_key_cache.shape[-1])
+            * 2
+            * element_bytes
+        )
+        _counter("head_split_kv_update_tokens", num_tokens)
+        _counter(f"head_split_kv_update_{phase}_tokens", num_tokens)
+        _counter("head_split_kv_update_layers")
+        _counter(f"head_split_kv_update_{phase}_layers")
+        _counter("head_split_kv_update_cpu_kv_heads", metadata.cpu_kv_heads)
+        _counter("head_split_kv_update_d2h_bytes", 0 if used_routed_kv else kv_bytes)
+        _counter(
+            f"head_split_kv_update_{phase}_d2h_bytes",
+            0 if used_routed_kv else kv_bytes,
+        )
+        _counter("head_split_kv_update_scatter_bytes", kv_bytes)
+        _counter(f"head_split_kv_update_{phase}_scatter_bytes", kv_bytes)
+        _counter("head_split_kv_update_valid_rows", int(key_cpu.shape[0]))
+        _counter(f"head_split_kv_update_{phase}_valid_rows", int(key_cpu.shape[0]))
+        _timing(f"head_split_kv_update_prepare_{phase}", prepare_start)
+        _timing(f"head_split_kv_scatter_{phase}", scatter_start)
+        _timing(f"head_split_kv_update_total_{phase}", total_start)
+    _timing("head_split_kv_update_total", total_start)
 
 
 def cots_head_split_gpu_kv_cache_update(
@@ -140,8 +213,11 @@ def cots_head_split_decode_attention(
     if num_tokens <= 0:
         return
 
+    total_start = _timer_start()
     q_start = metadata.cpu_query_start
     q_end = q_start + metadata.cpu_query_heads
+    query_start = _timer_start()
+    used_routed_query = metadata.routed_query_cpu is not None
     if metadata.routed_query_cpu is not None:
         query_cpu = metadata.routed_query_cpu[:num_tokens].contiguous()
     else:
@@ -151,6 +227,7 @@ def cots_head_split_decode_attention(
             query_cpu = query_view.detach().to(device="cpu").contiguous()
         else:
             query_cpu.copy_(query_view.detach(), non_blocking=False)
+    _timing("head_split_decode_query_prepare", query_start)
 
     output_cpu = metadata.output_cpu
     if output_cpu is None or tuple(output_cpu.shape) != tuple(query_cpu.shape):
@@ -166,6 +243,7 @@ def cots_head_split_decode_attention(
             expected_lse_shape, dtype=torch.float32, device="cpu"
         )
 
+    attention_start = _timer_start()
     cots_gqa_bf16_decode_attention(
         query_cpu,
         metadata.cpu_key_cache,
@@ -176,7 +254,9 @@ def cots_head_split_decode_attention(
         output_cpu,
         output_lse_cpu,
     )
+    _timing("head_split_decode_attention_kernel", attention_start)
 
+    output_start = _timer_start()
     if metadata.routed_qkv_sidecar is not None:
         from vllm.model_executor.offloader import get_offloader
 
@@ -196,6 +276,24 @@ def cots_head_split_decode_attention(
         else:
             output_view = output_cpu.to(device=output.device, non_blocking=True)
         output[:num_tokens, q_start:q_end, :].copy_(output_view)
+    _timing("head_split_decode_output_route", output_start)
+    if _COTS_COUNTERS_ENABLED:
+        element_bytes = _dtype_nbytes(query_cpu.dtype)
+        query_bytes = int(query_cpu.numel()) * element_bytes
+        _counter("head_split_decode_attention_tokens", num_tokens)
+        _counter("head_split_decode_attention_layers")
+        _counter(
+            "head_split_decode_attention_cpu_query_heads", metadata.cpu_query_heads
+        )
+        _counter(
+            "head_split_decode_query_d2h_bytes",
+            0 if used_routed_query else query_bytes,
+        )
+        _counter(
+            "head_split_decode_output_h2d_bytes",
+            0 if metadata.routed_qkv_sidecar is not None else query_bytes,
+        )
+    _timing("head_split_decode_attention_total", total_start)
 
 
 def cots_head_split_prefill_attention(
@@ -217,13 +315,17 @@ def cots_head_split_prefill_attention(
     if query_to_seq is None or seq_lens is None:
         raise RuntimeError("COTS head-split prefill metadata is missing")
 
+    total_start = _timer_start()
     q_start = metadata.cpu_query_start
     q_end = q_start + metadata.cpu_query_heads
+    query_start = _timer_start()
+    used_routed_query = metadata.routed_query_cpu is not None
     if metadata.routed_query_cpu is not None:
         query_cpu = metadata.routed_query_cpu[:num_tokens].contiguous()
     else:
         query_view = query[:num_tokens, q_start:q_end, :]
         query_cpu = query_view.detach().to(device="cpu").contiguous()
+    _timing("head_split_prefill_query_prepare", query_start)
     output_cpu = torch.empty_like(query_cpu, device="cpu")
     output_lse_cpu = torch.empty(
         (metadata.cpu_query_heads, num_tokens),
@@ -231,6 +333,7 @@ def cots_head_split_prefill_attention(
         device="cpu",
     )
 
+    attention_start = _timer_start()
     cots_gqa_bf16_prefill_attention(
         query_cpu,
         metadata.cpu_key_cache,
@@ -242,7 +345,9 @@ def cots_head_split_prefill_attention(
         output_cpu,
         output_lse_cpu,
     )
+    _timing("head_split_prefill_attention_kernel", attention_start)
 
+    output_start = _timer_start()
     if metadata.routed_qkv_sidecar is not None:
         from vllm.model_executor.offloader import get_offloader
 
@@ -262,3 +367,22 @@ def cots_head_split_prefill_attention(
         else:
             output_view = output_cpu.to(device=output.device, non_blocking=True)
         output[:num_tokens, q_start:q_end, :].copy_(output_view)
+    _timing("head_split_prefill_output_route", output_start)
+    if _COTS_COUNTERS_ENABLED:
+        element_bytes = _dtype_nbytes(query_cpu.dtype)
+        query_bytes = int(query_cpu.numel()) * element_bytes
+        _counter("head_split_prefill_attention_tokens", num_tokens)
+        _counter("head_split_prefill_attention_layers")
+        _counter(
+            "head_split_prefill_attention_cpu_query_heads",
+            metadata.cpu_query_heads,
+        )
+        _counter(
+            "head_split_prefill_query_d2h_bytes",
+            0 if used_routed_query else query_bytes,
+        )
+        _counter(
+            "head_split_prefill_output_h2d_bytes",
+            0 if metadata.routed_qkv_sidecar is not None else query_bytes,
+        )
+    _timing("head_split_prefill_attention_total", total_start)

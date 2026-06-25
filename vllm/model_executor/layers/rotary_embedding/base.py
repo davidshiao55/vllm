@@ -34,6 +34,9 @@ class RotaryEmbeddingBase(CustomOp):
         self.base = base
         self.is_neox_style = is_neox_style
         self.dtype = dtype
+        self._cots_head_split_cpu_cos_sin_cache_by_dtype: dict[
+            torch.dtype, torch.Tensor
+        ] = {}
         # TODO(mgoin): disabled for now due to failures
         # Flashinfer only supports head_size=64, 128, 256, 512.
         # https://github.com/flashinfer-ai/flashinfer/blob/ebfd655efe830048dba5d582aaa61d61d1cf9a87/include/flashinfer/utils.cuh#L174-L202
@@ -109,6 +112,15 @@ class RotaryEmbeddingBase(CustomOp):
         self.cos_sin_cache = cos_sin_cache
         return cos_sin_cache
 
+    def _cots_head_split_cpu_cos_sin_cache(self, dtype: torch.dtype) -> torch.Tensor:
+        cache = self._cots_head_split_cpu_cos_sin_cache_by_dtype.get(dtype)
+        if cache is None:
+            with torch.device("cpu"):
+                cache = self._compute_cos_sin_cache()
+            cache = cache.detach().to(device="cpu", dtype=dtype)
+            self._cots_head_split_cpu_cos_sin_cache_by_dtype[dtype] = cache
+        return cache
+
     def get_cos_sin(self, seqlen: int) -> tuple[torch.Tensor, torch.Tensor]:
         cos_sin = self.cos_sin_cache[:seqlen]
         cos, sin = cos_sin.chunk(2, dim=-1)
@@ -131,13 +143,17 @@ class RotaryEmbeddingBase(CustomOp):
         apply_cpu_rope = getattr(offloader, "maybe_apply_head_split_cpu_rope", None)
         if apply_cpu_rope is None:
             return
+        needs_cpu_rope = getattr(offloader, "head_split_cpu_rope_needed", None)
+        if needs_cpu_rope is not None and not needs_cpu_rope(query):
+            return
+        cpu_cos_sin_cache = self._cots_head_split_cpu_cos_sin_cache(query.dtype)
         apply_cpu_rope(
             positions=positions,
             query=query,
             key=key,
             head_size=self.head_size,
             rotary_dim=self.rotary_dim,
-            cos_sin_cache=cos_sin_cache,
+            cos_sin_cache=cpu_cos_sin_cache,
             is_neox_style=self.is_neox_style,
         )
 

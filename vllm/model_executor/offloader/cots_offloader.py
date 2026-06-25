@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
@@ -54,6 +55,7 @@ from vllm.model_executor.offloader.cots_storage import (
     CotsPrefetchBufferPool,
     WeightPrefetchStreamer,
 )
+from vllm.utils.cots_diag import COUNTERS_ENABLED as _COTS_COUNTERS_ENABLED
 from vllm.utils.platform_utils import is_pin_memory_available
 
 if TYPE_CHECKING:
@@ -61,6 +63,35 @@ if TYPE_CHECKING:
     from vllm.forward_context import BatchDescriptor
 
 logger = init_logger(__name__)
+
+
+def _cots_py_timer_start() -> int:
+    return time.perf_counter_ns() if _COTS_COUNTERS_ENABLED else 0
+
+
+def _cots_py_timing(name: str, start_ns: int) -> None:
+    if start_ns == 0:
+        return
+    from vllm.model_executor.offloader import cots_ops
+
+    cots_ops.add_python_timing(name, time.perf_counter_ns() - start_ns)
+
+
+def _cots_py_counter(name: str, value: int = 1) -> None:
+    if not _COTS_COUNTERS_ENABLED:
+        return
+    from vllm.model_executor.offloader import cots_ops
+
+    cots_ops.add_python_counter(name, int(value))
+
+
+def _dtype_nbytes(dtype: torch.dtype) -> int:
+    return int(torch.empty((), dtype=dtype).element_size())
+
+
+def _head_split_phase(num_tokens: int) -> str:
+    return "decode" if int(num_tokens) <= 128 else "prefill"
+
 
 LINEAR_OP_KIND_BY_ROLE = {
     QKV_ROLE: "qkv",
@@ -223,6 +254,7 @@ class CotsOffloader(BaseOffloader):
             | None
         ) = None
         self._head_split_qkv_work_capacity: int = 0
+        self._head_split_positions_cpu: torch.Tensor | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle: wrap_modules → (weight loading) → post_init.
@@ -1194,10 +1226,7 @@ class CotsOffloader(BaseOffloader):
 
     @property
     def head_split_activation_routing_enabled(self) -> bool:
-        return (
-            self.kv_mode == "head_split"
-            and float(getattr(self.config, "f_cpu_kv_store", 0.0)) > 0.0
-        )
+        return self.kv_mode == "head_split"
 
     @staticmethod
     def _storage_key(tensor: torch.Tensor) -> int:
@@ -1206,6 +1235,48 @@ class CotsOffloader(BaseOffloader):
     def _clear_head_split_sidecars(self) -> None:
         self._head_split_qkv_sidecars.clear()
         self._head_split_attention_outputs.clear()
+
+    def set_head_split_cpu_positions(
+        self,
+        positions_cpu: Sequence[int] | torch.Tensor | None,
+        num_tokens: int,
+    ) -> None:
+        """Publish CPU token positions for CPU-side head-split RoPE.
+
+        The worker already derives positions on CPU before filling vLLM's GPU
+        position tensor. Reusing that source avoids a per-layer GPU->CPU copy
+        in the CPU RoPE path.
+        """
+
+        if not self.head_split_activation_routing_enabled or positions_cpu is None:
+            self._head_split_positions_cpu = None
+            return
+        num_tokens = int(num_tokens)
+        if num_tokens <= 0:
+            self._head_split_positions_cpu = None
+            return
+
+        if isinstance(positions_cpu, torch.Tensor):
+            positions = positions_cpu[:num_tokens].flatten()
+            if positions.device.type != "cpu":
+                raise RuntimeError(
+                    "COTS head-split CPU positions must be published from CPU; "
+                    f"got {positions.device}"
+                )
+            if positions.dtype != torch.long:
+                positions = positions.to(dtype=torch.long)
+        else:
+            positions = torch.as_tensor(
+                positions_cpu[:num_tokens],
+                dtype=torch.long,
+                device="cpu",
+            ).flatten()
+        if int(positions.numel()) < num_tokens:
+            raise RuntimeError(
+                "COTS head-split CPU positions are shorter than the active "
+                f"forward: got={int(positions.numel())}, needed={num_tokens}"
+            )
+        self._head_split_positions_cpu = positions
 
     def _head_split_qkv_work_views(
         self,
@@ -1279,10 +1350,10 @@ class CotsOffloader(BaseOffloader):
             float(getattr(self.config, "f_cpu_kv_store", 0.0)),
             num_kv_heads=num_groups,
         )
-        if not (0 < cpu_attention_groups < num_groups):
+        if not (0 <= cpu_attention_groups < num_groups):
             raise RuntimeError(
-                "COTS head-split activation routing requires a non-empty CPU "
-                "and GPU attention partition"
+                "COTS head-split activation routing requires at least one "
+                "GPU attention group"
             )
         cpu_weight_groups = n_cpu // qkv_group
         return (
@@ -1308,6 +1379,7 @@ class CotsOffloader(BaseOffloader):
     ) -> torch.Tensor:
         """Build GPU QKV for GPU-owned groups and CPU sidecar for CPU groups."""
 
+        timer_start = _cots_py_timer_start()
         h = handle
         assert h.gpu_indices_cuda is not None
         assert h.q_size is not None and h.kv_size is not None
@@ -1419,11 +1491,13 @@ class CotsOffloader(BaseOffloader):
                 out[:, v_start : v_start + head_dim].copy_(
                     group[:, q_group + head_dim : qkv_group]
                 )
+        qkv_h2d_groups = max(0, cpu_weight_groups - cpu_attention_groups)
 
         for local_attention, global_group in enumerate(
             range(cpu_attention_start, num_groups)
         ):
             copy_group_to_cpu(global_group, local_attention)
+        qkv_d2h_groups = max(0, cpu_attention_groups - cpu_weight_groups)
 
         storage_key = self._storage_key(out)
         self._head_split_qkv_sidecars[storage_key] = CotsHeadSplitQKVSidecar(
@@ -1438,6 +1512,40 @@ class CotsOffloader(BaseOffloader):
             key=k_cpu,
             value=v_cpu,
         )
+        if _COTS_COUNTERS_ENABLED:
+            phase = _head_split_phase(num_tokens)
+            element_bytes = _dtype_nbytes(h.dtype)
+            qkv_d2h_elements = qkv_d2h_groups * qkv_group
+            _cots_py_counter("head_split_qkv_route_tokens", num_tokens)
+            _cots_py_counter(f"head_split_qkv_route_{phase}_tokens", num_tokens)
+            _cots_py_counter("head_split_qkv_route_layers")
+            _cots_py_counter(f"head_split_qkv_route_{phase}_layers")
+            _cots_py_counter(
+                "head_split_qkv_route_cpu_attention_groups",
+                cpu_attention_groups,
+            )
+            _cots_py_counter(
+                "head_split_qkv_route_cpu_weight_groups",
+                cpu_weight_groups,
+            )
+            _cots_py_counter(
+                "head_split_qkv_route_d2h_bytes",
+                num_tokens * qkv_d2h_elements * element_bytes,
+            )
+            _cots_py_counter(
+                f"head_split_qkv_route_{phase}_d2h_bytes",
+                num_tokens * qkv_d2h_elements * element_bytes,
+            )
+            _cots_py_counter(
+                "head_split_qkv_route_h2d_bytes",
+                num_tokens * qkv_h2d_groups * qkv_group * element_bytes,
+            )
+            _cots_py_counter(
+                f"head_split_qkv_route_{phase}_h2d_bytes",
+                num_tokens * qkv_h2d_groups * qkv_group * element_bytes,
+            )
+            _cots_py_timing(f"head_split_qkv_route_{phase}", timer_start)
+        _cots_py_timing("head_split_qkv_route", timer_start)
         return out
 
     def maybe_apply_head_split_cpu_rope(
@@ -1456,6 +1564,10 @@ class CotsOffloader(BaseOffloader):
         sidecar = self._head_split_qkv_sidecars.get(self._storage_key(query))
         if sidecar is None or sidecar.rope_applied:
             return
+        if sidecar.cpu_attention_groups == 0:
+            sidecar.rope_applied = True
+            return
+        timer_start = _cots_py_timer_start()
         if head_size != sidecar.head_dim:
             raise RuntimeError(
                 f"COTS head-split sidecar head_dim={sidecar.head_dim} but "
@@ -1464,8 +1576,27 @@ class CotsOffloader(BaseOffloader):
 
         from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
 
-        positions_cpu = positions.flatten().detach().to(device="cpu", dtype=torch.long)
-        cos_sin = cos_sin_cache.detach().to(device="cpu", dtype=sidecar.query.dtype)
+        if cos_sin_cache.device.type != "cpu":
+            raise RuntimeError(
+                "COTS head-split CPU RoPE requires a CPU cos/sin cache; "
+                f"got {cos_sin_cache.device}"
+            )
+        positions_cpu = self._head_split_positions_cpu
+        if positions_cpu is None:
+            if positions.device.type != "cpu":
+                raise RuntimeError(
+                    "COTS head-split CPU RoPE is missing CPU positions. "
+                    "GPU positions are not copied back in the head-split path."
+                )
+            positions_cpu = positions.flatten().detach().to(dtype=torch.long)
+        positions_cpu = positions_cpu[: sidecar.num_tokens]
+        if int(positions_cpu.numel()) < sidecar.num_tokens:
+            raise RuntimeError(
+                "COTS head-split CPU RoPE positions are shorter than the "
+                f"sidecar: got={int(positions_cpu.numel())}, "
+                f"needed={sidecar.num_tokens}"
+            )
+        cos_sin = cos_sin_cache.to(dtype=sidecar.query.dtype)
         cos_sin = cos_sin.index_select(0, positions_cpu)
         cos, sin = cos_sin.chunk(2, dim=-1)
 
@@ -1491,6 +1622,29 @@ class CotsOffloader(BaseOffloader):
         )
         k[..., :rotary_dim].copy_(k_rot)
         sidecar.rope_applied = True
+        if _COTS_COUNTERS_ENABLED:
+            phase = _head_split_phase(sidecar.num_tokens)
+            _cots_py_counter("head_split_cpu_rope_tokens", sidecar.num_tokens)
+            _cots_py_counter(
+                f"head_split_cpu_rope_{phase}_tokens",
+                sidecar.num_tokens,
+            )
+            _cots_py_counter("head_split_cpu_rope_layers")
+            _cots_py_counter(f"head_split_cpu_rope_{phase}_layers")
+            _cots_py_counter(
+                "head_split_cpu_rope_groups",
+                sidecar.cpu_attention_groups,
+            )
+            _cots_py_timing(f"head_split_cpu_rope_{phase}", timer_start)
+        _cots_py_timing("head_split_cpu_rope", timer_start)
+
+    def head_split_cpu_rope_needed(self, query: torch.Tensor) -> bool:
+        sidecar = self._head_split_qkv_sidecars.get(self._storage_key(query))
+        return bool(
+            sidecar is not None
+            and not sidecar.rope_applied
+            and sidecar.cpu_attention_groups > 0
+        )
 
     def lookup_head_split_qkv_sidecar(
         self, tensor: torch.Tensor
@@ -1510,6 +1664,8 @@ class CotsOffloader(BaseOffloader):
         cpu_weight_groups = qkv_sidecar.cpu_weight_groups
         q_heads_per_kv = qkv_sidecar.q_heads_per_kv
         cpu_attention_start = num_groups - cpu_attention_groups
+        timer_start = _cots_py_timer_start()
+        h2d_groups = max(0, cpu_attention_groups - cpu_weight_groups)
 
         # C < A mismatch: CPU attention produced groups that GPU/PREFETCH WO
         # will consume. Copy only those leading CPU-attention groups to GPU.
@@ -1540,6 +1696,81 @@ class CotsOffloader(BaseOffloader):
             )
         )
         self._head_split_qkv_sidecars.pop(qkv_sidecar.storage_key, None)
+        if _COTS_COUNTERS_ENABLED:
+            phase = _head_split_phase(num_tokens)
+            element_bytes = _dtype_nbytes(output_cpu.dtype)
+            _cots_py_counter("head_split_attention_output_route_tokens", num_tokens)
+            _cots_py_counter(
+                f"head_split_attention_output_route_{phase}_tokens",
+                num_tokens,
+            )
+            _cots_py_counter("head_split_attention_output_route_layers")
+            _cots_py_counter(f"head_split_attention_output_route_{phase}_layers")
+            _cots_py_counter(
+                "head_split_attention_output_route_h2d_bytes",
+                num_tokens
+                * h2d_groups
+                * q_heads_per_kv
+                * qkv_sidecar.head_dim
+                * element_bytes,
+            )
+            _cots_py_counter(
+                f"head_split_attention_output_route_{phase}_h2d_bytes",
+                num_tokens
+                * h2d_groups
+                * q_heads_per_kv
+                * qkv_sidecar.head_dim
+                * element_bytes,
+            )
+            _cots_py_timing(
+                f"head_split_attention_output_route_{phase}",
+                timer_start,
+            )
+        _cots_py_timing("head_split_attention_output_route", timer_start)
+
+    def register_head_split_gpu_attention_output(
+        self,
+        *,
+        output: torch.Tensor,
+        query: torch.Tensor,
+        num_tokens: int,
+    ) -> None:
+        """Register a full-GPU attention result for A=0 head-split routing.
+
+        When CPU KV is disabled, all attention heads live on GPU (A=0). The
+        head-split QKV route can still have CPU-produced weight groups (C>0),
+        so WO needs the same sidecar handoff as the CPU-attention path in
+        order to gather those groups into the native pinned input.
+        """
+
+        if not self.head_split_activation_routing_enabled:
+            return
+        qkv_sidecar = self.lookup_head_split_qkv_sidecar(query)
+        if qkv_sidecar is None:
+            return
+        if qkv_sidecar.cpu_attention_groups != 0:
+            return
+
+        empty_cpu_output = torch.empty(
+            (int(num_tokens), 0, int(qkv_sidecar.head_dim)),
+            dtype=output.dtype,
+            device="cpu",
+            pin_memory=is_pin_memory_available(),
+        )
+        storage_key = self._storage_key(output)
+        self._head_split_attention_outputs[storage_key] = (
+            CotsHeadSplitAttentionOutputSidecar(
+                storage_key=storage_key,
+                num_tokens=int(num_tokens),
+                num_groups=qkv_sidecar.num_groups,
+                cpu_attention_groups=0,
+                cpu_weight_groups=qkv_sidecar.cpu_weight_groups,
+                q_heads_per_kv=qkv_sidecar.q_heads_per_kv,
+                head_dim=qkv_sidecar.head_dim,
+                output=empty_cpu_output,
+            )
+        )
+        self._head_split_qkv_sidecars.pop(qkv_sidecar.storage_key, None)
 
     def lookup_head_split_attention_output(
         self, tensor: torch.Tensor
@@ -1560,6 +1791,7 @@ class CotsOffloader(BaseOffloader):
         sidecar = self.lookup_head_split_attention_output(x)
         if sidecar is None:
             return None
+        timer_start = _cots_py_timer_start()
         q_group = int(handle.gqa_q_group_size)
         n_cpu = int(handle.n_cpu_compute_by_bucket.get(bucket, handle.n_cpu))
         if n_cpu <= 0:
@@ -1581,6 +1813,7 @@ class CotsOffloader(BaseOffloader):
         cpu_attention_start = num_groups - cpu_attention_groups
         cpu_compute_start = num_groups - cpu_weight_groups
         q_heads_per_kv = sidecar.q_heads_per_kv
+        d2h_groups = max(0, cpu_weight_groups - cpu_attention_groups)
 
         if out is None:
             cpu_input = torch.empty(
@@ -1619,6 +1852,23 @@ class CotsOffloader(BaseOffloader):
                 ].detach()
                 dst.copy_(src, non_blocking=True)
         self._head_split_attention_outputs.pop(sidecar.storage_key, None)
+        if _COTS_COUNTERS_ENABLED:
+            phase = _head_split_phase(num_tokens)
+            element_bytes = _dtype_nbytes(x.dtype)
+            _cots_py_counter("head_split_wo_gather_tokens", num_tokens)
+            _cots_py_counter(f"head_split_wo_gather_{phase}_tokens", num_tokens)
+            _cots_py_counter("head_split_wo_gather_layers")
+            _cots_py_counter(f"head_split_wo_gather_{phase}_layers")
+            _cots_py_counter(
+                "head_split_wo_gather_d2h_bytes",
+                num_tokens * d2h_groups * q_group * element_bytes,
+            )
+            _cots_py_counter(
+                f"head_split_wo_gather_{phase}_d2h_bytes",
+                num_tokens * d2h_groups * q_group * element_bytes,
+            )
+            _cots_py_timing(f"head_split_wo_gather_{phase}", timer_start)
+        _cots_py_timing("head_split_wo_gather", timer_start)
         return cpu_input
 
     def set_live_num_tokens(self, live_num_tokens: int) -> None:
@@ -1712,6 +1962,10 @@ class CotsOffloader(BaseOffloader):
         num_tokens_unpadded = int(info.num_tokens_unpadded)
         active_bucket = self._dispatch_bucket_from_descriptor(info.batch_descriptor)
         self._clear_head_split_sidecars()
+        self.set_head_split_cpu_positions(
+            getattr(info, "positions_cpu", None),
+            num_tokens_unpadded,
+        )
         self._log_dispatch_trace(
             info,
             num_tokens_padded=num_tokens_padded,

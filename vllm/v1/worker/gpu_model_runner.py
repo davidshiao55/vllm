@@ -2550,15 +2550,39 @@ class GPUModelRunner(
 
                 nonlocal cots_head_split_common_metadata
                 if cots_head_split_common_metadata is None:
+                    cots_head_split_positions_cpu = getattr(
+                        self, "cots_hybrid_positions_cpu", None
+                    )
+                    if cots_head_split_positions_cpu is None:
+                        raise RuntimeError(
+                            "COTS head-split KV requires CPU positions for "
+                            "CPU-native metadata"
+                        )
+                    head_split_block_table = self.input_batch.block_table[0]
+                    total_cp_world_size = (
+                        head_split_block_table.pcp_world_size
+                        * head_split_block_table.dcp_world_size
+                    )
+                    total_cp_rank = (
+                        head_split_block_table.pcp_rank
+                        * head_split_block_table.dcp_world_size
+                        + head_split_block_table.dcp_rank
+                    )
                     head_split_metadata = self.cots_head_split_kv.build_metadata(
                         layer_name=layer_name,
-                        block_table=metadata.block_table,  # type: ignore[attr-defined]
+                        block_table_cpu=head_split_block_table.get_cpu_tensor(),
                         seq_lens_cpu=self.optimistic_seq_lens_cpu,
                         is_prefilling_cpu=common_attn_metadata.is_prefilling,
                         query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu,
+                        positions_cpu=cots_head_split_positions_cpu[:num_tokens],
                         max_query_len=common_attn_metadata.max_query_len,
                         num_actual_tokens=num_tokens,
                         num_reqs=num_reqs,
+                        total_cp_world_size=total_cp_world_size,
+                        total_cp_rank=total_cp_rank,
+                        cp_kv_cache_interleave_size=(
+                            head_split_block_table.cp_kv_cache_interleave_size
+                        ),
                     )
                     cots_head_split_common_metadata = head_split_metadata
                 else:
@@ -5774,6 +5798,18 @@ class GPUModelRunner(
         assert len(num_scheduled_tokens_list) == num_reqs
         num_scheduled_tokens = np.array(num_scheduled_tokens_list, dtype=np.int32)
         num_tokens_unpadded = int(num_scheduled_tokens.sum())
+        cots_config = self.vllm_config.offload_config.cots
+        cots_head_split_configured = (
+            self.vllm_config.offload_config.offload_backend == "cots"
+            and cots_config.head_split_kv_enabled
+        )
+        if self.cots_head_split_kv is not None or cots_head_split_configured:
+            self.cots_hybrid_positions_cpu = np.concatenate(
+                [
+                    np.arange(int(req_tokens), dtype=np.int64)
+                    for req_tokens in num_scheduled_tokens
+                ]
+            )
 
         num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
 
@@ -5882,6 +5918,11 @@ class GPUModelRunner(
                 cum_num_tokens = self._get_cumsum_and_arange(
                     num_scheduled_tokens, self.query_pos.np
                 )
+                if self.cots_head_split_kv is not None or cots_head_split_configured:
+                    self.cots_hybrid_positions_cpu = np.asarray(
+                        self.query_pos.np[:num_tokens_unpadded],
+                        dtype=np.int64,
+                    ).copy()
                 self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
                 self.query_start_loc.copy_to_gpu()
 

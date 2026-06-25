@@ -4,15 +4,39 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Sequence
 
+import numpy as np
 import torch
 from cots.snap import gqa_num_cpu_groups
 
+from vllm.utils.cots_diag import COUNTERS_ENABLED as _COTS_COUNTERS_ENABLED
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.cots_head_split_attention import (
     CotsHeadSplitAttentionMetadata,
 )
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+
+
+def _timer_start() -> int:
+    return time.perf_counter_ns() if _COTS_COUNTERS_ENABLED else 0
+
+
+def _timing(name: str, start_ns: int) -> None:
+    if start_ns == 0:
+        return
+    from vllm.model_executor.offloader import cots_ops
+
+    cots_ops.add_python_timing(name, time.perf_counter_ns() - start_ns)
+
+
+def _counter(name: str, value: int = 1) -> None:
+    if not _COTS_COUNTERS_ENABLED:
+        return
+    from vllm.model_executor.offloader import cots_ops
+
+    cots_ops.add_python_counter(name, int(value))
 
 
 class CotsHeadSplitKVStore:
@@ -110,6 +134,12 @@ class CotsHeadSplitKVStore:
             device="cpu",
             pin_memory=pin_memory,
         )
+        self._cpu_slot_mapping = torch.empty(
+            (self._max_num_tokens,),
+            dtype=torch.long,
+            device="cpu",
+            pin_memory=pin_memory,
+        )
         self._query_staging: dict[str, torch.Tensor] = {}
         self._output_staging: dict[str, torch.Tensor] = {}
         self._lse_staging: dict[str, torch.Tensor] = {}
@@ -145,12 +175,30 @@ class CotsHeadSplitKVStore:
                 pin_memory=pin_memory,
             )
 
-    def _copy_block_table(
+    @staticmethod
+    def _cpu_tensor(
+        value: torch.Tensor | np.ndarray | Sequence[int],
+        *,
+        dtype: torch.dtype,
+        name: str,
+    ) -> torch.Tensor:
+        if isinstance(value, torch.Tensor):
+            if value.device.type != "cpu":
+                raise RuntimeError(
+                    f"COTS head-split {name} must be CPU-native; got {value.device}"
+                )
+            return value.to(dtype=dtype) if value.dtype != dtype else value
+        return torch.as_tensor(value, dtype=dtype, device="cpu")
+
+    def _copy_cpu_block_table(
         self,
-        block_table: torch.Tensor,
+        block_table_cpu: torch.Tensor | np.ndarray,
         *,
         num_reqs: int,
     ) -> torch.Tensor:
+        block_table = self._cpu_tensor(
+            block_table_cpu, dtype=torch.int32, name="block table"
+        )
         max_blocks = int(block_table.shape[1])
         if max_blocks > self.max_blocks_per_req:
             raise RuntimeError(
@@ -166,8 +214,98 @@ class CotsHeadSplitKVStore:
                 device="cpu",
                 pin_memory=self.pin_memory,
             )
-        dst.copy_(block_table[:num_reqs].to(device="cpu", dtype=torch.int32))
+        dst.copy_(block_table[:num_reqs])
         return dst
+
+    def _build_cpu_slot_mapping(
+        self,
+        *,
+        block_table_cpu: torch.Tensor,
+        query_start_loc_cpu: torch.Tensor | np.ndarray,
+        positions_cpu: torch.Tensor | np.ndarray | Sequence[int],
+        num_reqs: int,
+        num_actual_tokens: int,
+        total_cp_world_size: int = 1,
+        total_cp_rank: int = 0,
+        cp_kv_cache_interleave_size: int = 1,
+    ) -> torch.Tensor:
+        if num_actual_tokens <= self._max_num_tokens:
+            slot_mapping = self._cpu_slot_mapping[:num_actual_tokens]
+        else:
+            slot_mapping = torch.empty(
+                (num_actual_tokens,),
+                dtype=torch.long,
+                device="cpu",
+                pin_memory=self.pin_memory,
+            )
+        slot_mapping.fill_(PAD_SLOT_ID)
+        if num_actual_tokens <= 0:
+            return slot_mapping
+
+        starts = self._cpu_tensor(
+            query_start_loc_cpu, dtype=torch.long, name="query_start_loc"
+        )[: num_reqs + 1]
+        positions = self._cpu_tensor(positions_cpu, dtype=torch.long, name="positions")[
+            :num_actual_tokens
+        ]
+        if int(positions.numel()) < num_actual_tokens:
+            raise RuntimeError(
+                "COTS head-split CPU positions are shorter than active tokens: "
+                f"got={int(positions.numel())}, needed={num_actual_tokens}"
+            )
+
+        total_cp_world_size = int(total_cp_world_size)
+        total_cp_rank = int(total_cp_rank)
+        cp_kv_cache_interleave_size = int(cp_kv_cache_interleave_size)
+        if total_cp_world_size <= 0 or cp_kv_cache_interleave_size <= 0:
+            raise RuntimeError(
+                "COTS head-split CPU slot mapping received invalid CP geometry: "
+                f"world={total_cp_world_size}, "
+                f"interleave={cp_kv_cache_interleave_size}"
+            )
+        virtual_block_size = self.block_size * total_cp_world_size
+
+        for req_idx in range(num_reqs):
+            start = int(starts[req_idx].item())
+            end = int(starts[req_idx + 1].item())
+            if end <= start:
+                continue
+            if start < 0 or end > num_actual_tokens:
+                raise RuntimeError(
+                    "COTS head-split CPU query_start_loc is outside token range: "
+                    f"req={req_idx}, start={start}, end={end}, "
+                    f"num_actual_tokens={num_actual_tokens}"
+                )
+            pos = positions[start:end]
+            block_indices = torch.div(
+                pos, virtual_block_size, rounding_mode="floor"
+            ).to(dtype=torch.long)
+            block_numbers = block_table_cpu[req_idx].index_select(0, block_indices)
+            block_numbers = block_numbers.to(dtype=torch.long)
+
+            virtual_offsets = pos - block_indices * virtual_block_size
+            is_local = (
+                torch.div(
+                    virtual_offsets,
+                    cp_kv_cache_interleave_size,
+                    rounding_mode="floor",
+                )
+                % total_cp_world_size
+            ) == total_cp_rank
+            local_offsets = torch.div(
+                virtual_offsets,
+                total_cp_world_size * cp_kv_cache_interleave_size,
+                rounding_mode="floor",
+            ) * cp_kv_cache_interleave_size + torch.remainder(
+                virtual_offsets, cp_kv_cache_interleave_size
+            )
+            slot_ids = block_numbers * self.block_size + local_offsets
+            slot_mapping[start:end] = torch.where(
+                is_local,
+                slot_ids,
+                torch.full_like(slot_ids, PAD_SLOT_ID),
+            )
+        return slot_mapping
 
     def _build_prefill_token_metadata(
         self,
@@ -194,8 +332,12 @@ class CotsHeadSplitKVStore:
                 pin_memory=self.pin_memory,
             )
 
-        starts = query_start_loc_cpu[: num_reqs + 1].to(device="cpu")
-        final_seq_lens = seq_lens_cpu[:num_reqs].to(device="cpu", dtype=torch.int32)
+        starts = self._cpu_tensor(
+            query_start_loc_cpu, dtype=torch.long, name="query_start_loc"
+        )[: num_reqs + 1]
+        final_seq_lens = self._cpu_tensor(
+            seq_lens_cpu, dtype=torch.int32, name="seq_lens"
+        )[:num_reqs]
         for req_idx in range(num_reqs):
             start = int(starts[req_idx].item())
             end = int(starts[req_idx + 1].item())
@@ -236,21 +378,27 @@ class CotsHeadSplitKVStore:
                 device="cpu",
                 pin_memory=self.pin_memory,
             )
-        dst.copy_(seq_lens_cpu[:num_reqs].to(device="cpu", dtype=torch.int32))
+        seq_lens = self._cpu_tensor(seq_lens_cpu, dtype=torch.int32, name="seq_lens")
+        dst.copy_(seq_lens[:num_reqs])
         return dst
 
     def build_metadata(
         self,
         *,
         layer_name: str,
-        block_table: torch.Tensor,
+        block_table_cpu: torch.Tensor | np.ndarray,
         seq_lens_cpu: torch.Tensor,
         is_prefilling_cpu: torch.Tensor | None,
         query_start_loc_cpu: torch.Tensor,
+        positions_cpu: torch.Tensor | np.ndarray | Sequence[int],
         max_query_len: int,
         num_actual_tokens: int,
         num_reqs: int,
+        total_cp_world_size: int = 1,
+        total_cp_rank: int = 0,
+        cp_kv_cache_interleave_size: int = 1,
     ) -> CotsHeadSplitAttentionMetadata:
+        timer_start = _timer_start()
         if layer_name not in self._key_caches:
             raise KeyError(f"Unknown COTS head-split KV layer: {layer_name}")
         if num_reqs <= 0:
@@ -260,7 +408,17 @@ class CotsHeadSplitKVStore:
         if is_decode and is_prefilling_cpu is not None:
             is_decode = not bool(is_prefilling_cpu[:num_reqs].any().item())
 
-        cpu_block_table = self._copy_block_table(block_table, num_reqs=num_reqs)
+        cpu_block_table = self._copy_cpu_block_table(block_table_cpu, num_reqs=num_reqs)
+        cpu_slot_mapping = self._build_cpu_slot_mapping(
+            block_table_cpu=cpu_block_table,
+            query_start_loc_cpu=query_start_loc_cpu,
+            positions_cpu=positions_cpu,
+            num_reqs=num_reqs,
+            num_actual_tokens=num_actual_tokens,
+            total_cp_world_size=total_cp_world_size,
+            total_cp_rank=total_cp_rank,
+            cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+        )
         cpu_seq_lens = self._copy_seq_lens(seq_lens_cpu, num_reqs=num_reqs)
 
         query_cpu = output_cpu = output_lse_cpu = None
@@ -278,10 +436,11 @@ class CotsHeadSplitKVStore:
                 num_actual_tokens=num_actual_tokens,
             )
 
-        return CotsHeadSplitAttentionMetadata(
+        metadata = CotsHeadSplitAttentionMetadata(
             cpu_key_cache=self._key_caches[layer_name],
             cpu_value_cache=self._value_caches[layer_name],
             cpu_block_table=cpu_block_table,
+            cpu_slot_mapping=cpu_slot_mapping,
             cpu_seq_lens=cpu_seq_lens,
             gpu_kv_heads=self.gpu_kv_heads,
             cpu_kv_heads=self.cpu_kv_heads,
@@ -296,6 +455,13 @@ class CotsHeadSplitKVStore:
             prefill_query_to_seq_cpu=prefill_query_to_seq,
             prefill_seq_lens_cpu=prefill_seq_lens,
         )
+        if _COTS_COUNTERS_ENABLED:
+            _counter("head_split_metadata_common_tokens", num_actual_tokens)
+            _counter("head_split_metadata_common_reqs", num_reqs)
+            _counter("head_split_metadata_common_decode_calls", 1 if is_decode else 0)
+            _counter("head_split_metadata_common_prefill_calls", 0 if is_decode else 1)
+        _timing("head_split_metadata_common", timer_start)
+        return metadata
 
     def build_metadata_from_common(
         self,
@@ -303,6 +469,7 @@ class CotsHeadSplitKVStore:
         layer_name: str,
         common_metadata: CotsHeadSplitAttentionMetadata,
     ) -> CotsHeadSplitAttentionMetadata:
+        timer_start = _timer_start()
         if layer_name not in self._key_caches:
             raise KeyError(f"Unknown COTS head-split KV layer: {layer_name}")
         num_reqs = int(common_metadata.cpu_seq_lens.shape[0])
@@ -311,10 +478,11 @@ class CotsHeadSplitKVStore:
             query_cpu = self._query_staging[layer_name][:num_reqs]
             output_cpu = self._output_staging[layer_name][:num_reqs]
             output_lse_cpu = self._lse_staging[layer_name][:, :num_reqs]
-        return CotsHeadSplitAttentionMetadata(
+        metadata = CotsHeadSplitAttentionMetadata(
             cpu_key_cache=self._key_caches[layer_name],
             cpu_value_cache=self._value_caches[layer_name],
             cpu_block_table=common_metadata.cpu_block_table,
+            cpu_slot_mapping=common_metadata.cpu_slot_mapping,
             cpu_seq_lens=common_metadata.cpu_seq_lens,
             gpu_kv_heads=self.gpu_kv_heads,
             cpu_kv_heads=self.cpu_kv_heads,
@@ -329,3 +497,8 @@ class CotsHeadSplitKVStore:
             prefill_query_to_seq_cpu=common_metadata.prefill_query_to_seq_cpu,
             prefill_seq_lens_cpu=common_metadata.prefill_seq_lens_cpu,
         )
+        if _COTS_COUNTERS_ENABLED:
+            _counter("head_split_metadata_layer_tokens", metadata.num_actual_tokens)
+            _counter("head_split_metadata_layer_layers")
+        _timing("head_split_metadata_layer", timer_start)
+        return metadata

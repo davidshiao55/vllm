@@ -51,6 +51,7 @@ class CotsRuntime:
             batch_descriptor=batch_descriptor,
             num_tokens_unpadded=int(num_tokens_unpadded),
             trace_context=trace_context,
+            positions_cpu=positions_cpu,
         )
         get_offloader().on_dispatch(dispatch_info)
         if self.hybrid_kv is not None:

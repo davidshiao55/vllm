@@ -882,6 +882,20 @@ class FlashAttentionImpl(AttentionImpl):
                 precomputed_prefix_lse=precomputed_prefix_lse,
             )
 
+        def _register_cots_head_split_gpu_attention_output() -> None:
+            from vllm.model_executor.offloader import get_offloader
+
+            register_output = getattr(
+                get_offloader(), "register_head_split_gpu_attention_output", None
+            )
+            if register_output is None:
+                return
+            register_output(
+                output=output,
+                query=query,
+                num_tokens=int(num_actual_tokens),
+            )
+
         def _apply_prefix_only_cots_hybrid_rows() -> None:
             if partial_cots_hybrid_decode is None:
                 return
@@ -1128,6 +1142,7 @@ class FlashAttentionImpl(AttentionImpl):
                     s_aux=self.sinks,
                 )
                 _apply_partial_cots_hybrid_decode()
+                _register_cots_head_split_gpu_attention_output()
                 return output
 
         # Cascade attention (rare case).
@@ -1158,6 +1173,7 @@ class FlashAttentionImpl(AttentionImpl):
             s_aux=self.sinks,
         )
         _apply_partial_cots_hybrid_decode()
+        _register_cots_head_split_gpu_attention_output()
         return output
 
     def do_kv_cache_update(

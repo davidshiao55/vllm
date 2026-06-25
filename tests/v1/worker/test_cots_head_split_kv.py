@@ -61,18 +61,21 @@ def _make_qkv_route_handle(*, cpu_weight_groups: int) -> SimpleNamespace:
     out_dim = q_size + 2 * kv_size
     cpu_compute_start = num_groups - cpu_weight_groups
     cpu_groups = range(cpu_compute_start, num_groups)
-    cpu_idx = torch.cat(
-        [
-            _canonical_group_indices(
-                group,
-                q_group=q_group,
-                head_dim=head_dim,
-                q_size=q_size,
-                kv_size=kv_size,
-            )
-            for group in cpu_groups
-        ]
-    )
+    if cpu_weight_groups > 0:
+        cpu_idx = torch.cat(
+            [
+                _canonical_group_indices(
+                    group,
+                    q_group=q_group,
+                    head_dim=head_dim,
+                    q_size=q_size,
+                    kv_size=kv_size,
+                )
+                for group in cpu_groups
+            ]
+        )
+    else:
+        cpu_idx = torch.empty(0, dtype=torch.long)
     gpu_idx = torch.tensor(
         [i for i in range(out_dim) if i not in set(cpu_idx.tolist())],
         dtype=torch.long,
@@ -152,6 +155,10 @@ def test_cots_head_split_qkv_route_assembles_cpu_plane_for_c_less_than_a() -> No
     assert torch.equal(
         sidecar.key[:, :1, :].reshape(num_tokens, head_dim),
         out_pref[:, q_group : q_group + head_dim],
+    )
+    assert torch.equal(
+        sidecar.value[:, :1, :].reshape(num_tokens, head_dim),
+        out_pref[:, q_group + head_dim : qkv_group],
     )
     assert torch.equal(
         sidecar.value[:, 1:2, :].reshape(num_tokens, head_dim),
@@ -250,6 +257,49 @@ def test_cots_head_split_qkv_route_reuses_cpu_work_buffers() -> None:
     )
 
 
+def test_cots_head_split_cpu_rope_uses_published_cpu_positions() -> None:
+    offloader = CotsOffloader(
+        CotsOffloadConfig(kv_mode="head_split", f_cpu_kv_store=0.25)
+    )
+    handle = _make_qkv_route_handle(cpu_weight_groups=1)
+    num_tokens = 1
+    qkv_group = handle.gqa_qkv_group_size
+    out_perm = torch.zeros(
+        (num_tokens, handle.gpu_indices_cuda.numel()), dtype=torch.bfloat16
+    )
+    out_cpu = torch.arange(qkv_group, dtype=torch.bfloat16).view(1, -1)
+
+    qkv_out = offloader.route_head_split_qkv_output(
+        handle=handle,
+        bucket=1,
+        num_tokens=num_tokens,
+        reference=out_perm,
+        out_perm=out_perm,
+        out_pref=None,
+        out_cpu=out_cpu,
+        pref_idx=torch.empty(0, dtype=torch.long),
+        bias=None,
+    )
+    sidecar = offloader.lookup_head_split_qkv_sidecar(qkv_out)
+    assert sidecar is not None
+    offloader.set_head_split_cpu_positions(torch.tensor([0]), num_tokens)
+    offloader.maybe_apply_head_split_cpu_rope(
+        positions=torch.empty(num_tokens, dtype=torch.long, device="meta"),
+        query=qkv_out,
+        key=qkv_out,
+        head_size=handle.head_dim,
+        rotary_dim=handle.head_dim,
+        cos_sin_cache=torch.tensor([[1.0, 0.0]], dtype=torch.bfloat16),
+        is_neox_style=True,
+    )
+
+    assert sidecar.rope_applied
+    assert torch.equal(
+        sidecar.query.reshape(num_tokens, handle.gqa_q_group_size),
+        out_cpu[:, : handle.gqa_q_group_size],
+    )
+
+
 def test_cots_head_split_wo_route_fills_preallocated_cpu_input() -> None:
     offloader = CotsOffloader(
         CotsOffloadConfig(kv_mode="head_split", f_cpu_kv_store=0.25)
@@ -301,6 +351,64 @@ def test_cots_head_split_wo_route_fills_preallocated_cpu_input() -> None:
     assert offloader.lookup_head_split_attention_output(x) is None
 
 
+def test_cots_head_split_a_zero_uses_gpu_attention_sidecar_for_wo() -> None:
+    offloader = CotsOffloader(
+        CotsOffloadConfig(kv_mode="head_split", f_cpu_kv_store=0.0)
+    )
+    assert offloader.head_split_activation_routing_enabled
+    handle = _make_qkv_route_handle(cpu_weight_groups=1)
+    num_tokens = 1
+    q_group = handle.gqa_q_group_size
+    head_dim = handle.head_dim
+    qkv_group = handle.gqa_qkv_group_size
+    q_size = handle.q_size
+    kv_size = handle.kv_size
+    out_perm = torch.zeros(
+        (num_tokens, handle.gpu_indices_cuda.numel()), dtype=torch.bfloat16
+    )
+    out_cpu = torch.arange(qkv_group, dtype=torch.bfloat16).view(1, -1)
+
+    qkv_out = offloader.route_head_split_qkv_output(
+        handle=handle,
+        bucket=1,
+        num_tokens=num_tokens,
+        reference=out_perm,
+        out_perm=out_perm,
+        out_pref=None,
+        out_cpu=out_cpu,
+        pref_idx=torch.empty(0, dtype=torch.long),
+        bias=None,
+    )
+    sidecar = offloader.lookup_head_split_qkv_sidecar(qkv_out)
+    assert sidecar is not None
+    assert sidecar.cpu_attention_groups == 0
+    assert sidecar.cpu_weight_groups == 1
+    group3 = _canonical_group_indices(
+        3, q_group=q_group, head_dim=head_dim, q_size=q_size, kv_size=kv_size
+    )
+    assert torch.equal(qkv_out[:, group3], out_cpu)
+
+    attn_out = torch.arange(4 * q_group, dtype=torch.bfloat16).view(1, 4 * q_group)
+    offloader.register_head_split_gpu_attention_output(
+        output=attn_out,
+        query=qkv_out,
+        num_tokens=num_tokens,
+    )
+    assert offloader.lookup_head_split_qkv_sidecar(qkv_out) is None
+
+    dst = torch.empty(num_tokens, q_group, dtype=torch.bfloat16)
+    routed = offloader.build_head_split_wo_cpu_input(
+        x=attn_out,
+        handle=_make_wo_route_handle(cpu_weight_groups=1),
+        bucket=1,
+        num_tokens=num_tokens,
+        out=dst,
+    )
+    assert routed is dst
+    assert torch.equal(dst, attn_out[:, 3 * q_group : 4 * q_group])
+    assert offloader.lookup_head_split_attention_output(attn_out) is None
+
+
 def test_cots_head_split_store_updates_cpu_heads_and_decodes() -> None:
     store = CotsHeadSplitKVStore(
         layer_names=["layer.0.attn"],
@@ -324,26 +432,28 @@ def test_cots_head_split_store_updates_cpu_heads_and_decodes() -> None:
 
     metadata = store.build_metadata(
         layer_name="layer.0.attn",
-        block_table=torch.tensor([[0, 1, 2, 3]], dtype=torch.int32),
-        seq_lens_cpu=torch.tensor([3], dtype=torch.int32),
+        block_table_cpu=torch.tensor([[0, 1, 2, 3]], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor([1], dtype=torch.int32),
         is_prefilling_cpu=torch.tensor([False]),
         query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.int32),
+        positions_cpu=torch.tensor([0], dtype=torch.long),
         max_query_len=1,
         num_actual_tokens=1,
         num_reqs=1,
     )
+    assert metadata.cpu_slot_mapping.tolist() == [0]
 
     key = torch.randn(3, 4, 128, dtype=torch.bfloat16)
     value = torch.randn(3, 4, 128, dtype=torch.bfloat16)
     cots_head_split_kv_cache_update(
         key,
         value,
-        torch.tensor([0, 1, 2], dtype=torch.long),
+        torch.empty(3, dtype=torch.long, device="meta"),
         metadata,
     )
 
-    assert torch.equal(metadata.cpu_key_cache[0, 0, 2], key[2, 3])
-    assert torch.equal(metadata.cpu_value_cache[0, 0, 2], value[2, 3])
+    assert torch.equal(metadata.cpu_key_cache[0, 0, 0], key[0, 3])
+    assert torch.equal(metadata.cpu_value_cache[0, 0, 0], value[0, 3])
 
     query = torch.randn(1, 28, 128, dtype=torch.bfloat16)
     output = torch.empty_like(query)
@@ -377,10 +487,11 @@ def test_cots_head_split_prefill_metadata_updates_cache_but_skips_cpu_decode() -
 
     metadata = store.build_metadata(
         layer_name="layer.0.attn",
-        block_table=torch.tensor([[0, 1, 2, 3]], dtype=torch.int32),
+        block_table_cpu=torch.tensor([[0, 1, 2, 3]], dtype=torch.int32),
         seq_lens_cpu=torch.tensor([4], dtype=torch.int32),
         is_prefilling_cpu=torch.tensor([True]),
         query_start_loc_cpu=torch.tensor([0, 4], dtype=torch.int32),
+        positions_cpu=torch.tensor([0, 1, 2, 3], dtype=torch.long),
         max_query_len=4,
         num_actual_tokens=4,
         num_reqs=1,
@@ -389,6 +500,7 @@ def test_cots_head_split_prefill_metadata_updates_cache_but_skips_cpu_decode() -
     assert metadata.is_decode is False
     assert metadata.prefill_query_to_seq_cpu is not None
     assert metadata.prefill_seq_lens_cpu is not None
+    assert metadata.cpu_slot_mapping.tolist() == [0, 1, 2, 3]
     assert metadata.prefill_query_to_seq_cpu.tolist() == [0, 0, 0, 0]
     assert metadata.prefill_seq_lens_cpu.tolist() == [1, 2, 3, 4]
     key = torch.randn(4, 4, 128, dtype=torch.bfloat16)
@@ -396,7 +508,7 @@ def test_cots_head_split_prefill_metadata_updates_cache_but_skips_cpu_decode() -
     cots_head_split_kv_cache_update(
         key,
         value,
-        torch.tensor([0, 1, 2, 3], dtype=torch.long),
+        torch.empty(4, dtype=torch.long, device="meta"),
         metadata,
     )
     assert torch.equal(metadata.cpu_key_cache[0, 0, 3], key[3, 3])
