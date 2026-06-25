@@ -476,6 +476,7 @@ class EngineArgs:
     cots_weight_modules: set[str] = get_field(CotsOffloadConfig, "weight_modules")
     cots_kv_split_blocks: int = CotsOffloadConfig.kv_split_blocks
     cots_kv_cpu_pool_bytes: int = CotsOffloadConfig.kv_cpu_pool_bytes
+    cots_f_cpu_kv_store: float = CotsOffloadConfig.f_cpu_kv_store
     cots_kv_mode: Literal["prefix_suffix", "head_split"] = CotsOffloadConfig.kv_mode
     cots_kv_h2d_mode: Literal["uva"] = CotsOffloadConfig.kv_h2d_mode
     cots_cpu_num_threads: int = CotsOffloadConfig.cpu_num_threads
@@ -1100,6 +1101,9 @@ class EngineArgs:
         )
         offload_group.add_argument(
             "--cots-kv-cpu-pool-bytes", **cots_kwargs["kv_cpu_pool_bytes"]
+        )
+        offload_group.add_argument(
+            "--cots-f-cpu-kv-store", **cots_kwargs["f_cpu_kv_store"]
         )
         offload_group.add_argument("--cots-kv-mode", **cots_kwargs["kv_mode"])
         offload_group.add_argument("--cots-kv-h2d-mode", **cots_kwargs["kv_h2d_mode"])
@@ -2031,6 +2035,7 @@ class EngineArgs:
             weight_modules=self.cots_weight_modules,
             kv_split_blocks=self.cots_kv_split_blocks,
             kv_cpu_pool_bytes=self.cots_kv_cpu_pool_bytes,
+            f_cpu_kv_store=self.cots_f_cpu_kv_store,
             kv_mode=self.cots_kv_mode,
             kv_h2d_mode=self.cots_kv_h2d_mode,
             cpu_num_threads=self.cots_cpu_num_threads,

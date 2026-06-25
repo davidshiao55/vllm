@@ -114,6 +114,33 @@ class RotaryEmbeddingBase(CustomOp):
         cos, sin = cos_sin.chunk(2, dim=-1)
         return cos, sin
 
+    def _maybe_apply_cots_head_split_cpu_rope(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor | None,
+        cos_sin_cache: torch.Tensor,
+    ) -> None:
+        if key is None:
+            return
+        try:
+            from vllm.model_executor.offloader import get_offloader
+        except ImportError:
+            return
+        offloader = get_offloader()
+        apply_cpu_rope = getattr(offloader, "maybe_apply_head_split_cpu_rope", None)
+        if apply_cpu_rope is None:
+            return
+        apply_cpu_rope(
+            positions=positions,
+            query=query,
+            key=key,
+            head_size=self.head_size,
+            rotary_dim=self.rotary_dim,
+            cos_sin_cache=cos_sin_cache,
+            is_neox_style=self.is_neox_style,
+        )
+
 
 class RotaryEmbedding(RotaryEmbeddingBase):
     def __init__(
@@ -187,7 +214,7 @@ class RotaryEmbedding(RotaryEmbeddingBase):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """A PyTorch-native implementation of forward()."""
         cos_sin_cache = self._match_cos_sin_cache_dtype(query)
-        return self.forward_static(
+        query, key = self.forward_static(
             positions,
             query,
             key,
@@ -196,6 +223,8 @@ class RotaryEmbedding(RotaryEmbeddingBase):
             cos_sin_cache,
             self.is_neox_style,
         )
+        self._maybe_apply_cots_head_split_cpu_rope(positions, query, key, cos_sin_cache)
+        return query, key
 
     def forward_cuda(
         self,
@@ -211,6 +240,9 @@ class RotaryEmbedding(RotaryEmbeddingBase):
                 self.head_size,
                 self.cos_sin_cache,
                 self.is_neox_style,
+            )
+            self._maybe_apply_cots_head_split_cpu_rope(
+                positions, query, key, self.cos_sin_cache
             )
             return query, key
 
@@ -228,6 +260,7 @@ class RotaryEmbedding(RotaryEmbeddingBase):
             cos_sin_cache,
             self.is_neox_style,
         )
+        self._maybe_apply_cots_head_split_cpu_rope(positions, query, key, cos_sin_cache)
         return query, key
 
     def forward_hip(
@@ -245,6 +278,9 @@ class RotaryEmbedding(RotaryEmbeddingBase):
                 self.head_size,
                 cos_sin_cache,
                 self.is_neox_style,
+            )
+            self._maybe_apply_cots_head_split_cpu_rope(
+                positions, query, key, cos_sin_cache
             )
             return query, key
         return self.forward_cuda(positions, query, key)
@@ -272,6 +308,7 @@ class RotaryEmbedding(RotaryEmbeddingBase):
                 cos_sin_cache,
                 self.is_neox_style,
             )
+        self._maybe_apply_cots_head_split_cpu_rope(positions, query, key, cos_sin_cache)
         return query, key
 
     def forward_cpu(
@@ -294,6 +331,7 @@ class RotaryEmbedding(RotaryEmbeddingBase):
             cos_sin_cache,
             self.is_neox_style,
         )
+        self._maybe_apply_cots_head_split_cpu_rope(positions, query, key, cos_sin_cache)
         return query, key
 
     def extra_repr(self) -> str:

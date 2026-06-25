@@ -183,6 +183,7 @@ from vllm.v1.utils import (
     record_function_or_nullcontext,
 )
 from vllm.v1.worker import mamba_utils
+from vllm.v1.worker.cots_head_split_kv import CotsHeadSplitKVStore
 from vllm.v1.worker.cots_hybrid_kv import CotsHybridKVStore
 from vllm.v1.worker.cots_runtime import CotsRuntime
 from vllm.v1.worker.cp_utils import (
@@ -501,6 +502,7 @@ class GPUModelRunner(
         self.kv_caches: list[torch.Tensor] = []
         self.cots_runtime = CotsRuntime()
         self.cots_hybrid_kv: CotsHybridKVStore | None = None
+        self.cots_head_split_kv: CotsHeadSplitKVStore | None = None
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -2426,6 +2428,7 @@ class GPUModelRunner(
                     cots_attn_stats.get(suffix_bucket, 0.0) + 1.0
                 )
             cots_hybrid_common_metadata = None
+            cots_head_split_common_metadata = None
 
             def _with_cots_hybrid_decode_metadata(
                 metadata: AttentionMetadata,
@@ -2521,10 +2524,63 @@ class GPUModelRunner(
                 )
                 return layer_metadata
 
+            def _with_cots_head_split_metadata(
+                metadata: AttentionMetadata,
+                layer_name: str,
+            ) -> AttentionMetadata:
+                if self.cots_head_split_kv is None:
+                    return metadata
+                if self.cots_hybrid_kv is not None:
+                    raise ValueError(
+                        "COTS hybrid KV and COTS head-split KV cannot both be active"
+                    )
+                if ubid is not None:
+                    raise ValueError(
+                        "COTS head-split KV does not support ubatched attention"
+                    )
+                if for_cudagraph_capture:
+                    raise ValueError(
+                        "COTS head-split KV currently requires eager attention"
+                    )
+                if not hasattr(metadata, "cots_head_split"):
+                    raise ValueError(
+                        "COTS head-split KV currently requires FlashAttention "
+                        f"metadata, got {type(metadata).__name__}"
+                    )
+
+                nonlocal cots_head_split_common_metadata
+                if cots_head_split_common_metadata is None:
+                    head_split_metadata = self.cots_head_split_kv.build_metadata(
+                        layer_name=layer_name,
+                        block_table=metadata.block_table,  # type: ignore[attr-defined]
+                        seq_lens_cpu=self.optimistic_seq_lens_cpu,
+                        is_prefilling_cpu=common_attn_metadata.is_prefilling,
+                        query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu,
+                        max_query_len=common_attn_metadata.max_query_len,
+                        num_actual_tokens=num_tokens,
+                        num_reqs=num_reqs,
+                    )
+                    cots_head_split_common_metadata = head_split_metadata
+                else:
+                    head_split_metadata = (
+                        self.cots_head_split_kv.build_metadata_from_common(
+                            layer_name=layer_name,
+                            common_metadata=cots_head_split_common_metadata,
+                        )
+                    )
+
+                layer_metadata = copy(metadata)
+                layer_metadata.cots_head_split = head_split_metadata
+                return layer_metadata
+
             for layer_name in attn_group.layer_names:
-                attn_metadata_dict[layer_name] = _with_cots_hybrid_decode_metadata(
+                layer_metadata = _with_cots_hybrid_decode_metadata(
                     attn_metadata_i, layer_name
                 )
+                layer_metadata = _with_cots_head_split_metadata(
+                    layer_metadata, layer_name
+                )
+                attn_metadata_dict[layer_name] = layer_metadata
 
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
@@ -7284,6 +7340,116 @@ class GPUModelRunner(
             cots_config.kv_cpu_pool_bytes,
         )
 
+    def _maybe_initialize_cots_head_split_kv(
+        self,
+        kv_cache_config: KVCacheConfig,
+        kv_caches: dict[str, torch.Tensor],
+        kernel_block_sizes: list[int],
+    ) -> None:
+        self.cots_head_split_kv = None
+        cots_config = self.offload_config.cots
+        if (
+            self.offload_config.offload_backend != "cots"
+            or not cots_config.head_split_kv_enabled
+        ):
+            return
+        if len(kernel_block_sizes) != 1:
+            raise ValueError(
+                "COTS head-split KV supports exactly one decoder KV cache group"
+            )
+        if not self.model_config.enforce_eager:
+            raise ValueError("COTS head-split KV currently requires enforce_eager=True")
+
+        layer_names: list[str] = []
+        attention_spec: AttentionSpec | None = None
+        for kv_cache_group in kv_cache_config.kv_cache_groups:
+            kv_cache_spec = kv_cache_group.kv_cache_spec
+            if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+                layer_specs = kv_cache_spec.kv_cache_specs
+            else:
+                layer_specs = {
+                    layer_name: kv_cache_spec
+                    for layer_name in kv_cache_group.layer_names
+                }
+
+            for layer_name, layer_spec in layer_specs.items():
+                if layer_name in self.runner_only_attn_layers:
+                    continue
+                if isinstance(layer_spec, EncoderOnlyAttentionSpec):
+                    continue
+                if not isinstance(layer_spec, FullAttentionSpec):
+                    raise ValueError(
+                        "COTS head-split KV supports only decoder full attention; "
+                        f"got {type(layer_spec).__name__} for {layer_name}"
+                    )
+                if (
+                    layer_spec.sliding_window is not None
+                    or layer_spec.attention_chunk_size is not None
+                ):
+                    raise ValueError(
+                        "COTS head-split KV does not support sliding-window or "
+                        "chunked-local attention"
+                    )
+                if layer_spec.head_size_v != layer_spec.head_size:
+                    raise ValueError(
+                        "COTS head-split KV requires V head size to match K/Q head size"
+                    )
+                if attention_spec is None:
+                    attention_spec = layer_spec
+                elif layer_spec != attention_spec:
+                    raise ValueError(
+                        "COTS head-split KV requires uniform attention KV specs"
+                    )
+                if layer_name in kv_caches:
+                    layer_names.append(layer_name)
+
+        if attention_spec is None or not layer_names:
+            raise ValueError(
+                "COTS head-split KV was enabled but no attention KV layers exist"
+            )
+
+        first_cache = kv_caches[layer_names[0]]
+        if first_cache.dim() != 5:
+            raise ValueError(
+                "COTS head-split KV expected FlashAttention KV cache shape "
+                "[2, blocks, block_size, kv_heads, head_dim], got "
+                f"{tuple(first_cache.shape)}"
+            )
+        num_blocks = int(first_cache.shape[1])
+        full_num_kv_heads = self.model_config.get_num_kv_heads(self.parallel_config)
+
+        self.cots_head_split_kv = CotsHeadSplitKVStore(
+            layer_names=layer_names,
+            num_blocks=num_blocks,
+            block_size=kernel_block_sizes[0],
+            num_kv_heads=full_num_kv_heads,
+            num_query_heads=self.num_query_heads,
+            head_size=attention_spec.head_size,
+            dtype=attention_spec.dtype,
+            f_cpu_kv_store=cots_config.f_cpu_kv_store,
+            max_num_reqs=self.max_num_reqs,
+            max_num_tokens=self.max_num_tokens,
+            max_model_len=self.max_model_len,
+            pin_memory=self.pin_memory,
+        )
+        if attention_spec.num_kv_heads != self.cots_head_split_kv.gpu_kv_heads:
+            raise ValueError(
+                "COTS head-split KV GPU cache spec mismatch: "
+                f"spec_kv_heads={attention_spec.num_kv_heads}, "
+                f"expected_gpu_kv_heads={self.cots_head_split_kv.gpu_kv_heads}"
+            )
+        logger.info(
+            "Initialized COTS head-split CPU KV store: "
+            "f_cpu_kv_store=%.4f, gpu_kv_heads=%d, cpu_kv_heads=%d, "
+            "block_size=%d, blocks=%d, layers=%d",
+            cots_config.f_cpu_kv_store,
+            self.cots_head_split_kv.gpu_kv_heads,
+            self.cots_head_split_kv.cpu_kv_heads,
+            self.cots_head_split_kv.block_size,
+            self.cots_head_split_kv.num_blocks,
+            len(layer_names),
+        )
+
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(
         self, kv_cache_config: KVCacheConfig
     ) -> None:
@@ -7344,6 +7510,9 @@ class GPUModelRunner(
             kv_cache_config, kernel_block_sizes
         )
         self._maybe_initialize_cots_hybrid_kv(
+            kv_cache_config, kv_caches, kernel_block_sizes
+        )
+        self._maybe_initialize_cots_head_split_kv(
             kv_cache_config, kv_caches, kernel_block_sizes
         )
 

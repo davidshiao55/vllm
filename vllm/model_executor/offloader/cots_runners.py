@@ -301,6 +301,32 @@ class PythonCotsWeightRunner:
         self._pending_y_pinned = y_pinned
         self._future = _get_executor().submit(cb, event, x_pinned, y_pinned)
 
+    def submit_preloaded_pinned(
+        self,
+        x_pinned: torch.Tensor,
+        y_pinned: torch.Tensor,
+        op_descriptor: tuple[int, int, str],
+    ) -> None:
+        """Submit CPU work after the caller has filled ``x_pinned``.
+
+        Used by the experimental head-split WO route, where the CPU input is
+        assembled from mixed CPU/GPU attention outputs instead of being a
+        simple slice copied from one GPU tensor.
+        """
+        layer_idx, bucket, op_kind = op_descriptor
+        assert isinstance(bucket, int), (
+            "PythonCotsWeightRunner.submit_preloaded_pinned: op_descriptor[1] "
+            "must be a resolved int bucket."
+        )
+        event = torch.cuda.Event()
+        event.record()
+        if self._dry_run:
+            cb: PyCotsWeightCallback = _cpu_dryrun_noop
+        else:
+            cb = self._callbacks[(layer_idx, bucket, op_kind)]
+        self._pending_y_pinned = y_pinned
+        self._future = _get_executor().submit(cb, event, x_pinned, y_pinned)
+
     def wait_and_uva(
         self,
         y_gpu: torch.Tensor,
@@ -331,6 +357,29 @@ class PythonCotsWeightRunner:
             self._future = None
             self._pending_y_pinned = None
         uva_copy_into_gpu(y_pinned, y_gpu)
+
+    def wait_cpu_output(
+        self,
+        op_descriptor: tuple[int, int, str],
+    ) -> torch.Tensor:
+        """Drain the worker and return the pinned CPU output view.
+
+        This eager-only path is used by the experimental head-split KV router
+        when the next consumer is CPU RoPE/attention rather than the canonical
+        GPU QKV tensor.
+        """
+        del op_descriptor
+        assert self._future is not None, "submit_with_d2h() not called"
+        assert self._pending_y_pinned is not None, (
+            "submit_with_d2h() did not stash y_pinned"
+        )
+        y_pinned = self._pending_y_pinned
+        try:
+            self._future.result()  # re-raises worker exceptions
+        finally:
+            self._future = None
+            self._pending_y_pinned = None
+        return y_pinned
 
     def close(self) -> None:
         """Drain any pending task. Idempotent; safe to call from teardown."""
@@ -520,6 +569,27 @@ class NativeCotsWeightRunner:
             cots_ops.op_kind_code(op_kind),
         )
 
+    def submit_preloaded_pinned(
+        self,
+        layer_idx: int,
+        op_kind: str,
+        tensor_rows: int,
+    ) -> None:
+        """Submit native CPU GEMM using the slab's already-filled input.
+
+        The routed head-split WO path materializes the compact CPU input into
+        the native slab's pinned x buffer itself. This entry enqueues the same
+        worker GEMM as ``submit_with_d2h`` but skips the native D2H copy.
+        """
+        from vllm.model_executor.offloader import cots_ops
+
+        cots_ops.submit_preloaded_pinned_gemm(
+            self._runner_id,
+            int(layer_idx),
+            cots_ops.op_kind_code(op_kind),
+            int(tensor_rows),
+        )
+
     def wait_and_uva(
         self,
         y_gpu: torch.Tensor,
@@ -553,6 +623,27 @@ class NativeCotsWeightRunner:
             self._runner_id,
             int(layer_idx),
             cots_ops.op_kind_code(op_kind),
+        )
+
+    def wait_cpu_output(
+        self,
+        layer_idx: int,
+        op_kind: str,
+        tensor_rows: int,
+    ) -> torch.Tensor:
+        """Synchronize the native slab and return its pinned CPU output view.
+
+        This is intentionally eager-only. It exposes the same slab output that
+        `cots_sync_then_uva` normally copies back to GPU, but the caller keeps it
+        on CPU for the experimental head-split attention data plane.
+        """
+        from vllm.model_executor.offloader import cots_ops
+
+        return cots_ops.sync_and_get_pinned_output(
+            self._runner_id,
+            int(layer_idx),
+            cots_ops.op_kind_code(op_kind),
+            int(tensor_rows),
         )
 
     def __getstate__(self) -> dict:

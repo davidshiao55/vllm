@@ -7,12 +7,13 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Callable, Generator, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from cots.snap import gqa_num_cpu_groups
 
 # Register prefetch custom ops; COTS reuses wait_prefetch/start_prefetch.
 import vllm.model_executor.offloader.prefetch_ops  # noqa: F401
@@ -66,6 +67,37 @@ LINEAR_OP_KIND_BY_ROLE = {
     WO_ROLE: "wo",
     WO_INPUT_ROLE: "wo",
 }
+
+
+@dataclass
+class CotsHeadSplitQKVSidecar:
+    """CPU-resident routed Q/K/V for one layer's head-split attention call."""
+
+    storage_key: int
+    num_tokens: int
+    num_groups: int
+    cpu_attention_groups: int
+    cpu_weight_groups: int
+    q_heads_per_kv: int
+    head_dim: int
+    query: torch.Tensor
+    key: torch.Tensor
+    value: torch.Tensor
+    rope_applied: bool = False
+
+
+@dataclass
+class CotsHeadSplitAttentionOutputSidecar:
+    """CPU-resident attention output for CPU-owned GQA groups."""
+
+    storage_key: int
+    num_tokens: int
+    num_groups: int
+    cpu_attention_groups: int
+    cpu_weight_groups: int
+    q_heads_per_kv: int
+    head_dim: int
+    output: torch.Tensor
 
 
 class CotsOffloader(BaseOffloader):
@@ -174,6 +206,23 @@ class CotsOffloader(BaseOffloader):
         # (phase1a_findings.md §1.5).
         self._dummy_gpu_anchor_a: torch.Tensor | None = None
         self._dummy_gpu_anchor_b: torch.Tensor | None = None
+        self._head_split_qkv_sidecars: dict[int, CotsHeadSplitQKVSidecar] = {}
+        self._head_split_attention_outputs: dict[
+            int, CotsHeadSplitAttentionOutputSidecar
+        ] = {}
+        self._head_split_q_work: torch.Tensor | None = None
+        self._head_split_k_work: torch.Tensor | None = None
+        self._head_split_v_work: torch.Tensor | None = None
+        self._head_split_qkv_work_signature: (
+            tuple[
+                int,
+                int,
+                int,
+                torch.dtype,
+            ]
+            | None
+        ) = None
+        self._head_split_qkv_work_capacity: int = 0
 
     # ------------------------------------------------------------------
     # Lifecycle: wrap_modules → (weight loading) → post_init.
@@ -1143,6 +1192,435 @@ class CotsOffloader(BaseOffloader):
             )
         return self._dispatch_bucket_for(x_rows)
 
+    @property
+    def head_split_activation_routing_enabled(self) -> bool:
+        return (
+            self.kv_mode == "head_split"
+            and float(getattr(self.config, "f_cpu_kv_store", 0.0)) > 0.0
+        )
+
+    @staticmethod
+    def _storage_key(tensor: torch.Tensor) -> int:
+        return int(tensor.untyped_storage().data_ptr())
+
+    def _clear_head_split_sidecars(self) -> None:
+        self._head_split_qkv_sidecars.clear()
+        self._head_split_attention_outputs.clear()
+
+    def _head_split_qkv_work_views(
+        self,
+        *,
+        num_tokens: int,
+        cpu_attention_groups: int,
+        q_heads_per_kv: int,
+        head_dim: int,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return reusable pinned CPU Q/K/V work views for head-split attention."""
+
+        signature = (cpu_attention_groups, q_heads_per_kv, head_dim, dtype)
+        capacity = max(int(num_tokens), int(self._max_num_tokens), 1)
+        if (
+            self._head_split_q_work is None
+            or self._head_split_k_work is None
+            or self._head_split_v_work is None
+            or self._head_split_qkv_work_signature != signature
+            or self._head_split_qkv_work_capacity < capacity
+        ):
+            self._head_split_qkv_work_signature = signature
+            self._head_split_qkv_work_capacity = capacity
+            self._head_split_q_work = torch.empty(
+                (capacity, cpu_attention_groups * q_heads_per_kv, head_dim),
+                dtype=dtype,
+                device="cpu",
+                pin_memory=is_pin_memory_available(),
+            )
+            self._head_split_k_work = torch.empty(
+                (capacity, cpu_attention_groups, head_dim),
+                dtype=dtype,
+                device="cpu",
+                pin_memory=is_pin_memory_available(),
+            )
+            self._head_split_v_work = torch.empty_like(self._head_split_k_work)
+
+        assert self._head_split_q_work is not None
+        assert self._head_split_k_work is not None
+        assert self._head_split_v_work is not None
+        return (
+            self._head_split_q_work[:num_tokens],
+            self._head_split_k_work[:num_tokens],
+            self._head_split_v_work[:num_tokens],
+        )
+
+    def _qkv_group_route(
+        self,
+        h: CotsLinearHandle,
+        bucket: int,
+    ) -> tuple[int, int, int, int, int]:
+        if (
+            h.role != QKV_ROLE
+            or h.qkv_cpu_layout != "gqa_group"
+            or h.num_kv_heads is None
+            or h.head_dim is None
+        ):
+            raise RuntimeError(
+                "COTS head-split activation routing requires GQA-group QKV "
+                f"handle, got {h.qualified_name}"
+            )
+        n_cpu = int(h.n_cpu_compute_by_bucket.get(bucket, h.n_cpu))
+        qkv_group = int(h.gqa_qkv_group_size)
+        if n_cpu % qkv_group != 0:
+            raise RuntimeError(
+                f"COTS head-split QKV CPU rows are not group-aligned: "
+                f"n_cpu={n_cpu}, group={qkv_group}"
+            )
+        num_groups = int(h.num_kv_heads)
+        cpu_attention_groups = gqa_num_cpu_groups(
+            float(getattr(self.config, "f_cpu_kv_store", 0.0)),
+            num_kv_heads=num_groups,
+        )
+        if not (0 < cpu_attention_groups < num_groups):
+            raise RuntimeError(
+                "COTS head-split activation routing requires a non-empty CPU "
+                "and GPU attention partition"
+            )
+        cpu_weight_groups = n_cpu // qkv_group
+        return (
+            num_groups,
+            cpu_attention_groups,
+            cpu_weight_groups,
+            int(h.gqa_q_group_size),
+            int(h.head_dim),
+        )
+
+    def route_head_split_qkv_output(
+        self,
+        *,
+        handle: CotsLinearHandle,
+        bucket: int,
+        num_tokens: int,
+        reference: torch.Tensor,
+        out_perm: torch.Tensor | None,
+        out_pref: torch.Tensor | None,
+        out_cpu: torch.Tensor | None,
+        pref_idx: torch.Tensor,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Build GPU QKV for GPU-owned groups and CPU sidecar for CPU groups."""
+
+        h = handle
+        assert h.gpu_indices_cuda is not None
+        assert h.q_size is not None and h.kv_size is not None
+        (
+            num_groups,
+            cpu_attention_groups,
+            cpu_weight_groups,
+            q_group,
+            head_dim,
+        ) = self._qkv_group_route(h, bucket)
+        q_heads_per_kv = q_group // head_dim
+        qkv_group = q_group + 2 * head_dim
+        cpu_attention_start = num_groups - cpu_attention_groups
+        cpu_compute_start = num_groups - cpu_weight_groups
+
+        out = torch.empty(
+            (num_tokens, h.out_dim), dtype=reference.dtype, device=reference.device
+        )
+        if out_perm is not None:
+            out.index_copy_(1, h.gpu_indices_cuda, out_perm)
+        if out_pref is not None:
+            out.index_copy_(1, pref_idx, out_pref)
+        if bias is not None:
+            out = out + bias
+
+        q_cpu, k_cpu, v_cpu = self._head_split_qkv_work_views(
+            num_tokens=num_tokens,
+            cpu_attention_groups=cpu_attention_groups,
+            q_heads_per_kv=q_heads_per_kv,
+            head_dim=head_dim,
+            dtype=h.dtype,
+        )
+
+        def cpu_group_with_bias(global_group: int) -> torch.Tensor:
+            if out_cpu is None:
+                raise RuntimeError(
+                    "CPU-produced QKV group requested without CPU output"
+                )
+            local_group = global_group - cpu_compute_start
+            group_start = local_group * qkv_group
+            group_end = (local_group + 1) * qkv_group
+            group = out_cpu[:, group_start:group_end]
+            group = group.contiguous()
+            if bias is None:
+                return group
+            q_start = global_group * q_group
+            k_start = h.q_size + global_group * head_dim
+            v_start = h.q_size + h.kv_size + global_group * head_dim
+            bias_group = torch.cat(
+                [
+                    bias[q_start : q_start + q_group],
+                    bias[k_start : k_start + head_dim],
+                    bias[v_start : v_start + head_dim],
+                ]
+            ).to(device="cpu")
+            return group + bias_group
+
+        def copy_group_to_cpu(
+            global_group: int,
+            local_attention: int,
+        ) -> None:
+            q_dst = q_cpu[
+                :,
+                local_attention * q_heads_per_kv : (local_attention + 1)
+                * q_heads_per_kv,
+                :,
+            ]
+            k_dst = k_cpu[:, local_attention : local_attention + 1, :]
+            v_dst = v_cpu[:, local_attention : local_attention + 1, :]
+            if global_group >= cpu_compute_start and cpu_weight_groups > 0:
+                group = cpu_group_with_bias(global_group)
+                q_dst.copy_(
+                    group[:, :q_group].view(num_tokens, q_heads_per_kv, head_dim)
+                )
+                k_dst.copy_(
+                    group[:, q_group : q_group + head_dim].view(num_tokens, 1, head_dim)
+                )
+                v_dst.copy_(
+                    group[:, q_group + head_dim : qkv_group].view(
+                        num_tokens, 1, head_dim
+                    )
+                )
+                return
+
+            q_start = global_group * q_group
+            k_start = h.q_size + global_group * head_dim
+            v_start = h.q_size + h.kv_size + global_group * head_dim
+            q_src = out[:, q_start : q_start + q_group].detach().to(device="cpu")
+            k_src = out[:, k_start : k_start + head_dim].detach().to(device="cpu")
+            v_src = out[:, v_start : v_start + head_dim].detach().to(device="cpu")
+            q_dst.copy_(q_src.view(num_tokens, q_heads_per_kv, head_dim))
+            k_dst.copy_(k_src.view(num_tokens, 1, head_dim))
+            v_dst.copy_(v_src.view(num_tokens, 1, head_dim))
+
+        # CPU-computed groups that belong to GPU attention are the C > A
+        # mismatch. Insert only those groups into the canonical GPU QKV tensor.
+        if cpu_weight_groups > cpu_attention_groups:
+            for global_group in range(cpu_compute_start, cpu_attention_start):
+                group = cpu_group_with_bias(global_group).to(
+                    device=reference.device, non_blocking=True
+                )
+                q_start = global_group * q_group
+                k_start = h.q_size + global_group * head_dim
+                v_start = h.q_size + h.kv_size + global_group * head_dim
+                out[:, q_start : q_start + q_group].copy_(group[:, :q_group])
+                out[:, k_start : k_start + head_dim].copy_(
+                    group[:, q_group : q_group + head_dim]
+                )
+                out[:, v_start : v_start + head_dim].copy_(
+                    group[:, q_group + head_dim : qkv_group]
+                )
+
+        for local_attention, global_group in enumerate(
+            range(cpu_attention_start, num_groups)
+        ):
+            copy_group_to_cpu(global_group, local_attention)
+
+        storage_key = self._storage_key(out)
+        self._head_split_qkv_sidecars[storage_key] = CotsHeadSplitQKVSidecar(
+            storage_key=storage_key,
+            num_tokens=num_tokens,
+            num_groups=num_groups,
+            cpu_attention_groups=cpu_attention_groups,
+            cpu_weight_groups=cpu_weight_groups,
+            q_heads_per_kv=q_heads_per_kv,
+            head_dim=head_dim,
+            query=q_cpu,
+            key=k_cpu,
+            value=v_cpu,
+        )
+        return out
+
+    def maybe_apply_head_split_cpu_rope(
+        self,
+        *,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor | None,
+        head_size: int,
+        rotary_dim: int,
+        cos_sin_cache: torch.Tensor,
+        is_neox_style: bool,
+    ) -> None:
+        if key is None or not self.head_split_activation_routing_enabled:
+            return
+        sidecar = self._head_split_qkv_sidecars.get(self._storage_key(query))
+        if sidecar is None or sidecar.rope_applied:
+            return
+        if head_size != sidecar.head_dim:
+            raise RuntimeError(
+                f"COTS head-split sidecar head_dim={sidecar.head_dim} but "
+                f"RoPE head_size={head_size}"
+            )
+
+        from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
+
+        positions_cpu = positions.flatten().detach().to(device="cpu", dtype=torch.long)
+        cos_sin = cos_sin_cache.detach().to(device="cpu", dtype=sidecar.query.dtype)
+        cos_sin = cos_sin.index_select(0, positions_cpu)
+        cos, sin = cos_sin.chunk(2, dim=-1)
+
+        q_shape = sidecar.query.shape
+        q = sidecar.query.view(q_shape[0], -1, head_size)
+        q_rot = ApplyRotaryEmb.forward_static(
+            q[..., :rotary_dim],
+            cos,
+            sin,
+            is_neox_style,
+            enable_fp32_compute=True,
+        )
+        q[..., :rotary_dim].copy_(q_rot)
+
+        k_shape = sidecar.key.shape
+        k = sidecar.key.view(k_shape[0], -1, head_size)
+        k_rot = ApplyRotaryEmb.forward_static(
+            k[..., :rotary_dim],
+            cos,
+            sin,
+            is_neox_style,
+            enable_fp32_compute=True,
+        )
+        k[..., :rotary_dim].copy_(k_rot)
+        sidecar.rope_applied = True
+
+    def lookup_head_split_qkv_sidecar(
+        self, tensor: torch.Tensor
+    ) -> CotsHeadSplitQKVSidecar | None:
+        return self._head_split_qkv_sidecars.get(self._storage_key(tensor))
+
+    def register_head_split_attention_output(
+        self,
+        *,
+        output: torch.Tensor,
+        qkv_sidecar: CotsHeadSplitQKVSidecar,
+        output_cpu: torch.Tensor,
+    ) -> None:
+        num_tokens = int(output_cpu.shape[0])
+        num_groups = qkv_sidecar.num_groups
+        cpu_attention_groups = qkv_sidecar.cpu_attention_groups
+        cpu_weight_groups = qkv_sidecar.cpu_weight_groups
+        q_heads_per_kv = qkv_sidecar.q_heads_per_kv
+        cpu_attention_start = num_groups - cpu_attention_groups
+
+        # C < A mismatch: CPU attention produced groups that GPU/PREFETCH WO
+        # will consume. Copy only those leading CPU-attention groups to GPU.
+        if cpu_weight_groups < cpu_attention_groups:
+            for local_group in range(cpu_attention_groups - cpu_weight_groups):
+                global_group = cpu_attention_start + local_group
+                q_start = global_group * q_heads_per_kv
+                q_end = q_start + q_heads_per_kv
+                src_start = local_group * q_heads_per_kv
+                src_end = src_start + q_heads_per_kv
+                output[:num_tokens, q_start:q_end, :].copy_(
+                    output_cpu[:, src_start:src_end, :].to(
+                        device=output.device, non_blocking=True
+                    )
+                )
+
+        storage_key = self._storage_key(output)
+        self._head_split_attention_outputs[storage_key] = (
+            CotsHeadSplitAttentionOutputSidecar(
+                storage_key=storage_key,
+                num_tokens=num_tokens,
+                num_groups=num_groups,
+                cpu_attention_groups=cpu_attention_groups,
+                cpu_weight_groups=cpu_weight_groups,
+                q_heads_per_kv=q_heads_per_kv,
+                head_dim=qkv_sidecar.head_dim,
+                output=output_cpu,
+            )
+        )
+        self._head_split_qkv_sidecars.pop(qkv_sidecar.storage_key, None)
+
+    def lookup_head_split_attention_output(
+        self, tensor: torch.Tensor
+    ) -> CotsHeadSplitAttentionOutputSidecar | None:
+        return self._head_split_attention_outputs.get(self._storage_key(tensor))
+
+    def build_head_split_wo_cpu_input(
+        self,
+        *,
+        x: torch.Tensor,
+        handle: CotsLinearHandle,
+        bucket: int,
+        num_tokens: int,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
+        if handle.role != WO_INPUT_ROLE:
+            return None
+        sidecar = self.lookup_head_split_attention_output(x)
+        if sidecar is None:
+            return None
+        q_group = int(handle.gqa_q_group_size)
+        n_cpu = int(handle.n_cpu_compute_by_bucket.get(bucket, handle.n_cpu))
+        if n_cpu <= 0:
+            return None
+        if n_cpu % q_group != 0:
+            raise RuntimeError(
+                f"COTS WO head-split CPU rows are not group-aligned: "
+                f"n_cpu={n_cpu}, group={q_group}"
+            )
+        cpu_weight_groups = n_cpu // q_group
+        if cpu_weight_groups != sidecar.cpu_weight_groups:
+            raise RuntimeError(
+                "COTS WQKV and WO CPU-compute group counts diverged for the "
+                "active bucket: "
+                f"qkv={sidecar.cpu_weight_groups}, wo={cpu_weight_groups}"
+            )
+        num_groups = sidecar.num_groups
+        cpu_attention_groups = sidecar.cpu_attention_groups
+        cpu_attention_start = num_groups - cpu_attention_groups
+        cpu_compute_start = num_groups - cpu_weight_groups
+        q_heads_per_kv = sidecar.q_heads_per_kv
+
+        if out is None:
+            cpu_input = torch.empty(
+                (num_tokens, n_cpu),
+                dtype=x.dtype,
+                device="cpu",
+                pin_memory=is_pin_memory_available(),
+            )
+        else:
+            if tuple(out.shape) != (num_tokens, n_cpu):
+                raise RuntimeError(
+                    "COTS routed WO pinned input has wrong shape: "
+                    f"got={tuple(out.shape)}, expected={(num_tokens, n_cpu)}"
+                )
+            if out.device.type != "cpu":
+                raise RuntimeError(
+                    "COTS routed WO input destination must be a CPU tensor, "
+                    f"got {out.device}"
+                )
+            cpu_input = out
+        for local_cpu, global_group in enumerate(range(cpu_compute_start, num_groups)):
+            dst = cpu_input[:, local_cpu * q_group : (local_cpu + 1) * q_group]
+            if global_group >= cpu_attention_start:
+                local_attention = global_group - cpu_attention_start
+                src = sidecar.output[
+                    :num_tokens,
+                    local_attention * q_heads_per_kv : (local_attention + 1)
+                    * q_heads_per_kv,
+                    :,
+                ]
+                dst.copy_(src.reshape(num_tokens, q_group))
+            else:
+                src = x[
+                    :num_tokens,
+                    global_group * q_group : (global_group + 1) * q_group,
+                ].detach()
+                dst.copy_(src, non_blocking=True)
+        self._head_split_attention_outputs.pop(sidecar.storage_key, None)
+        return cpu_input
+
     def set_live_num_tokens(self, live_num_tokens: int) -> None:
         """Push the live unpadded token count to the C++ worker.
 
@@ -1233,6 +1711,7 @@ class CotsOffloader(BaseOffloader):
         num_tokens_padded = int(info.batch_descriptor.num_tokens)
         num_tokens_unpadded = int(info.num_tokens_unpadded)
         active_bucket = self._dispatch_bucket_from_descriptor(info.batch_descriptor)
+        self._clear_head_split_sidecars()
         self._log_dispatch_trace(
             info,
             num_tokens_padded=num_tokens_padded,

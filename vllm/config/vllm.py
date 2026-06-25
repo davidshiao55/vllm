@@ -756,11 +756,11 @@ class VllmConfig:
             # Enable async scheduling unless there is an incompatible option.
             if (
                 self.offload_config.offload_backend == "cots"
-                and self.offload_config.cots.hybrid_kv_enabled
+                and self.offload_config.cots.cots_kv_enabled
             ):
                 logger.warning_once(
-                    "Async scheduling is not compatible with COTS hybrid KV "
-                    "in the Phase 2 first attempt and will be disabled.",
+                    "Async scheduling is not compatible with COTS KV offload "
+                    "in the current thesis runtime and will be disabled.",
                     scope="local",
                 )
                 self.scheduler_config.async_scheduling = False
@@ -1326,17 +1326,19 @@ class VllmConfig:
         cots_config = self.offload_config.cots
         if (
             self.offload_config.offload_backend != "cots"
-            or not cots_config.hybrid_kv_enabled
+            or not cots_config.cots_kv_enabled
         ):
             return
-        if cots_config.kv_mode != "prefix_suffix":
-            raise ValueError(
-                "COTS KV mode 'head_split' is a redesign scaffold only; "
-                "disable COTS KV or use cots_kv_mode='prefix_suffix' until "
-                "the head-split runtime is implemented."
-            )
+        is_head_split = cots_config.head_split_kv_enabled
         graph_enabled = self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
-        if graph_enabled and (
+        if is_head_split and self.model_config is not None:
+            if not self.model_config.enforce_eager:
+                raise ValueError(
+                    "COTS head-split KV currently requires "
+                    "enforce_eager=True. Disable head-split KV or pass "
+                    "--enforce-eager for the experiment path."
+                )
+        elif graph_enabled and (
             self.model_config is None or not self.model_config.enforce_eager
         ):
             logger.warning_once(
@@ -1347,17 +1349,15 @@ class VllmConfig:
             )
         if self.cache_config.kv_offloading_size is not None:
             raise ValueError(
-                "COTS hybrid KV is incompatible with native vLLM KV "
+                "COTS KV offload is incompatible with native vLLM KV "
                 "offloading. Disable kv_offloading_size or set "
-                "cots_kv_split_blocks=0 / cots_kv_cpu_pool_bytes=0 to "
-                "disable hybrid KV."
+                "cots KV fields to zero to disable COTS KV offload."
             )
         if self.kv_transfer_config is not None:
             raise ValueError(
-                "COTS hybrid KV does not support vLLM KV transfer/connectors "
-                "in the Phase 2 runtime. Disable kv_transfer_config or set "
-                "cots_kv_split_blocks=0 / cots_kv_cpu_pool_bytes=0 to "
-                "disable hybrid KV."
+                "COTS KV offload does not support vLLM KV transfer/connectors "
+                "in the current thesis runtime. Disable kv_transfer_config or "
+                "set COTS KV fields to zero to disable COTS KV offload."
             )
         parallel_config = self.parallel_config
         if (
@@ -1368,7 +1368,7 @@ class VllmConfig:
             or parallel_config.data_parallel_size != 1
         ):
             raise ValueError(
-                "COTS hybrid KV Phase 2 supports only single-GPU execution: "
+                "COTS KV offload supports only single-GPU execution: "
                 f"tp={parallel_config.tensor_parallel_size}, "
                 f"pp={parallel_config.pipeline_parallel_size}, "
                 f"pcp={parallel_config.prefill_context_parallel_size}, "
@@ -1379,28 +1379,27 @@ class VllmConfig:
         if self.model_config is not None:
             if self.model_config.is_encoder_decoder:
                 raise ValueError(
-                    "COTS hybrid KV Phase 2 supports decoder-only models. "
-                    "Disable hybrid KV for encoder-decoder models."
+                    "COTS KV offload supports decoder-only models. Disable "
+                    "COTS KV offload for encoder-decoder models."
                 )
             if self.model_config.dtype != torch.bfloat16:
                 raise ValueError(
-                    "COTS hybrid KV Phase 2 supports only BF16 model/KV "
+                    "COTS KV offload supports only BF16 model/KV "
                     f"dtype; got dtype={self.model_config.dtype}. Use "
-                    "dtype=bfloat16 or disable hybrid KV."
+                    "dtype=bfloat16 or disable COTS KV offload."
                 )
         if self.cache_config.cache_dtype not in ("auto", "bfloat16"):
             raise ValueError(
-                "COTS hybrid KV Phase 2 supports only BF16 KV cache dtype; "
+                "COTS KV offload supports only BF16 KV cache dtype; "
                 f"got cache_dtype={self.cache_config.cache_dtype}. Use "
                 "kv_cache_dtype=auto with a BF16 model, kv_cache_dtype=bfloat16, "
-                "or disable hybrid KV."
+                "or disable COTS KV offload."
             )
         if self.scheduler_config.async_scheduling:
             raise ValueError(
-                "COTS hybrid KV does not support async scheduling in the "
-                "Phase 2 first attempt. Set async_scheduling=False or set "
-                "cots_kv_split_blocks=0 / cots_kv_cpu_pool_bytes=0 to "
-                "disable hybrid KV."
+                "COTS KV offload does not support async scheduling in the "
+                "current thesis runtime. Set async_scheduling=False or set "
+                "COTS KV fields to zero to disable COTS KV offload."
             )
 
     def _apply_cots_graph_defaults(self) -> list[str] | None:

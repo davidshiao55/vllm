@@ -18,6 +18,11 @@ from vllm.v1.attention.backend import (
     MultipleOf,
     is_quantized_kv_cache,
 )
+from vllm.v1.attention.backends.cots_head_split_attention import (
+    CotsHeadSplitAttentionMetadata,
+    cots_head_split_decode_attention,
+    cots_head_split_prefill_attention,
+)
 from vllm.v1.attention.backends.cots_hybrid_attention import (
     CotsHybridDecodeMetadata,
     _cuda_event_timing_enabled,
@@ -241,6 +246,8 @@ class FlashAttentionMetadata:
 
     # COTS Phase 2: optional CPU suffix KV metadata for hybrid decode.
     cots_hybrid_decode: CotsHybridDecodeMetadata | None = None
+    # COTS KV redesign: optional TP-style CPU-owned GQA-group metadata.
+    cots_head_split: CotsHeadSplitAttentionMetadata | None = None
 
 
 def _get_sliding_window_configs(
@@ -713,6 +720,106 @@ class FlashAttentionImpl(AttentionImpl):
             )
             key_cache = key_cache.view(dtype)
             value_cache = value_cache.view(dtype)
+
+        if (
+            attn_metadata.cots_hybrid_decode is not None
+            and attn_metadata.cots_head_split is not None
+        ):
+            raise RuntimeError("COTS hybrid KV and head-split KV cannot both be active")
+
+        head_split = attn_metadata.cots_head_split
+        if head_split is not None:
+            if self.sliding_window != (-1, -1):
+                raise NotImplementedError(
+                    "COTS head-split KV does not support sliding-window attention"
+                )
+            if self.alibi_slopes is not None:
+                raise NotImplementedError(
+                    "COTS head-split KV does not support ALiBi attention"
+                )
+            if self.sinks is not None:
+                raise NotImplementedError(
+                    "COTS head-split KV does not support attention sinks"
+                )
+            if self.kv_cache_dtype.startswith("fp8"):
+                raise NotImplementedError(
+                    "COTS head-split KV supports only BF16 KV cache"
+                )
+            if self.dcp_world_size > 1:
+                raise NotImplementedError(
+                    "COTS head-split KV is currently single-GPU only"
+                )
+            if attn_metadata.use_cascade:
+                raise NotImplementedError(
+                    "COTS head-split KV does not currently support cascade attention"
+                )
+            if head_split.is_decode and attn_metadata.max_query_len != 1:
+                raise RuntimeError(
+                    "COTS head-split decode metadata was attached to non-decode "
+                    f"attention: max_query_len={attn_metadata.max_query_len}"
+                )
+            if (
+                head_split.is_decode
+                and int(head_split.cpu_seq_lens.shape[0]) != num_actual_tokens
+            ):
+                raise RuntimeError(
+                    "COTS head-split decode requires one query row per request: "
+                    f"tokens={num_actual_tokens}, "
+                    f"reqs={head_split.cpu_seq_lens.shape[0]}"
+                )
+
+            gpu_kv_heads = int(head_split.gpu_kv_heads)
+            gpu_query_heads = gpu_kv_heads * int(head_split.q_heads_per_kv)
+            if gpu_kv_heads <= 0 or gpu_query_heads <= 0:
+                raise RuntimeError(
+                    "COTS head-split KV requires a non-empty GPU head partition"
+                )
+
+            gpu_query = query[:num_actual_tokens, :gpu_query_heads, :].contiguous()
+            gpu_output = torch.empty_like(gpu_query)
+            descale_shape = (
+                int(head_split.cpu_seq_lens.shape[0]),
+                gpu_kv_heads,
+            )
+            flash_attn_varlen_func(
+                q=gpu_query,
+                k=key_cache,
+                v=value_cache,
+                out=gpu_output,
+                cu_seqlens_q=attn_metadata.query_start_loc,
+                max_seqlen_q=1 if head_split.is_decode else attn_metadata.max_query_len,
+                seqused_k=attn_metadata.seq_lens,
+                max_seqlen_k=attn_metadata.max_seq_len,
+                softmax_scale=self.scale,
+                causal=False if head_split.is_decode else attn_metadata.causal,
+                alibi_slopes=None,
+                window_size=None,
+                block_table=attn_metadata.block_table,
+                softcap=self.logits_soft_cap,
+                scheduler_metadata=None,
+                fa_version=self.vllm_flash_attn_version,
+                q_descale=layer._q_scale.expand(descale_shape),
+                k_descale=layer._k_scale.expand(descale_shape),
+                v_descale=layer._v_scale.expand(descale_shape),
+                num_splits=attn_metadata.max_num_splits,
+                s_aux=None,
+            )
+            output[:num_actual_tokens, :gpu_query_heads, :].copy_(gpu_output)
+            if head_split.is_decode:
+                cots_head_split_decode_attention(
+                    output[:num_actual_tokens],
+                    query[:num_actual_tokens],
+                    head_split,
+                    softmax_scale=self.scale,
+                )
+            else:
+                cots_head_split_prefill_attention(
+                    output[:num_actual_tokens],
+                    query[:num_actual_tokens],
+                    head_split,
+                    softmax_scale=self.scale,
+                )
+            return output
 
         partial_cots_hybrid_decode = None
         if attn_metadata.cots_hybrid_decode is not None:

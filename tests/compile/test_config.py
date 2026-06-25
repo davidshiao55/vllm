@@ -22,9 +22,11 @@ from vllm.config import (
     ParallelConfig,
     SchedulerConfig,
     VllmConfig,
+    set_current_vllm_config,
 )
 from vllm.config.compilation import CompilationMode, PassConfig
 from vllm.engine.arg_utils import EngineArgs
+from vllm.model_executor.layers.attention import Attention
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import (
     _is_torch_equal_or_newer,
@@ -381,9 +383,10 @@ def test_cots_hybrid_kv_config_is_derived_and_graph_piecewise():
         )
 
 
-def test_cots_head_split_kv_mode_is_scaffold_only():
+def test_cots_head_split_kv_mode_uses_fraction_knob():
     disabled_head_split = CotsOffloadConfig(kv_mode="head_split")
     assert not disabled_head_split.hybrid_kv_enabled
+    assert not disabled_head_split.head_split_kv_enabled
 
     VllmConfig(
         offload_config=OffloadConfig(offload_backend="cots", cots=disabled_head_split),
@@ -391,19 +394,50 @@ def test_cots_head_split_kv_mode_is_scaffold_only():
     )
 
     enabled_head_split = CotsOffloadConfig(
-        kv_split_blocks=128,
-        kv_cpu_pool_bytes=1 << 30,
+        f_cpu_kv_store=0.25,
         kv_mode="head_split",
     )
-    assert enabled_head_split.hybrid_kv_enabled
+    assert not enabled_head_split.hybrid_kv_enabled
+    assert enabled_head_split.head_split_kv_enabled
 
-    with pytest.raises(ValueError, match="head_split.*scaffold"):
-        VllmConfig(
-            offload_config=OffloadConfig(
-                offload_backend="cots", cots=enabled_head_split
-            ),
-            compilation_config=CompilationConfig(cudagraph_mode=CUDAGraphMode.NONE),
+    config = VllmConfig(
+        offload_config=OffloadConfig(offload_backend="cots", cots=enabled_head_split),
+        compilation_config=CompilationConfig(cudagraph_mode=CUDAGraphMode.NONE),
+    )
+    assert config.scheduler_config.async_scheduling is False
+
+    with pytest.raises(ValueError, match="kv_split_blocks.*prefix_suffix"):
+        CotsOffloadConfig(
+            f_cpu_kv_store=0.25,
+            kv_split_blocks=128,
+            kv_mode="head_split",
         )
+
+
+def test_cots_head_split_kv_reduces_gpu_kv_cache_spec_heads():
+    config = VllmConfig(
+        offload_config=OffloadConfig(
+            offload_backend="cots",
+            cots=CotsOffloadConfig(
+                f_cpu_kv_store=0.25,
+                kv_mode="head_split",
+            ),
+        ),
+        cache_config=CacheConfig(block_size=16),
+        compilation_config=CompilationConfig(cudagraph_mode=CUDAGraphMode.NONE),
+    )
+
+    with set_current_vllm_config(config):
+        attn = Attention(
+            num_heads=28,
+            num_kv_heads=4,
+            head_size=128,
+            scale=1.0,
+            prefix="cots_head_split_test_attn",
+        )
+
+    spec = attn.get_kv_cache_spec(config)
+    assert spec.num_kv_heads == 3
 
 
 def test_cots_weight_and_hybrid_kv_graph_policy_combines_boundaries():
