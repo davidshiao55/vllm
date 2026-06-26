@@ -9,7 +9,7 @@ import os
 import time
 from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn as nn
@@ -21,6 +21,12 @@ import vllm.model_executor.offloader.prefetch_ops  # noqa: F401
 from vllm.config.cots import (
     cots_weight_module_for_name,
     normalize_cots_weight_modules,
+)
+from vllm.config.offload import (
+    CotsDispatchTableEntry,
+    cots_dispatch_kv_group_pair,
+    cots_dispatch_weight_pair,
+    normalize_cots_dispatch_table_entry,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -52,7 +58,10 @@ from vllm.model_executor.offloader.cots_storage import (
     WO_QKVO_GRANULARITY_MULTIPLIER,
     WO_ROLE,
     CotsLinearHandle,
-    CotsPrefetchBufferPool,
+    CotsLinearRole,
+    KVPrefetchBufferPool,
+    KVPrefetchStreamer,
+    WeightPrefetchBufferPool,
     WeightPrefetchStreamer,
 )
 from vllm.utils.cots_diag import COUNTERS_ENABLED as _COTS_COUNTERS_ENABLED
@@ -100,6 +109,26 @@ LINEAR_OP_KIND_BY_ROLE = {
 }
 
 
+@dataclass(frozen=True)
+class CotsDispatchEntry:
+    """Normalized runtime dispatch row for one COTS bucket."""
+
+    f_cpu_compute: float
+    f_prefetch_compute: float
+    cpu_kv_compute_groups: int | None = None
+    kv_prefetch_groups: int | None = None
+
+    @property
+    def weight_pair(self) -> tuple[float, float]:
+        return self.f_cpu_compute, self.f_prefetch_compute
+
+    @property
+    def kv_group_pair(self) -> tuple[int, int] | None:
+        if self.cpu_kv_compute_groups is None or self.kv_prefetch_groups is None:
+            return None
+        return self.cpu_kv_compute_groups, self.kv_prefetch_groups
+
+
 @dataclass
 class CotsHeadSplitQKVSidecar:
     """CPU-resident routed Q/K/V for one layer's head-split attention call."""
@@ -109,6 +138,8 @@ class CotsHeadSplitQKVSidecar:
     num_groups: int
     cpu_attention_groups: int
     cpu_weight_groups: int
+    cpu_compute_kv_heads: int
+    prefetch_kv_heads: int
     q_heads_per_kv: int
     head_dim: int
     query: torch.Tensor
@@ -126,6 +157,8 @@ class CotsHeadSplitAttentionOutputSidecar:
     num_groups: int
     cpu_attention_groups: int
     cpu_weight_groups: int
+    cpu_compute_kv_heads: int
+    prefetch_kv_heads: int
     q_heads_per_kv: int
     head_dim: int
     output: torch.Tensor
@@ -148,7 +181,7 @@ class CotsOffloader(BaseOffloader):
         self,
         config: CotsOffloadConfig,
         dispatch_table_factory: Callable[
-            [Sequence[int]], dict[int, tuple[float, float]]
+            [Sequence[int]], dict[int, CotsDispatchTableEntry]
         ]
         | None = None,
     ):
@@ -156,6 +189,9 @@ class CotsOffloader(BaseOffloader):
         self.f_cpu_store = float(config.f_cpu_store)
         self.f_prefetch = float(config.f_prefetch)
         self.kv_mode = str(getattr(config, "kv_mode", "prefix_suffix"))
+        self.kv_head_prefetch_enabled = bool(
+            getattr(config, "head_split_kv_prefetch_enabled", False)
+        )
         self.weight_modules = frozenset(
             normalize_cots_weight_modules(getattr(config, "weight_modules", None))
         )
@@ -200,6 +236,7 @@ class CotsOffloader(BaseOffloader):
 
         # Dispatch table populated in wrap_modules (Phase 1b: needed before
         # the prefetch buffer pool is sized).
+        self._dispatch_entries: dict[int, CotsDispatchEntry] = {}
         self._dispatch_table: dict[int, tuple[float, float]] = {}
         # CUDA graph capture buckets and Planner dispatch buckets are related
         # but distinct. Graph buckets describe replay shapes. Dispatch buckets
@@ -215,8 +252,11 @@ class CotsOffloader(BaseOffloader):
         # Prefetch infrastructure — allocated in wrap_modules when the
         # dispatch table reserves any prefetch capacity. Active buckets may
         # still have zero prefetched rows after runtime snapping.
-        self._prefetch_buffer_pool: CotsPrefetchBufferPool | None = None
+        self._prefetch_buffer_pool: WeightPrefetchBufferPool | None = None
         self._streamer: WeightPrefetchStreamer | None = None
+        self._kv_prefetch_buffer_pool: KVPrefetchBufferPool | None = None
+        self._kv_prefetch_streamer: KVPrefetchStreamer | None = None
+        self._prefetch_hooks_installed: bool = False
 
         # One offloader-owned runner is shared across all operator call sites.
         # The no-offload path leaves it unset to avoid starting a worker thread.
@@ -255,6 +295,7 @@ class CotsOffloader(BaseOffloader):
         ) = None
         self._head_split_qkv_work_capacity: int = 0
         self._head_split_positions_cpu: torch.Tensor | None = None
+        self._live_num_tokens: int | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle: wrap_modules → (weight loading) → post_init.
@@ -282,25 +323,35 @@ class CotsOffloader(BaseOffloader):
         layer_idx = 0
         for layer in modules_generator:
             modules.append(layer)
-            if self.f_cpu_store == 0.0:
-                continue
-            layer_handles = self._build_handles(layer)
-            if not layer_handles:
-                continue
-            for h in layer_handles:
-                h.layer_idx = layer_idx
-            self._install_qkv_ops(layer_handles)
-            self._install_mlp_ops(layer, layer_handles)
-            self._install_wo_ops(layer_handles)
-            self._check_no_orphan_mlp_handles(layer_handles)
-            self._layer_modules.append(layer)
-            self._layer_handles.append(layer_handles)
-            layer_idx += 1
+            layer_handles: list[CotsLinearHandle] = []
+            if self.f_cpu_store > 0.0:
+                layer_handles = self._build_handles(layer)
+                if layer_handles:
+                    for h in layer_handles:
+                        h.layer_idx = layer_idx
+                    self._install_qkv_ops(layer_handles)
+                    self._install_mlp_ops(layer, layer_handles)
+                    self._install_wo_ops(layer_handles)
+                    self._check_no_orphan_mlp_handles(layer_handles)
+            if layer_handles or self.kv_head_prefetch_enabled:
+                self._layer_modules.append(layer)
+                self._layer_handles.append(layer_handles)
+                layer_idx += 1
 
         if self.f_cpu_store == 0.0:
-            logger.info_once(
-                "CotsOffloader: f_cpu_store=0, no offloading.", scope="local"
-            )
+            if self.kv_head_prefetch_enabled:
+                self._build_dispatch_table()
+                self._validate_head_split_kv_dispatch_geometry()
+                self._install_kv_prefetch_machinery()
+                logger.info_once(
+                    "CotsOffloader: f_cpu_store=0, installed experimental "
+                    "head-split KV prefetch lifecycle only.",
+                    scope="local",
+                )
+            else:
+                logger.info_once(
+                    "CotsOffloader: f_cpu_store=0, no offloading.", scope="local"
+                )
             return modules
 
         # Phase 1b: build dispatch table, populate per-handle dispatch
@@ -310,6 +361,7 @@ class CotsOffloader(BaseOffloader):
         self._build_dispatch_table()
         for h in self._handles:
             h.apply_prefetch_split_per_bucket(self._dispatch_table)
+        self._validate_head_split_kv_dispatch_geometry()
         self._has_cpu_compute_work = self._compute_has_cpu_compute_work()
         self._build_route_signatures()
 
@@ -322,6 +374,8 @@ class CotsOffloader(BaseOffloader):
         # knob. A Planner-emitted table can request prefetch even when config
         # f_prefetch == 0, and zero-prefetch tables still reserve full-store
         # slots so runtime accounting matches planner GPU buffer accounting.
+        if self.kv_head_prefetch_enabled:
+            self._install_kv_prefetch_machinery()
         if any(h.max_n_prefetch > 0 for h in self._handles):
             self._install_prefetch_machinery()
         logger.debug(
@@ -644,22 +698,319 @@ class CotsOffloader(BaseOffloader):
 
     # --- Phase 1b: dispatch table + prefetch machinery installation ---
 
+    @staticmethod
+    def _normalize_dispatch_entry(
+        bucket: int, entry: CotsDispatchTableEntry
+    ) -> CotsDispatchEntry:
+        normalized = normalize_cots_dispatch_table_entry(
+            entry, label="cots.dispatch_table", bucket=int(bucket)
+        )
+        f_cpu_compute, f_prefetch_compute = cots_dispatch_weight_pair(normalized)
+        kv_groups = cots_dispatch_kv_group_pair(normalized)
+        if kv_groups is None:
+            return CotsDispatchEntry(
+                f_cpu_compute=f_cpu_compute,
+                f_prefetch_compute=f_prefetch_compute,
+            )
+        return CotsDispatchEntry(
+            f_cpu_compute=f_cpu_compute,
+            f_prefetch_compute=f_prefetch_compute,
+            cpu_kv_compute_groups=int(kv_groups[0]),
+            kv_prefetch_groups=int(kv_groups[1]),
+        )
+
     def _build_dispatch_table(self) -> None:
         """Construct the uniform Planner dispatch table."""
         if self._dispatch_table_factory is not None:
-            self._dispatch_table = self._dispatch_table_factory(self._dispatch_buckets)
+            raw_table = self._dispatch_table_factory(self._dispatch_buckets)
         else:
             pair = (self.f_cpu_store - self.f_prefetch, self.f_prefetch)
-            self._dispatch_table = {b: pair for b in self._dispatch_buckets}
+            raw_table = {b: pair for b in self._dispatch_buckets}
+        self._dispatch_entries = {
+            int(bucket): self._normalize_dispatch_entry(int(bucket), entry)
+            for bucket, entry in raw_table.items()
+        }
+        self._dispatch_table = {
+            bucket: entry.weight_pair
+            for bucket, entry in self._dispatch_entries.items()
+        }
+        if self.kv_head_prefetch_enabled:
+            missing_kv_rows = [
+                int(bucket)
+                for bucket in self._dispatch_buckets
+                if self._dispatch_entries.get(int(bucket)) is None
+                or self._dispatch_entries[int(bucket)].kv_group_pair is None
+            ]
+            if missing_kv_rows:
+                raise ValueError(
+                    "COTS 3-way head-split KV requires compact dispatch rows "
+                    "with (cpu_kv_compute_groups, kv_prefetch_groups); "
+                    f"missing buckets: {missing_kv_rows}"
+                )
         self._validate_graph_capture_dispatch_coverage()
+
+    def _head_split_num_kv_heads_for_validation(self) -> int:
+        _, num_kv_heads, _ = self._head_split_qkv_shape_for_validation()
+        return int(num_kv_heads)
+
+    def _head_split_qkv_shape_for_validation(self) -> tuple[int, int, int]:
+        num_q_heads: int | None = None
+        num_kv_heads: int | None = None
+        head_dim: int | None = None
+        for h in self._handles:
+            if h.role not in (QKV_ROLE, WO_INPUT_ROLE):
+                continue
+            handle_num_q_heads_attr = getattr(h, "num_q_heads", None)
+            handle_num_kv_heads_attr = getattr(h, "num_kv_heads", None)
+            handle_head_dim_attr = getattr(h, "head_dim", None)
+            if handle_num_kv_heads_attr is None:
+                continue
+            if handle_num_q_heads_attr is None or handle_head_dim_attr is None:
+                continue
+            handle_num_q_heads = int(handle_num_q_heads_attr)
+            handle_num_kv_heads = int(handle_num_kv_heads_attr)
+            handle_head_dim = int(handle_head_dim_attr)
+            if num_kv_heads is None:
+                num_q_heads = handle_num_q_heads
+                num_kv_heads = handle_num_kv_heads
+                head_dim = handle_head_dim
+            elif (
+                handle_num_q_heads != num_q_heads
+                or handle_num_kv_heads != num_kv_heads
+                or handle_head_dim != head_dim
+            ):
+                raise ValueError(
+                    "COTS 3-way head-split KV validation found inconsistent "
+                    "attention handle GQA geometry: "
+                    f"({handle_num_q_heads}, {handle_num_kv_heads}, "
+                    f"{handle_head_dim}) != "
+                    f"({num_q_heads}, {num_kv_heads}, {head_dim})"
+                )
+        if (
+            num_q_heads is not None
+            and num_kv_heads is not None
+            and head_dim is not None
+        ):
+            return int(num_q_heads), int(num_kv_heads), int(head_dim)
+
+        if not self._layer_modules:
+            raise ValueError(
+                "COTS 3-way head-split KV validation requires an attention "
+                "layer so CPU-owned KV group count can be checked."
+            )
+        from vllm.model_executor.layers.linear import QKVParallelLinear
+
+        return self._gqa_shape_for_layer(self._layer_modules[0], QKVParallelLinear)
+
+    def _head_split_kv_prefetch_dtype_for_validation(self) -> torch.dtype:
+        for h in self._handles:
+            if h.role == QKV_ROLE:
+                return h.dtype
+        if not self._layer_modules:
+            raise ValueError(
+                "COTS 3-way head-split KV prefetch requires an attention "
+                "layer so KV dtype can be checked."
+            )
+        from vllm.model_executor.layers.linear import QKVParallelLinear
+
+        for _, child in self._layer_modules[0].named_modules():
+            if isinstance(child, QKVParallelLinear):
+                return child.weight.dtype
+        raise RuntimeError(
+            "CotsOffloader head_split mode requires a QKVParallelLinear in "
+            "each offloaded attention layer so KV prefetch dtype can be inferred."
+        )
+
+    def _head_split_kv_prefetch_block_size(self) -> int:
+        from vllm.config import get_current_vllm_config
+
+        vllm_config = get_current_vllm_config()
+        block_size = int(vllm_config.cache_config.block_size)
+        if block_size <= 0:
+            raise ValueError(
+                "COTS 3-way head-split KV prefetch requires a positive "
+                f"cache block_size, got {block_size}"
+            )
+        return block_size
+
+    def _head_split_kv_prefetch_block_table_capacity(
+        self, block_size: int
+    ) -> tuple[int, int]:
+        from vllm.config import get_current_vllm_config
+
+        vllm_config = get_current_vllm_config()
+        max_num_reqs = int(vllm_config.scheduler_config.max_num_seqs)
+        model_config = vllm_config.model_config
+        if model_config is None:
+            max_model_len = int(vllm_config.scheduler_config.max_num_batched_tokens)
+        else:
+            max_model_len = int(model_config.max_model_len)
+        max_blocks_per_req = (max_model_len + int(block_size) - 1) // int(block_size)
+        if max_num_reqs <= 0 or max_blocks_per_req <= 0:
+            raise ValueError(
+                "COTS 3-way head-split KV prefetch requires positive "
+                "compact block-table capacity: "
+                f"max_num_reqs={max_num_reqs}, "
+                f"max_blocks_per_req={max_blocks_per_req}"
+            )
+        return max_num_reqs, max_blocks_per_req
+
+    @staticmethod
+    def _head_split_cpu_weight_groups(h: CotsLinearHandle, bucket: int) -> int | None:
+        if h.role == QKV_ROLE and h.qkv_cpu_layout == "gqa_group":
+            group_size = int(h.gqa_qkv_group_size)
+        elif h.role == WO_INPUT_ROLE:
+            group_size = int(h.gqa_q_group_size)
+        else:
+            return None
+        n_cpu = int(h.n_cpu_compute_by_bucket.get(bucket, h.n_cpu))
+        if group_size <= 0 or n_cpu % group_size != 0:
+            raise ValueError(
+                "COTS 3-way head-split KV validation found non-GQA-aligned "
+                f"attention weight split for {h.qualified_name}: "
+                f"n_cpu={n_cpu}, group_size={group_size}"
+            )
+        return n_cpu // group_size
+
+    def _validate_head_split_role_groups(
+        self,
+        *,
+        bucket: int,
+        expected_cpu_groups: int,
+        role: CotsLinearRole,
+        label: str,
+    ) -> None:
+        seen = False
+        for h in self._handles:
+            if h.role != role:
+                continue
+            groups = self._head_split_cpu_weight_groups(h, bucket)
+            if groups is None:
+                continue
+            seen = True
+            if int(groups) != int(expected_cpu_groups):
+                raise ValueError(
+                    "COTS 3-way head-split KV dispatch row disagrees with "
+                    f"snapped {label} weight geometry for bucket {bucket}: "
+                    f"dispatch C={expected_cpu_groups}, {label} groups={groups}, "
+                    f"module={h.qualified_name}"
+                )
+        if not seen and int(expected_cpu_groups) != 0:
+            raise ValueError(
+                "COTS 3-way head-split KV dispatch row requests CPU "
+                f"attention groups for bucket {bucket}, but no snapped "
+                f"{label} CPU-compute groups exist: C={expected_cpu_groups}"
+            )
+
+    def _validate_head_split_kv_dispatch_geometry(self) -> None:
+        if not self.kv_head_prefetch_enabled:
+            return
+        num_kv_heads = self._head_split_num_kv_heads_for_validation()
+        cpu_kv_groups = gqa_num_cpu_groups(
+            float(getattr(self.config, "f_cpu_kv_store", 0.0)),
+            num_kv_heads=num_kv_heads,
+        )
+        for bucket in self._dispatch_buckets:
+            entry = self._dispatch_entries.get(int(bucket))
+            if entry is None or entry.kv_group_pair is None:
+                raise ValueError(
+                    "COTS 3-way head-split KV requires compact dispatch rows "
+                    "with (cpu_kv_compute_groups, kv_prefetch_groups); "
+                    f"missing bucket: {bucket}"
+                )
+            cpu_compute, prefetch = entry.kv_group_pair
+            if int(cpu_compute) + int(prefetch) != int(cpu_kv_groups):
+                raise ValueError(
+                    "COTS 3-way head-split KV dispatch row must cover exactly "
+                    "the CPU-owned KV groups: "
+                    f"bucket={bucket}, C={cpu_compute}, P={prefetch}, "
+                    f"A={cpu_kv_groups}"
+                )
+            self._validate_head_split_role_groups(
+                bucket=int(bucket),
+                expected_cpu_groups=int(cpu_compute),
+                role=QKV_ROLE,
+                label="WQKV",
+            )
+            self._validate_head_split_role_groups(
+                bucket=int(bucket),
+                expected_cpu_groups=int(cpu_compute),
+                role=WO_INPUT_ROLE,
+                label="WO",
+            )
+
+    def head_split_kv_group_plan_by_bucket(self) -> dict[int, tuple[int, int]]:
+        """Return Planner-owned 3-way KV group rows keyed by dispatch bucket."""
+        if not self.kv_head_prefetch_enabled:
+            return {}
+        plan: dict[int, tuple[int, int]] = {}
+        for bucket in self._dispatch_buckets:
+            entry = self._dispatch_entries.get(int(bucket))
+            if entry is None or entry.kv_group_pair is None:
+                raise RuntimeError(
+                    "COTS 3-way head-split KV plan requested before compact "
+                    f"dispatch row exists for bucket {bucket}."
+                )
+            cpu_compute, prefetch = entry.kv_group_pair
+            plan[int(bucket)] = (int(cpu_compute), int(prefetch))
+        return plan
+
+    def publish_head_split_kv_prefetch_descriptor(
+        self, layer_idx: int, descriptor: object | None
+    ) -> None:
+        if self._kv_prefetch_streamer is None:
+            return
+        self._kv_prefetch_streamer.publish_descriptor(layer_idx, descriptor)
+
+    def head_split_kv_prefetch_attention_inputs(
+        self, descriptor: object
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._kv_prefetch_streamer is None:
+            raise RuntimeError(
+                "COTS head-split KV prefetch attention requested without "
+                "a KV prefetch streamer"
+            )
+        layer_idx = int(cast(Any, descriptor).layer_idx)
+        return self._kv_prefetch_streamer.attention_inputs(
+            layer_idx=layer_idx,
+            descriptor=descriptor,
+        )
+
+    def patch_head_split_kv_prefetch_current(
+        self,
+        *,
+        descriptor: object | None,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        cpu_slot_mapping: torch.Tensor,
+        gpu_kv_heads: int,
+        num_actual_tokens: int,
+    ) -> None:
+        if descriptor is None or self._kv_prefetch_streamer is None:
+            return
+        layer_idx = int(cast(Any, descriptor).layer_idx)
+        self._kv_prefetch_streamer.patch_current_kv(
+            layer_idx=layer_idx,
+            descriptor=descriptor,
+            key=key,
+            value=value,
+            cpu_slot_mapping=cpu_slot_mapping,
+            gpu_kv_heads=int(gpu_kv_heads),
+            num_actual_tokens=int(num_actual_tokens),
+        )
+
+    def wait_head_split_kv_prefetch_writeback(self, layer_idx: int) -> bool:
+        if self._kv_prefetch_streamer is None:
+            return False
+        return self._kv_prefetch_streamer.wait_for_layer_writeback(int(layer_idx))
 
     def _install_prefetch_machinery(self) -> None:
         """Allocate prefetch buffers and install layer-level prefetch hooks."""
         device = torch.device("cuda")
-        self._prefetch_buffer_pool = CotsPrefetchBufferPool(self._handles, device)
+        self._prefetch_buffer_pool = WeightPrefetchBufferPool(self._handles, device)
         for h in self._handles:
             if h.layer_idx >= 0:
-                h.slot_idx = h.layer_idx % CotsPrefetchBufferPool.K
+                h.slot_idx = h.layer_idx % WeightPrefetchBufferPool.K
 
         n_layers = len(self._layer_modules)
         self._streamer = WeightPrefetchStreamer(
@@ -668,8 +1019,102 @@ class CotsOffloader(BaseOffloader):
         )
         self._streamer.buffer_pool = self._prefetch_buffer_pool
 
+        self._ensure_prefetch_hooks_installed()
+
+    def _install_kv_prefetch_machinery(self) -> None:
+        """Install the gated no-op lifecycle for 3-way head-split KV prefetch."""
+        if self._kv_prefetch_buffer_pool is None:
+            _, _, head_dim = self._head_split_qkv_shape_for_validation()
+            dtype = self._head_split_kv_prefetch_dtype_for_validation()
+            if dtype != torch.bfloat16:
+                raise ValueError(
+                    "COTS 3-way head-split KV prefetch currently supports only "
+                    f"BF16 KV cache, got dtype={dtype}."
+                )
+            self.configure_kv_prefetch_buffer(
+                max_active_blocks=int(self.config.kv_prefetch_max_active_blocks),
+                block_size=self._head_split_kv_prefetch_block_size(),
+                head_dim=int(head_dim),
+                dtype=dtype,
+                device=torch.device("cuda"),
+            )
+        if self._kv_prefetch_streamer is None:
+            self._kv_prefetch_streamer = KVPrefetchStreamer(
+                n_layers=len(self._layer_modules),
+                buffer_pool=self._kv_prefetch_buffer_pool,
+            )
+        self._ensure_prefetch_hooks_installed()
+
+    def configure_kv_prefetch_buffer(
+        self,
+        *,
+        max_active_blocks: int,
+        block_size: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        """Allocate the compact 3-way head-split KV prefetch workspace.
+
+        Weight routing owns the dispatch table, so this method derives the
+        maximum prefetched GQA group count ``P`` from normalized compact
+        dispatch rows. The offloader allocates this during model wrapping so
+        vLLM's memory profiler accounts for the reserved prefetch workspace
+        before sizing the main KV cache.
+        """
+        if not self.kv_head_prefetch_enabled:
+            return
+        if max_active_blocks <= 0:
+            raise ValueError(
+                "COTS 3-way head-split KV prefetch requires "
+                f"max_active_blocks > 0, got {max_active_blocks}"
+            )
+        if block_size <= 0 or head_dim <= 0:
+            raise ValueError(
+                "COTS 3-way head-split KV prefetch requires positive "
+                f"block_size/head_dim, got block_size={block_size}, "
+                f"head_dim={head_dim}"
+            )
+        if not self._dispatch_entries:
+            raise RuntimeError(
+                "COTS 3-way head-split KV prefetch buffer cannot be "
+                "configured before the compact dispatch table is built."
+            )
+        max_num_reqs, max_blocks_per_req = (
+            self._head_split_kv_prefetch_block_table_capacity(block_size)
+        )
+
+        max_prefetch_kv_heads = 0
+        for bucket in self._dispatch_buckets:
+            entry = self._dispatch_entries.get(int(bucket))
+            if entry is None or entry.kv_group_pair is None:
+                raise RuntimeError(
+                    "COTS 3-way head-split KV prefetch buffer requires compact "
+                    f"dispatch rows for every bucket; missing bucket {bucket}."
+                )
+            _, prefetch = entry.kv_group_pair
+            max_prefetch_kv_heads = max(max_prefetch_kv_heads, int(prefetch))
+
+        self._kv_prefetch_buffer_pool = KVPrefetchBufferPool(
+            n_layers=len(self._layer_modules),
+            max_active_blocks=int(max_active_blocks),
+            max_num_reqs=max_num_reqs,
+            max_blocks_per_req=max_blocks_per_req,
+            block_size=int(block_size),
+            max_prefetch_kv_heads=max_prefetch_kv_heads,
+            head_dim=int(head_dim),
+            dtype=dtype,
+            device=device,
+        )
+        if self._kv_prefetch_streamer is not None:
+            self._kv_prefetch_streamer.buffer_pool = self._kv_prefetch_buffer_pool
+
+    def _ensure_prefetch_hooks_installed(self) -> None:
+        if self._prefetch_hooks_installed:
+            return
         for i, layer in enumerate(self._layer_modules):
             self._hook_layer_forward(i, layer)
+        self._prefetch_hooks_installed = True
 
     # --- Runner install (closures / slab specs) -----
 
@@ -1097,22 +1542,34 @@ class CotsOffloader(BaseOffloader):
         """Wrap the decoder layer's `forward` with pre-compute scheduling.
 
         For layer i: wait for layer i's prefetched weights, start prefetch
-        for layer i+1, then run layer i. With K=2 slot rotation, i reads
-        slot i%2 while i+1 writes slot (i+1)%2, so the H2D overlaps with
-        layer i compute without a wraparound special case.
+        for layer i+1, then run layer i. Experimental KV prefetch reuses this
+        same custom-op lifecycle when enabled. With K=2 slot rotation, i reads
+        slot i%2 while i+1 writes slot (i+1)%2, so H2D overlaps with layer i
+        compute without a wraparound special case.
         """
         original_forward = layer.forward
         n_layers = len(self._layer_modules)
 
-        layer_has_prefetch = any(
+        layer_has_weight_prefetch = any(
             h.max_n_prefetch > 0 for h in self._layer_handles[index]
         )
-        next_idx = (index + 1) % n_layers if n_layers > 0 else 0
-        next_has_prefetch = (
-            n_layers > 1
-            and next_idx != index
-            and any(h.max_n_prefetch > 0 for h in self._layer_handles[next_idx])
+        layer_has_kv_prefetch = (
+            self._kv_prefetch_streamer is not None
+            and self._kv_prefetch_streamer.has_layer_prefetch(index)
         )
+        layer_has_prefetch = layer_has_weight_prefetch or layer_has_kv_prefetch
+        next_idx = (index + 1) % n_layers if n_layers > 0 else 0
+        if n_layers > 1 and next_idx != index:
+            next_has_weight_prefetch = any(
+                h.max_n_prefetch > 0 for h in self._layer_handles[next_idx]
+            )
+            next_has_kv_prefetch = (
+                self._kv_prefetch_streamer is not None
+                and self._kv_prefetch_streamer.has_layer_prefetch(next_idx)
+            )
+            next_has_prefetch = next_has_weight_prefetch or next_has_kv_prefetch
+        else:
+            next_has_prefetch = False
 
         def forward(*args, **kwargs):
             layer.forward = original_forward
@@ -1177,6 +1634,9 @@ class CotsOffloader(BaseOffloader):
 
     def _prepare_before_forward_bucket(self, num_tokens: int, bucket: int) -> None:
         self._current_bucket = int(bucket)
+        if self._kv_prefetch_streamer is not None:
+            self._kv_prefetch_streamer.current_bucket = int(bucket)
+            self._kv_prefetch_streamer.prepare_for_forward_bucket(0)
         if self._streamer is None:
             return
         self._streamer.current_bucket = int(bucket)
@@ -1323,11 +1783,44 @@ class CotsOffloader(BaseOffloader):
             self._head_split_v_work[:num_tokens],
         )
 
+    def _head_split_live_num_tokens(
+        self,
+        *,
+        num_tokens_padded: int,
+        out_cpu: torch.Tensor | None,
+    ) -> int:
+        """Return the live row count for CPU-side routed activations."""
+
+        num_tokens_padded = int(num_tokens_padded)
+        if num_tokens_padded < 0:
+            raise RuntimeError(
+                "COTS head-split QKV route got a negative padded token count: "
+                f"{num_tokens_padded}"
+            )
+        live = self._live_num_tokens
+        if live is None and out_cpu is not None:
+            live = int(out_cpu.shape[0])
+        if live is None:
+            live = num_tokens_padded
+        live = int(live)
+        if live < 0 or live > num_tokens_padded:
+            raise RuntimeError(
+                "COTS head-split QKV route live token count is outside the "
+                f"padded activation shape: live={live}, padded={num_tokens_padded}"
+            )
+        if out_cpu is not None:
+            # Native CPU slabs are dispatch-bucket capacity sized. Profile
+            # dummy runs may have many more model rows than the largest COTS
+            # dispatch bucket, so the pinned output row count is the
+            # authoritative row count for CPU-produced routed activations.
+            live = min(live, int(out_cpu.shape[0]))
+        return live
+
     def _qkv_group_route(
         self,
         h: CotsLinearHandle,
         bucket: int,
-    ) -> tuple[int, int, int, int, int]:
+    ) -> tuple[int, int, int, int, int, int, int]:
         if (
             h.role != QKV_ROLE
             or h.qkv_cpu_layout != "gqa_group"
@@ -1356,13 +1849,64 @@ class CotsOffloader(BaseOffloader):
                 "GPU attention group"
             )
         cpu_weight_groups = n_cpu // qkv_group
+        cpu_compute_kv_heads, prefetch_kv_heads = self._head_split_kv_group_plan(
+            bucket=bucket,
+            cpu_attention_groups=cpu_attention_groups,
+            cpu_weight_groups=cpu_weight_groups,
+        )
         return (
             num_groups,
             cpu_attention_groups,
             cpu_weight_groups,
+            cpu_compute_kv_heads,
+            prefetch_kv_heads,
             int(h.gqa_q_group_size),
             int(h.head_dim),
         )
+
+    def _head_split_kv_group_plan(
+        self,
+        *,
+        bucket: int,
+        cpu_attention_groups: int,
+        cpu_weight_groups: int,
+    ) -> tuple[int, int]:
+        """Return the 3-way KV group geometry for one bucket.
+
+        ``cpu_attention_groups`` is the static CPU-owned KV count ``A``. The
+        returned pair is ``(C, P)`` where ``C`` is the CPU-compute attention
+        island and ``P`` is the CPU-owned KV prefix that the 3-way path
+        prefetches to GPU attention.
+        """
+
+        if not self.kv_head_prefetch_enabled:
+            return int(cpu_attention_groups), 0
+        entry = self._dispatch_entries.get(int(bucket))
+        if entry is None or entry.kv_group_pair is None:
+            raise RuntimeError(
+                "COTS 3-way head-split KV routing requires a compact dispatch "
+                f"row for bucket {bucket} with "
+                "(cpu_kv_compute_groups, kv_prefetch_groups)."
+            )
+        cpu_compute, prefetch = entry.kv_group_pair
+        if cpu_compute < 0 or prefetch < 0:
+            raise RuntimeError(
+                "COTS head-split KV group plan must be non-negative: "
+                f"C={cpu_compute}, P={prefetch}"
+            )
+        if cpu_compute + prefetch != int(cpu_attention_groups):
+            raise RuntimeError(
+                "COTS head-split KV group plan must cover all CPU-owned "
+                f"KV groups: C={cpu_compute}, P={prefetch}, "
+                f"A={cpu_attention_groups}"
+            )
+        if int(cpu_compute) != int(cpu_weight_groups):
+            raise RuntimeError(
+                "COTS head-split KV group plan must match snapped WQKV "
+                f"CPU-compute groups: C={cpu_compute}, "
+                f"WQKV={cpu_weight_groups}, bucket={bucket}"
+            )
+        return int(cpu_compute), int(prefetch)
 
     def route_head_split_qkv_output(
         self,
@@ -1387,16 +1931,36 @@ class CotsOffloader(BaseOffloader):
             num_groups,
             cpu_attention_groups,
             cpu_weight_groups,
+            cpu_compute_kv_heads,
+            prefetch_kv_heads,
             q_group,
             head_dim,
         ) = self._qkv_group_route(h, bucket)
         q_heads_per_kv = q_group // head_dim
         qkv_group = q_group + 2 * head_dim
-        cpu_attention_start = num_groups - cpu_attention_groups
+        q_size = int(h.q_size)
+        kv_size = int(h.kv_size)
         cpu_compute_start = num_groups - cpu_weight_groups
+        cpu_sidecar_groups = cpu_compute_kv_heads
+        cpu_sidecar_start = num_groups - cpu_sidecar_groups
+        if self.kv_head_prefetch_enabled and cpu_sidecar_groups != cpu_weight_groups:
+            raise RuntimeError(
+                "COTS 3-way head-split QKV route requires WQKV CPU-compute "
+                "groups to match the compact CPU-attention sidecar: "
+                f"WQKV={cpu_weight_groups}, C={cpu_sidecar_groups}, "
+                f"P={prefetch_kv_heads}, bucket={bucket}"
+            )
+
+        num_tokens_padded = int(num_tokens)
+        num_tokens_live = self._head_split_live_num_tokens(
+            num_tokens_padded=num_tokens_padded,
+            out_cpu=out_cpu,
+        )
 
         out = torch.empty(
-            (num_tokens, h.out_dim), dtype=reference.dtype, device=reference.device
+            (num_tokens_padded, h.out_dim),
+            dtype=reference.dtype,
+            device=reference.device,
         )
         if out_perm is not None:
             out.index_copy_(1, h.gpu_indices_cuda, out_perm)
@@ -1406,8 +1970,8 @@ class CotsOffloader(BaseOffloader):
             out = out + bias
 
         q_cpu, k_cpu, v_cpu = self._head_split_qkv_work_views(
-            num_tokens=num_tokens,
-            cpu_attention_groups=cpu_attention_groups,
+            num_tokens=num_tokens_live,
+            cpu_attention_groups=cpu_sidecar_groups,
             q_heads_per_kv=q_heads_per_kv,
             head_dim=head_dim,
             dtype=h.dtype,
@@ -1421,13 +1985,13 @@ class CotsOffloader(BaseOffloader):
             local_group = global_group - cpu_compute_start
             group_start = local_group * qkv_group
             group_end = (local_group + 1) * qkv_group
-            group = out_cpu[:, group_start:group_end]
+            group = out_cpu[:num_tokens_live, group_start:group_end]
             group = group.contiguous()
             if bias is None:
                 return group
             q_start = global_group * q_group
-            k_start = h.q_size + global_group * head_dim
-            v_start = h.q_size + h.kv_size + global_group * head_dim
+            k_start = q_size + global_group * head_dim
+            v_start = q_size + kv_size + global_group * head_dim
             bias_group = torch.cat(
                 [
                     bias[q_start : q_start + q_group],
@@ -1451,78 +2015,101 @@ class CotsOffloader(BaseOffloader):
             v_dst = v_cpu[:, local_attention : local_attention + 1, :]
             if global_group >= cpu_compute_start and cpu_weight_groups > 0:
                 group = cpu_group_with_bias(global_group)
-                q_dst.copy_(
-                    group[:, :q_group].view(num_tokens, q_heads_per_kv, head_dim)
+                q_view = group[:, :q_group].view(
+                    num_tokens_live, q_heads_per_kv, head_dim
                 )
+                q_dst.copy_(q_view)
                 k_dst.copy_(
-                    group[:, q_group : q_group + head_dim].view(num_tokens, 1, head_dim)
+                    group[:, q_group : q_group + head_dim].view(
+                        num_tokens_live, 1, head_dim
+                    )
                 )
                 v_dst.copy_(
                     group[:, q_group + head_dim : qkv_group].view(
-                        num_tokens, 1, head_dim
+                        num_tokens_live, 1, head_dim
                     )
                 )
                 return
 
             q_start = global_group * q_group
-            k_start = h.q_size + global_group * head_dim
-            v_start = h.q_size + h.kv_size + global_group * head_dim
-            q_src = out[:, q_start : q_start + q_group].detach().to(device="cpu")
-            k_src = out[:, k_start : k_start + head_dim].detach().to(device="cpu")
-            v_src = out[:, v_start : v_start + head_dim].detach().to(device="cpu")
-            q_dst.copy_(q_src.view(num_tokens, q_heads_per_kv, head_dim))
-            k_dst.copy_(k_src.view(num_tokens, 1, head_dim))
-            v_dst.copy_(v_src.view(num_tokens, 1, head_dim))
+            k_start = q_size + global_group * head_dim
+            v_start = q_size + kv_size + global_group * head_dim
+            q_src = (
+                out[:num_tokens_live, q_start : q_start + q_group]
+                .detach()
+                .to(device="cpu")
+            )
+            k_src = (
+                out[:num_tokens_live, k_start : k_start + head_dim]
+                .detach()
+                .to(device="cpu")
+            )
+            v_src = (
+                out[:num_tokens_live, v_start : v_start + head_dim]
+                .detach()
+                .to(device="cpu")
+            )
+            q_dst.copy_(q_src.view(num_tokens_live, q_heads_per_kv, head_dim))
+            k_dst.copy_(k_src.view(num_tokens_live, 1, head_dim))
+            v_dst.copy_(v_src.view(num_tokens_live, 1, head_dim))
 
-        # CPU-computed groups that belong to GPU attention are the C > A
+        # CPU-computed groups that do not run CPU attention are the activation
         # mismatch. Insert only those groups into the canonical GPU QKV tensor.
-        if cpu_weight_groups > cpu_attention_groups:
-            for global_group in range(cpu_compute_start, cpu_attention_start):
+        if not self.kv_head_prefetch_enabled and cpu_weight_groups > cpu_sidecar_groups:
+            for global_group in range(cpu_compute_start, cpu_sidecar_start):
                 group = cpu_group_with_bias(global_group).to(
                     device=reference.device, non_blocking=True
                 )
                 q_start = global_group * q_group
-                k_start = h.q_size + global_group * head_dim
-                v_start = h.q_size + h.kv_size + global_group * head_dim
-                out[:, q_start : q_start + q_group].copy_(group[:, :q_group])
-                out[:, k_start : k_start + head_dim].copy_(
+                k_start = q_size + global_group * head_dim
+                v_start = q_size + kv_size + global_group * head_dim
+                out[:num_tokens_live, q_start : q_start + q_group].copy_(
+                    group[:, :q_group]
+                )
+                out[:num_tokens_live, k_start : k_start + head_dim].copy_(
                     group[:, q_group : q_group + head_dim]
                 )
-                out[:, v_start : v_start + head_dim].copy_(
+                out[:num_tokens_live, v_start : v_start + head_dim].copy_(
                     group[:, q_group + head_dim : qkv_group]
                 )
-        qkv_h2d_groups = max(0, cpu_weight_groups - cpu_attention_groups)
+        qkv_h2d_groups = max(0, cpu_weight_groups - cpu_sidecar_groups)
 
         for local_attention, global_group in enumerate(
-            range(cpu_attention_start, num_groups)
+            range(cpu_sidecar_start, num_groups)
         ):
             copy_group_to_cpu(global_group, local_attention)
-        qkv_d2h_groups = max(0, cpu_attention_groups - cpu_weight_groups)
+        qkv_d2h_groups = max(0, cpu_sidecar_groups - cpu_weight_groups)
 
         storage_key = self._storage_key(out)
         self._head_split_qkv_sidecars[storage_key] = CotsHeadSplitQKVSidecar(
             storage_key=storage_key,
-            num_tokens=num_tokens,
+            num_tokens=num_tokens_live,
             num_groups=num_groups,
-            cpu_attention_groups=cpu_attention_groups,
+            cpu_attention_groups=cpu_sidecar_groups,
             cpu_weight_groups=cpu_weight_groups,
+            cpu_compute_kv_heads=cpu_compute_kv_heads,
+            prefetch_kv_heads=prefetch_kv_heads,
             q_heads_per_kv=q_heads_per_kv,
             head_dim=head_dim,
             query=q_cpu,
             key=k_cpu,
             value=v_cpu,
+            rope_applied=cpu_sidecar_groups == 0,
         )
         if _COTS_COUNTERS_ENABLED:
-            phase = _head_split_phase(num_tokens)
+            phase = _head_split_phase(num_tokens_live)
             element_bytes = _dtype_nbytes(h.dtype)
             qkv_d2h_elements = qkv_d2h_groups * qkv_group
-            _cots_py_counter("head_split_qkv_route_tokens", num_tokens)
-            _cots_py_counter(f"head_split_qkv_route_{phase}_tokens", num_tokens)
+            _cots_py_counter("head_split_qkv_route_tokens", num_tokens_live)
+            _cots_py_counter(
+                f"head_split_qkv_route_{phase}_tokens",
+                num_tokens_live,
+            )
             _cots_py_counter("head_split_qkv_route_layers")
             _cots_py_counter(f"head_split_qkv_route_{phase}_layers")
             _cots_py_counter(
                 "head_split_qkv_route_cpu_attention_groups",
-                cpu_attention_groups,
+                cpu_sidecar_groups,
             )
             _cots_py_counter(
                 "head_split_qkv_route_cpu_weight_groups",
@@ -1530,19 +2117,19 @@ class CotsOffloader(BaseOffloader):
             )
             _cots_py_counter(
                 "head_split_qkv_route_d2h_bytes",
-                num_tokens * qkv_d2h_elements * element_bytes,
+                num_tokens_live * qkv_d2h_elements * element_bytes,
             )
             _cots_py_counter(
                 f"head_split_qkv_route_{phase}_d2h_bytes",
-                num_tokens * qkv_d2h_elements * element_bytes,
+                num_tokens_live * qkv_d2h_elements * element_bytes,
             )
             _cots_py_counter(
                 "head_split_qkv_route_h2d_bytes",
-                num_tokens * qkv_h2d_groups * qkv_group * element_bytes,
+                num_tokens_live * qkv_h2d_groups * qkv_group * element_bytes,
             )
             _cots_py_counter(
                 f"head_split_qkv_route_{phase}_h2d_bytes",
-                num_tokens * qkv_h2d_groups * qkv_group * element_bytes,
+                num_tokens_live * qkv_h2d_groups * qkv_group * element_bytes,
             )
             _cots_py_timing(f"head_split_qkv_route_{phase}", timer_start)
         _cots_py_timing("head_split_qkv_route", timer_start)
@@ -1660,9 +2247,14 @@ class CotsOffloader(BaseOffloader):
     ) -> None:
         num_tokens = int(output_cpu.shape[0])
         num_groups = qkv_sidecar.num_groups
-        cpu_attention_groups = qkv_sidecar.cpu_attention_groups
-        cpu_weight_groups = qkv_sidecar.cpu_weight_groups
         q_heads_per_kv = qkv_sidecar.q_heads_per_kv
+        if int(output_cpu.shape[1]) % q_heads_per_kv != 0:
+            raise RuntimeError(
+                "COTS head-split CPU attention output is not GQA aligned: "
+                f"heads={output_cpu.shape[1]}, q_heads_per_kv={q_heads_per_kv}"
+            )
+        cpu_attention_groups = int(output_cpu.shape[1]) // q_heads_per_kv
+        cpu_weight_groups = qkv_sidecar.cpu_weight_groups
         cpu_attention_start = num_groups - cpu_attention_groups
         timer_start = _cots_py_timer_start()
         h2d_groups = max(0, cpu_attention_groups - cpu_weight_groups)
@@ -1690,6 +2282,8 @@ class CotsOffloader(BaseOffloader):
                 num_groups=num_groups,
                 cpu_attention_groups=cpu_attention_groups,
                 cpu_weight_groups=cpu_weight_groups,
+                cpu_compute_kv_heads=qkv_sidecar.cpu_compute_kv_heads,
+                prefetch_kv_heads=qkv_sidecar.prefetch_kv_heads,
                 q_heads_per_kv=q_heads_per_kv,
                 head_dim=qkv_sidecar.head_dim,
                 output=output_cpu,
@@ -1765,6 +2359,8 @@ class CotsOffloader(BaseOffloader):
                 num_groups=qkv_sidecar.num_groups,
                 cpu_attention_groups=0,
                 cpu_weight_groups=qkv_sidecar.cpu_weight_groups,
+                cpu_compute_kv_heads=qkv_sidecar.cpu_compute_kv_heads,
+                prefetch_kv_heads=qkv_sidecar.prefetch_kv_heads,
                 q_heads_per_kv=qkv_sidecar.q_heads_per_kv,
                 head_dim=qkv_sidecar.head_dim,
                 output=empty_cpu_output,
@@ -1883,6 +2479,7 @@ class CotsOffloader(BaseOffloader):
         `slab.num_tokens.store` at submit time). Also no-op for
         `live_num_tokens <= 0` (sentinel).
         """
+        self._live_num_tokens = int(live_num_tokens)
         if not self._has_cpu_compute_work:
             return
         if not isinstance(self._runner, NativeCotsWeightRunner):
@@ -1961,6 +2558,7 @@ class CotsOffloader(BaseOffloader):
         num_tokens_padded = int(info.batch_descriptor.num_tokens)
         num_tokens_unpadded = int(info.num_tokens_unpadded)
         active_bucket = self._dispatch_bucket_from_descriptor(info.batch_descriptor)
+        self._live_num_tokens = num_tokens_unpadded
         self._clear_head_split_sidecars()
         self.set_head_split_cpu_positions(
             getattr(info, "positions_cpu", None),
@@ -2021,18 +2619,26 @@ class CotsOffloader(BaseOffloader):
     def _start_prefetch(self, layer_idx: int) -> None:
         if self._streamer is not None:
             self._streamer.start(layer_idx, self._layer_handles[layer_idx])
+        if self._kv_prefetch_streamer is not None:
+            self._kv_prefetch_streamer.start(layer_idx)
 
     def _wait_for_layer(self, layer_idx: int) -> None:
         if self._streamer is not None:
             self._streamer.wait(layer_idx)
+        if self._kv_prefetch_streamer is not None:
+            self._kv_prefetch_streamer.wait(layer_idx)
 
     def sync_prev_onload(self) -> None:
         if self._streamer is not None:
             self._streamer.sync_prev_onload()
+        if self._kv_prefetch_streamer is not None:
+            self._kv_prefetch_streamer.sync_prev_onload()
 
     def join_after_forward(self) -> None:
         if self._streamer is not None:
             self._streamer.join_after_forward()
+        if self._kv_prefetch_streamer is not None:
+            self._kv_prefetch_streamer.join_after_forward()
 
     # --- Graph/dispatch bucket resolution ---
 

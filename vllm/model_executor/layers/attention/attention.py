@@ -756,6 +756,26 @@ def unified_kv_cache_update(
                         head_split_metadata.routed_key_cpu = sidecar.key
                         head_split_metadata.routed_value_cpu = sidecar.value
                         head_split_metadata.routed_qkv_sidecar = sidecar
+                        prefetch_kv_heads = int(sidecar.prefetch_kv_heads)
+                        cpu_compute_kv_heads = int(sidecar.cpu_compute_kv_heads)
+                        q_heads_per_kv = int(sidecar.q_heads_per_kv)
+                        head_split_metadata.prefetch_kv_heads = prefetch_kv_heads
+                        head_split_metadata.cpu_compute_kv_heads = cpu_compute_kv_heads
+                        head_split_metadata.prefetch_query_start = (
+                            head_split_metadata.cpu_query_start
+                        )
+                        head_split_metadata.prefetch_query_heads = (
+                            prefetch_kv_heads * q_heads_per_kv
+                        )
+                        head_split_metadata.cpu_compute_query_start = (
+                            head_split_metadata.cpu_query_start
+                            + head_split_metadata.prefetch_query_heads
+                        )
+                        head_split_metadata.cpu_compute_query_heads = (
+                            cpu_compute_kv_heads * q_heads_per_kv
+                        )
+                        head_split_metadata.prefetch_cpu_kv_start = 0
+                        head_split_metadata.cpu_compute_cpu_kv_start = prefetch_kv_heads
 
             cots_head_split_gpu_kv_cache_update(
                 attn_layer,
@@ -768,6 +788,27 @@ def unified_kv_cache_update(
             cots_head_split_kv_cache_update(
                 key, value, layer_slot_mapping, head_split_metadata
             )
+            if head_split_metadata.kv_prefetch is not None:
+                from vllm.model_executor.offloader import get_offloader
+
+                patch_current = getattr(
+                    get_offloader(),
+                    "patch_head_split_kv_prefetch_current",
+                    None,
+                )
+                if patch_current is None:
+                    raise RuntimeError(
+                        "COTS head-split KV prefetch current patch has no "
+                        "offloader hook"
+                    )
+                patch_current(
+                    descriptor=head_split_metadata.kv_prefetch,
+                    key=key,
+                    value=value,
+                    cpu_slot_mapping=head_split_metadata.cpu_slot_mapping,
+                    gpu_kv_heads=head_split_metadata.gpu_kv_heads,
+                    num_actual_tokens=head_split_metadata.num_actual_tokens,
+                )
         else:
             attn_layer.impl.do_kv_cache_update(
                 attn_layer,

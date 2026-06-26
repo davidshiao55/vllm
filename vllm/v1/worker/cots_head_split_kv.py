@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Sequence
+from dataclasses import replace
 
 import numpy as np
 import torch
@@ -15,6 +16,7 @@ from vllm.utils.cots_diag import COUNTERS_ENABLED as _COTS_COUNTERS_ENABLED
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.cots_head_split_attention import (
     CotsHeadSplitAttentionMetadata,
+    CotsHeadSplitKVPrefetchDescriptor,
 )
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
@@ -61,6 +63,9 @@ class CotsHeadSplitKVStore:
         max_num_tokens: int,
         max_model_len: int,
         pin_memory: bool,
+        kv_head_prefetch_enabled: bool = False,
+        kv_prefetch_max_active_blocks: int = 0,
+        kv_group_plan_by_bucket: dict[int, tuple[int, int]] | None = None,
     ) -> None:
         if not layer_names:
             raise ValueError("COTS head-split KV requires at least one layer")
@@ -90,6 +95,9 @@ class CotsHeadSplitKVStore:
             )
 
         self.layer_names = tuple(layer_names)
+        self._layer_index_by_name = {
+            layer_name: idx for idx, layer_name in enumerate(self.layer_names)
+        }
         self.num_blocks = int(num_blocks)
         self.block_size = int(block_size)
         self.num_kv_heads = int(num_kv_heads)
@@ -99,6 +107,31 @@ class CotsHeadSplitKVStore:
         self.q_heads_per_kv = self.num_query_heads // self.num_kv_heads
         self.cpu_query_start = self.gpu_kv_heads * self.q_heads_per_kv
         self.cpu_query_heads = self.cpu_kv_heads * self.q_heads_per_kv
+        self.kv_head_prefetch_enabled = bool(kv_head_prefetch_enabled)
+        self.kv_prefetch_max_active_blocks = int(kv_prefetch_max_active_blocks)
+        self.kv_group_plan_by_bucket = dict(kv_group_plan_by_bucket or {})
+        if self.kv_head_prefetch_enabled:
+            if self.kv_prefetch_max_active_blocks <= 0:
+                raise ValueError(
+                    "COTS head-split KV prefetch requires "
+                    "kv_prefetch_max_active_blocks > 0"
+                )
+            if not self.kv_group_plan_by_bucket:
+                raise ValueError(
+                    "COTS head-split KV prefetch requires a compact "
+                    "KV group plan by dispatch bucket"
+                )
+            for (
+                bucket,
+                (cpu_compute, prefetch),
+            ) in self.kv_group_plan_by_bucket.items():
+                if int(cpu_compute) + int(prefetch) != self.cpu_kv_heads:
+                    raise ValueError(
+                        "COTS head-split KV prefetch plan must cover all "
+                        "CPU-owned KV groups: "
+                        f"bucket={bucket}, C={cpu_compute}, P={prefetch}, "
+                        f"A={self.cpu_kv_heads}"
+                    )
         self.head_size = int(head_size)
         self.dtype = dtype
         self.pin_memory = bool(pin_memory)
@@ -155,6 +188,37 @@ class CotsHeadSplitKVStore:
             device="cpu",
             pin_memory=pin_memory,
         )
+        self._prefetch_block_positions = torch.arange(
+            self.max_blocks_per_req,
+            dtype=torch.long,
+            device="cpu",
+        )
+        self._prefetch_active_mask = torch.empty(
+            (self._max_num_reqs, self.max_blocks_per_req),
+            dtype=torch.bool,
+            device="cpu",
+            pin_memory=pin_memory,
+        )
+        compact_rows = max(1, self._max_num_reqs)
+        compact_cols = max(1, self.max_blocks_per_req)
+        self._prefetch_compact_block_table = torch.empty(
+            (compact_rows, compact_cols),
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=pin_memory,
+        )
+        source_capacity = max(1, self.kv_prefetch_max_active_blocks)
+        self._prefetch_source_block_ids = torch.empty(
+            (source_capacity,),
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=pin_memory,
+        )
+        self._prefetch_destination_block_ids = torch.arange(
+            source_capacity,
+            dtype=torch.int32,
+            device="cpu",
+        )
         for layer_name in self.layer_names:
             self._query_staging[layer_name] = torch.empty(
                 (self._max_num_reqs, self.cpu_query_heads, self.head_size),
@@ -174,6 +238,12 @@ class CotsHeadSplitKVStore:
                 device="cpu",
                 pin_memory=pin_memory,
             )
+
+    def layer_index(self, layer_name: str) -> int:
+        try:
+            return self._layer_index_by_name[layer_name]
+        except KeyError as exc:
+            raise KeyError(f"Unknown COTS head-split KV layer: {layer_name}") from exc
 
     @staticmethod
     def _cpu_tensor(
@@ -436,6 +506,14 @@ class CotsHeadSplitKVStore:
                 num_actual_tokens=num_actual_tokens,
             )
 
+        group_plan = self._metadata_group_plan_kwargs(num_actual_tokens)
+        kv_prefetch = self._build_kv_prefetch_descriptor(
+            layer_name=layer_name,
+            cpu_block_table=cpu_block_table,
+            cpu_seq_lens=cpu_seq_lens,
+            group_plan=group_plan,
+        )
+
         metadata = CotsHeadSplitAttentionMetadata(
             cpu_key_cache=self._key_caches[layer_name],
             cpu_value_cache=self._value_caches[layer_name],
@@ -449,11 +527,14 @@ class CotsHeadSplitKVStore:
             cpu_query_heads=self.cpu_query_heads,
             is_decode=is_decode,
             num_actual_tokens=num_actual_tokens,
+            layer_idx=self.layer_index(layer_name),
+            **group_plan,
             query_cpu=query_cpu,
             output_cpu=output_cpu,
             output_lse_cpu=output_lse_cpu,
             prefill_query_to_seq_cpu=prefill_query_to_seq,
             prefill_seq_lens_cpu=prefill_seq_lens,
+            kv_prefetch=kv_prefetch,
         )
         if _COTS_COUNTERS_ENABLED:
             _counter("head_split_metadata_common_tokens", num_actual_tokens)
@@ -462,6 +543,162 @@ class CotsHeadSplitKVStore:
             _counter("head_split_metadata_common_prefill_calls", 0 if is_decode else 1)
         _timing("head_split_metadata_common", timer_start)
         return metadata
+
+    def _default_kv_group_plan(self) -> tuple[int, int]:
+        return self.cpu_kv_heads, 0
+
+    def _kv_group_plan_for_tokens(self, num_actual_tokens: int) -> tuple[int, int]:
+        if not self.kv_head_prefetch_enabled:
+            return self._default_kv_group_plan()
+        for bucket in sorted(self.kv_group_plan_by_bucket):
+            if int(num_actual_tokens) <= int(bucket):
+                return self.kv_group_plan_by_bucket[bucket]
+        return self.kv_group_plan_by_bucket[max(self.kv_group_plan_by_bucket)]
+
+    def _metadata_group_plan_kwargs(self, num_actual_tokens: int) -> dict[str, int]:
+        cpu_compute_kv_heads, prefetch_kv_heads = self._kv_group_plan_for_tokens(
+            num_actual_tokens
+        )
+        if int(cpu_compute_kv_heads) + int(prefetch_kv_heads) != self.cpu_kv_heads:
+            raise RuntimeError(
+                "COTS head-split KV group plan must cover all CPU-owned "
+                f"KV heads: C={cpu_compute_kv_heads}, P={prefetch_kv_heads}, "
+                f"A={self.cpu_kv_heads}"
+            )
+        prefetch_query_heads = prefetch_kv_heads * self.q_heads_per_kv
+        cpu_compute_query_heads = cpu_compute_kv_heads * self.q_heads_per_kv
+        return {
+            "prefetch_kv_heads": prefetch_kv_heads,
+            "cpu_compute_kv_heads": cpu_compute_kv_heads,
+            "prefetch_query_start": self.cpu_query_start,
+            "prefetch_query_heads": prefetch_query_heads,
+            "cpu_compute_query_start": self.cpu_query_start + prefetch_query_heads,
+            "cpu_compute_query_heads": cpu_compute_query_heads,
+            "prefetch_cpu_kv_start": 0,
+            "cpu_compute_cpu_kv_start": prefetch_kv_heads,
+        }
+
+    def _active_block_ids(
+        self,
+        *,
+        cpu_block_table: torch.Tensor,
+        cpu_seq_lens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        timer_start = _timer_start()
+        num_reqs = int(cpu_seq_lens.shape[0])
+        max_blocks = int(cpu_block_table.shape[1])
+        blocks_per_req = torch.div(
+            cpu_seq_lens.to(dtype=torch.long) + self.block_size - 1,
+            self.block_size,
+            rounding_mode="floor",
+        )
+        max_needed = int(blocks_per_req.max().item()) if num_reqs > 0 else 0
+        if max_needed > max_blocks:
+            raise RuntimeError(
+                "COTS head-split KV prefetch descriptor exceeds block table "
+                f"width: needed={max_needed}, available={max_blocks}"
+            )
+
+        if num_reqs <= self._max_num_reqs and max_blocks <= self.max_blocks_per_req:
+            active_mask = self._prefetch_active_mask[:num_reqs, :max_blocks]
+        else:
+            active_mask = torch.empty(
+                (num_reqs, max_blocks), dtype=torch.bool, device="cpu"
+            )
+        active_mask.copy_(
+            self._prefetch_block_positions[:max_blocks].unsqueeze(0)
+            < blocks_per_req.unsqueeze(1)
+        )
+        active = cpu_block_table[:num_reqs, :max_blocks][active_mask]
+        if active.numel() == 0:
+            _timing("head_split_kv_prefetch_active_blocks", timer_start)
+            return (
+                self._prefetch_source_block_ids[:0],
+                self._prefetch_destination_block_ids[:0],
+                active_mask,
+            )
+
+        unique_blocks = torch.unique(active.to(dtype=torch.int32), sorted=True)
+        num_active = int(unique_blocks.numel())
+        if num_active > self.kv_prefetch_max_active_blocks:
+            raise RuntimeError(
+                "COTS head-split KV prefetch active block set exceeds workload "
+                "contract: "
+                f"active_blocks={num_active}, "
+                f"max_active_blocks={self.kv_prefetch_max_active_blocks}"
+            )
+        source_block_ids = self._prefetch_source_block_ids[:num_active]
+        source_block_ids.copy_(unique_blocks)
+        destination_block_ids = self._prefetch_destination_block_ids[:num_active]
+        if _COTS_COUNTERS_ENABLED:
+            _counter("head_split_kv_prefetch_active_blocks", num_active)
+        _timing("head_split_kv_prefetch_active_blocks", timer_start)
+        return source_block_ids, destination_block_ids, active_mask
+
+    def _build_kv_prefetch_descriptor(
+        self,
+        *,
+        layer_name: str,
+        cpu_block_table: torch.Tensor,
+        cpu_seq_lens: torch.Tensor,
+        group_plan: dict[str, int],
+    ) -> CotsHeadSplitKVPrefetchDescriptor | None:
+        prefetch_kv_heads = int(group_plan["prefetch_kv_heads"])
+        if not self.kv_head_prefetch_enabled or prefetch_kv_heads <= 0:
+            return None
+
+        timer_start = _timer_start()
+        num_reqs = int(cpu_seq_lens.shape[0])
+        max_blocks = int(cpu_block_table.shape[1])
+        source_block_ids, destination_block_ids, active_mask = self._active_block_ids(
+            cpu_block_table=cpu_block_table,
+            cpu_seq_lens=cpu_seq_lens,
+        )
+        num_active = int(source_block_ids.shape[0])
+        if num_reqs <= self._max_num_reqs and max_blocks <= self.max_blocks_per_req:
+            compact_block_table = self._prefetch_compact_block_table[
+                :num_reqs, :max_blocks
+            ]
+        else:
+            compact_block_table = torch.empty(
+                (num_reqs, max_blocks), dtype=torch.int32, device="cpu"
+            )
+        compact_block_table.fill_(0)
+        if num_active > 0:
+            source_long = source_block_ids.to(dtype=torch.long)
+            table_long = cpu_block_table[:num_reqs, :max_blocks].to(dtype=torch.long)
+            compact_all = torch.searchsorted(source_long, table_long)
+            compact_block_table[active_mask] = compact_all[active_mask].to(
+                dtype=torch.int32
+            )
+
+        descriptor = CotsHeadSplitKVPrefetchDescriptor(
+            source_key_cache=self._key_caches[layer_name],
+            source_value_cache=self._value_caches[layer_name],
+            source_block_ids=source_block_ids,
+            destination_block_ids=destination_block_ids,
+            compact_block_table=compact_block_table,
+            layer_idx=self.layer_index(layer_name),
+            num_active_blocks=num_active,
+            max_active_blocks=self.kv_prefetch_max_active_blocks,
+            block_size=self.block_size,
+            prefetch_cpu_kv_start=int(group_plan["prefetch_cpu_kv_start"]),
+            prefetch_kv_heads=prefetch_kv_heads,
+        )
+        if _COTS_COUNTERS_ENABLED:
+            element_bytes = int(torch.empty((), dtype=self.dtype).element_size())
+            prefetch_bytes = (
+                num_active
+                * self.block_size
+                * prefetch_kv_heads
+                * self.head_size
+                * 2
+                * element_bytes
+            )
+            _counter("head_split_kv_prefetch_descriptor_blocks", num_active)
+            _counter("head_split_kv_prefetch_descriptor_bytes", prefetch_bytes)
+        _timing("head_split_kv_prefetch_descriptor", timer_start)
+        return descriptor
 
     def build_metadata_from_common(
         self,
@@ -491,11 +728,30 @@ class CotsHeadSplitKVStore:
             cpu_query_heads=self.cpu_query_heads,
             is_decode=common_metadata.is_decode,
             num_actual_tokens=common_metadata.num_actual_tokens,
+            layer_idx=self.layer_index(layer_name),
+            prefetch_kv_heads=common_metadata.prefetch_kv_heads,
+            cpu_compute_kv_heads=common_metadata.cpu_compute_kv_heads,
+            prefetch_query_start=common_metadata.prefetch_query_start,
+            prefetch_query_heads=common_metadata.prefetch_query_heads,
+            cpu_compute_query_start=common_metadata.cpu_compute_query_start,
+            cpu_compute_query_heads=common_metadata.cpu_compute_query_heads,
+            prefetch_cpu_kv_start=common_metadata.prefetch_cpu_kv_start,
+            cpu_compute_cpu_kv_start=common_metadata.cpu_compute_cpu_kv_start,
             query_cpu=query_cpu,
             output_cpu=output_cpu,
             output_lse_cpu=output_lse_cpu,
             prefill_query_to_seq_cpu=common_metadata.prefill_query_to_seq_cpu,
             prefill_seq_lens_cpu=common_metadata.prefill_seq_lens_cpu,
+            kv_prefetch=(
+                None
+                if common_metadata.kv_prefetch is None
+                else replace(
+                    common_metadata.kv_prefetch,
+                    layer_idx=self.layer_index(layer_name),
+                    source_key_cache=self._key_caches[layer_name],
+                    source_value_cache=self._value_caches[layer_name],
+                )
+            ),
         )
         if _COTS_COUNTERS_ENABLED:
             _counter("head_split_metadata_layer_tokens", metadata.num_actual_tokens)

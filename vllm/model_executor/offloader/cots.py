@@ -34,7 +34,8 @@ from vllm.model_executor.offloader.cots_storage import (
     WO_INPUT_ROLE,
     WO_ROLE,
     CotsLinearHandle,
-    CotsPrefetchBufferPool,
+    KVPrefetchBufferPool,
+    WeightPrefetchBufferPool,
     WeightPrefetchStreamer,
 )
 from vllm.model_executor.offloader.cots_utils import (
@@ -51,7 +52,8 @@ from vllm.model_executor.offloader.cots_utils import (
 __all__ = [
     "CotsOffloader",
     "CotsLinearHandle",
-    "CotsPrefetchBufferPool",
+    "KVPrefetchBufferPool",
+    "WeightPrefetchBufferPool",
     "WeightPrefetchStreamer",
     "OUTPUT_SPLIT_AXIS",
     "INPUT_SPLIT_AXIS",

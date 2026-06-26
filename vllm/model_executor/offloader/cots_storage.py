@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 import torch.nn as nn
@@ -205,7 +205,7 @@ class CotsLinearHandle:
         # Decoder-layer index. Set by the offloader after `_build_handles`.
         # Phase 1b uses it for prefetch slot rotation (`layer_idx % K`).
         self.layer_idx: int = -1
-        # Prefetch slot index = `layer_idx % CotsPrefetchBufferPool.K`. Set
+        # Prefetch slot index = `layer_idx % WeightPrefetchBufferPool.K`. Set
         # by the offloader when constructing the buffer pool.
         self.slot_idx: int = -1
         # Per-bucket prefetch geometry — populated by
@@ -929,7 +929,7 @@ class CotsLinearHandle:
 
 
 # ---------------------------------------------------------------------------
-# Execution layer: CotsPrefetchBufferPool
+# Execution layer: WeightPrefetchBufferPool
 #
 # Layer-ahead weight-prefetch destination. Allocates K=2 GPU slot views per
 # offloaded handle so prefetch for layer i+1 can overlap with layer i's
@@ -943,7 +943,7 @@ class CotsLinearHandle:
 # Sized to the full CPU-stored slice (`max_n_prefetch == n_cpu`);
 # per-forward H2D narrows to the active bucket's `n_prefetch_by_bucket[b]`.
 # ---------------------------------------------------------------------------
-class CotsPrefetchBufferPool:
+class WeightPrefetchBufferPool:
     """K=2 slot rotation. K slots PER UNIQUE shape, SHARED across layers.
 
     Mirrors `prefetch.py`'s `StaticBufferPool`: at G=1 (every layer
@@ -1020,6 +1020,149 @@ class CotsPrefetchBufferPool:
 
 
 # ---------------------------------------------------------------------------
+# Execution layer: KVPrefetchBufferPool
+#
+# K=2 GPU slot rotation for experimental 3-way head-split KV prefetch. This is
+# deliberately a sibling of the weight buffer pool rather than a reuse of it:
+# weight slots are per-linear 2-D slices, while KV prefetch needs a FlashAttention
+# KV-cache shaped staging area.
+# ---------------------------------------------------------------------------
+class KVPrefetchBufferPool:
+    """K=2 reusable GPU slots for prefetched KV heads.
+
+    The slot layout is a compact paged-KV staging workspace:
+    ``(2, max_active_blocks, block_size, max_prefetch_kv_heads, head_dim)``
+    where dimension 0 selects K/V. ``max_active_blocks`` is the maximum number
+    of logical KV blocks a single forward may touch after compact remapping,
+    not the global GPU KV-cache block count. The pool owns only the reusable
+    staging buffers and slot ownership metadata; the streamer will later issue
+    H2D copies into these slots once the KV store provides concrete cache
+    geometry.
+    """
+
+    K = WeightPrefetchBufferPool.K
+
+    def __init__(
+        self,
+        *,
+        n_layers: int,
+        max_active_blocks: int,
+        max_num_reqs: int,
+        max_blocks_per_req: int,
+        block_size: int,
+        max_prefetch_kv_heads: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        self.n_layers = int(n_layers)
+        self.max_active_blocks = int(max_active_blocks)
+        self.max_num_reqs = int(max_num_reqs)
+        self.max_blocks_per_req = int(max_blocks_per_req)
+        self.block_size = int(block_size)
+        self.max_prefetch_kv_heads = int(max_prefetch_kv_heads)
+        self.head_dim = int(head_dim)
+        self.dtype = dtype
+        self.device = device
+        self.total_bytes = 0
+        self._buffer: torch.Tensor | None = None
+        self._block_table_buffer: torch.Tensor | None = None
+        self.slots: list[torch.Tensor] = []
+        self.compact_block_table_slots: list[torch.Tensor] = []
+        self.owner_layer_in_slot: list[int | None] = []
+        self.available_heads_in_slot: list[int] = []
+        self.available_blocks_in_slot: list[int] = []
+        self.available_block_table_shape_in_slot: list[tuple[int, int]] = []
+
+        for name, value in (
+            ("n_layers", self.n_layers),
+            ("max_active_blocks", self.max_active_blocks),
+            ("max_num_reqs", self.max_num_reqs),
+            ("max_blocks_per_req", self.max_blocks_per_req),
+            ("block_size", self.block_size),
+            ("max_prefetch_kv_heads", self.max_prefetch_kv_heads),
+            ("head_dim", self.head_dim),
+        ):
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative, got {value}")
+
+        if (
+            self.n_layers == 0
+            or self.max_active_blocks == 0
+            or self.max_num_reqs == 0
+            or self.max_blocks_per_req == 0
+            or self.block_size == 0
+            or self.max_prefetch_kv_heads == 0
+            or self.head_dim == 0
+        ):
+            return
+
+        slot_shape = (
+            2,
+            self.max_active_blocks,
+            self.block_size,
+            self.max_prefetch_kv_heads,
+            self.head_dim,
+        )
+        slot_numel = 1
+        for dim in slot_shape:
+            slot_numel *= int(dim)
+
+        self._buffer = torch.empty(
+            self.K * slot_numel,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self._block_table_buffer = torch.empty(
+            self.K * self.max_num_reqs * self.max_blocks_per_req,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.total_bytes = (
+            self._buffer.numel() * self._buffer.element_size()
+            + self._block_table_buffer.numel() * self._block_table_buffer.element_size()
+        )
+
+        offset = 0
+        for _ in range(self.K):
+            slot = self._buffer[offset : offset + slot_numel].view(*slot_shape)
+            self.slots.append(slot)
+            offset += slot_numel
+        table_numel = self.max_num_reqs * self.max_blocks_per_req
+        table_offset = 0
+        for _ in range(self.K):
+            table_slot = self._block_table_buffer[
+                table_offset : table_offset + table_numel
+            ].view(self.max_num_reqs, self.max_blocks_per_req)
+            self.compact_block_table_slots.append(table_slot)
+            table_offset += table_numel
+        self.owner_layer_in_slot = [None] * self.K
+        self.available_heads_in_slot = [0] * self.K
+        self.available_blocks_in_slot = [0] * self.K
+        self.available_block_table_shape_in_slot = [(0, 0)] * self.K
+
+    def has_buffers(self) -> bool:
+        return bool(self.slots)
+
+    def slot_idx_for_layer(self, layer_idx: int) -> int:
+        return int(layer_idx) % self.K
+
+    def slot_for_layer(self, layer_idx: int) -> torch.Tensor:
+        if not self.slots:
+            raise RuntimeError("KVPrefetchBufferPool has no allocated slots")
+        return self.slots[self.slot_idx_for_layer(layer_idx)]
+
+    def key_value_slots(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        slot = self.slot_for_layer(layer_idx)
+        return slot[0], slot[1]
+
+    def compact_block_table_slot(self, layer_idx: int) -> torch.Tensor:
+        if not self.compact_block_table_slots:
+            raise RuntimeError("KVPrefetchBufferPool has no block-table slots")
+        return self.compact_block_table_slots[self.slot_idx_for_layer(layer_idx)]
+
+
+# ---------------------------------------------------------------------------
 # Execution layer: WeightPrefetchStreamer
 #
 # Layer-ahead H2D streamer. Owns the copy stream, per-layer copy-done events,
@@ -1058,7 +1201,7 @@ class WeightPrefetchStreamer:
         # pre-hook. Read by `start` to size the bucket-specific H2D.
         self.current_bucket: int = 0
         # Owned externally; offloader sets after constructing the pool.
-        self.buffer_pool: CotsPrefetchBufferPool | None = None
+        self.buffer_pool: WeightPrefetchBufferPool | None = None
 
     def set_current_bucket(
         self, num_tokens: int, bucket_for: Callable[[int], int]
@@ -1261,6 +1404,449 @@ class WeightPrefetchStreamer:
         """Join any layers whose prefetch was started under capture but not
         yet waited — port of `prefetch.py:345-364`. Handles full and
         piecewise CUDA-graph modes."""
+        for i, in_capture in enumerate(self._prefetch_in_capture):
+            if in_capture:
+                torch.cuda.current_stream().wait_event(self._copy_done_events[i])
+                self._prefetch_in_capture[i] = False
+
+
+class KVPrefetchStreamer:
+    """Layer-ahead H2D streamer for experimental 3-way head-split KV prefetch."""
+
+    def __init__(
+        self,
+        n_layers: int,
+        buffer_pool: KVPrefetchBufferPool | None = None,
+    ) -> None:
+        self.n_layers = int(n_layers)
+        self.buffer_pool = buffer_pool
+        self.current_bucket: int = 0
+        self.copy_stream = torch.cuda.Stream()
+        self.writeback_stream = torch.cuda.Stream()
+        self._copy_done_events: list[torch.cuda.Event] = [
+            torch.cuda.Event() for _ in range(self.n_layers)
+        ]
+        self._writeback_done_events: list[torch.cuda.Event] = [
+            torch.cuda.Event() for _ in range(KVPrefetchBufferPool.K)
+        ]
+        self._writeback_pending: list[bool] = [False] * KVPrefetchBufferPool.K
+        self._writeback_owner_layer: list[int | None] = [None] * KVPrefetchBufferPool.K
+        self._event_valid_for_eager: list[bool] = [False] * self.n_layers
+        self._prefetch_in_capture: list[bool] = [False] * self.n_layers
+        self._descriptors: list[Any | None] = [None] * self.n_layers
+        self._layer0_ready_for_forward = False
+
+    def set_current_bucket(
+        self, num_tokens: int, bucket_for: Callable[[int], int]
+    ) -> None:
+        self.current_bucket = bucket_for(num_tokens)
+
+    def has_buffers(self) -> bool:
+        return bool(self.buffer_pool is not None and self.buffer_pool.has_buffers())
+
+    def has_layer_prefetch(self, layer_idx: int) -> bool:
+        return 0 <= int(layer_idx) < self.n_layers
+
+    def publish_descriptor(self, layer_idx: int, descriptor: Any | None) -> None:
+        layer_idx = int(layer_idx)
+        if not 0 <= layer_idx < self.n_layers:
+            raise IndexError(
+                "KVPrefetchStreamer descriptor layer index out of range: "
+                f"{layer_idx} not in [0, {self.n_layers})"
+            )
+        self._descriptors[layer_idx] = descriptor
+        if layer_idx == 0:
+            self._layer0_ready_for_forward = False
+
+    def prepare_for_forward_bucket(self, layer_idx: int) -> None:
+        layer_idx = int(layer_idx)
+        if layer_idx != 0:
+            self.start(layer_idx)
+            return
+        self._layer0_ready_for_forward = False
+        self.start(0)
+
+    def _wait_for_slot_reuse(self, slot_idx: int) -> bool:
+        return self.wait_for_slot_writeback(slot_idx)
+
+    def wait_for_slot_writeback(self, slot_idx: int) -> bool:
+        slot_idx = int(slot_idx)
+        if not 0 <= slot_idx < KVPrefetchBufferPool.K:
+            return False
+        if not self._writeback_pending[slot_idx]:
+            return False
+
+        timer_start = 0
+        from vllm.utils.cots_diag import COUNTERS_ENABLED as _COTS_COUNTERS_ENABLED
+
+        if _COTS_COUNTERS_ENABLED:
+            import time
+
+            timer_start = time.perf_counter_ns()
+
+        self._writeback_done_events[slot_idx].synchronize()
+        self._writeback_pending[slot_idx] = False
+        self._writeback_owner_layer[slot_idx] = None
+        if _COTS_COUNTERS_ENABLED:
+            import time
+
+            from vllm.model_executor.offloader import cots_ops
+
+            cots_ops.add_python_timing(
+                "head_split_kv_prefetch_writeback_wait",
+                time.perf_counter_ns() - timer_start,
+            )
+        return True
+
+    def wait_for_layer_writeback(self, layer_idx: int) -> bool:
+        layer_idx = int(layer_idx)
+        if self.buffer_pool is None:
+            slot_idx = layer_idx % KVPrefetchBufferPool.K
+        else:
+            slot_idx = self.buffer_pool.slot_idx_for_layer(layer_idx)
+        if self._writeback_owner_layer[slot_idx] != layer_idx:
+            return False
+        return self.wait_for_slot_writeback(slot_idx)
+
+    def start(self, layer_idx: int) -> None:
+        layer_idx = int(layer_idx)
+        if not 0 <= layer_idx < self.n_layers:
+            return
+        if layer_idx == 0 and self._layer0_ready_for_forward:
+            # Weight prefetch can wrap from the last layer to layer 0 because
+            # weights are static. KV descriptors are per-forward, so the
+            # end-of-forward wraparound would only recopy stale current-step KV.
+            return
+        descriptor = self._descriptors[layer_idx]
+        if (
+            descriptor is None
+            or self.buffer_pool is None
+            or not self.buffer_pool.has_buffers()
+            or int(descriptor.num_active_blocks) <= 0
+            or int(descriptor.prefetch_kv_heads) <= 0
+        ):
+            self._event_valid_for_eager[layer_idx] = False
+            self._prefetch_in_capture[layer_idx] = False
+            if layer_idx == 0:
+                self._layer0_ready_for_forward = True
+            return
+
+        pool = self.buffer_pool
+        slot_idx = pool.slot_idx_for_layer(layer_idx)
+        self._wait_for_slot_reuse(slot_idx)
+        num_active = int(descriptor.num_active_blocks)
+        prefetch_heads = int(descriptor.prefetch_kv_heads)
+        if num_active > pool.max_active_blocks:
+            raise RuntimeError(
+                "COTS KV prefetch descriptor exceeds buffer active-block "
+                f"capacity: active={num_active}, max={pool.max_active_blocks}"
+            )
+        if prefetch_heads > pool.max_prefetch_kv_heads:
+            raise RuntimeError(
+                "COTS KV prefetch descriptor exceeds buffer head capacity: "
+                f"P={prefetch_heads}, max={pool.max_prefetch_kv_heads}"
+            )
+        if int(descriptor.block_size) != pool.block_size:
+            raise RuntimeError(
+                "COTS KV prefetch descriptor block size mismatch: "
+                f"descriptor={descriptor.block_size}, buffer={pool.block_size}"
+            )
+        block_table = descriptor.compact_block_table
+        if block_table.device.type != "cpu":
+            raise RuntimeError(
+                "COTS KV prefetch descriptor compact block table must be CPU, "
+                f"got {block_table.device}"
+            )
+        table_rows = int(block_table.shape[0])
+        table_cols = int(block_table.shape[1])
+        if table_rows > pool.max_num_reqs or table_cols > pool.max_blocks_per_req:
+            raise RuntimeError(
+                "COTS KV prefetch compact block table exceeds buffer "
+                "capacity: "
+                f"table={tuple(block_table.shape)}, "
+                f"max={(pool.max_num_reqs, pool.max_blocks_per_req)}"
+            )
+
+        in_capture = torch.cuda.is_current_stream_capturing()
+        self._prefetch_in_capture[layer_idx] = in_capture
+        fork_event = torch.cuda.Event()
+        torch.cuda.current_stream().record_event(fork_event)
+        self.copy_stream.wait_event(fork_event)
+
+        with torch.cuda.stream(self.copy_stream):
+            key_dst, value_dst = pool.key_value_slots(layer_idx)
+            ids = descriptor.source_block_ids[:num_active].to(dtype=torch.long)
+            head_start = int(descriptor.prefetch_cpu_kv_start)
+            head_end = head_start + prefetch_heads
+            key_src = descriptor.source_key_cache.index_select(0, ids)
+            value_src = descriptor.source_value_cache.index_select(0, ids)
+            key_src = key_src[:, head_start:head_end, :, :]
+            value_src = value_src[:, head_start:head_end, :, :]
+            key_src = key_src.permute(0, 2, 1, 3).contiguous()
+            value_src = value_src.permute(0, 2, 1, 3).contiguous()
+            key_dst[:num_active, :, :prefetch_heads, :].copy_(
+                key_src, non_blocking=True
+            )
+            value_dst[:num_active, :, :prefetch_heads, :].copy_(
+                value_src, non_blocking=True
+            )
+            table_dst = pool.compact_block_table_slot(layer_idx)
+            table_dst[:table_rows, :table_cols].copy_(block_table, non_blocking=True)
+            pool.owner_layer_in_slot[slot_idx] = layer_idx
+            pool.available_heads_in_slot[slot_idx] = prefetch_heads
+            pool.available_blocks_in_slot[slot_idx] = num_active
+            pool.available_block_table_shape_in_slot[slot_idx] = (
+                table_rows,
+                table_cols,
+            )
+
+        self._copy_done_events[layer_idx].record(self.copy_stream)
+        self._event_valid_for_eager[layer_idx] = not in_capture
+        if layer_idx == 0:
+            self._layer0_ready_for_forward = True
+
+        from vllm.utils.cots_diag import COUNTERS_ENABLED as _COTS_COUNTERS_ENABLED
+
+        if _COTS_COUNTERS_ENABLED:
+            from vllm.model_executor.offloader import cots_ops
+
+            element_bytes = int(torch.empty((), dtype=pool.dtype).element_size())
+            staged_bytes = (
+                num_active
+                * pool.block_size
+                * prefetch_heads
+                * pool.head_dim
+                * 2
+                * element_bytes
+            )
+            cots_ops.add_python_counter("head_split_kv_prefetch_h2d_blocks", num_active)
+            cots_ops.add_python_counter(
+                "head_split_kv_prefetch_h2d_heads", prefetch_heads
+            )
+            cots_ops.add_python_counter(
+                "head_split_kv_prefetch_h2d_bytes", staged_bytes
+            )
+
+    def attention_inputs(
+        self,
+        *,
+        layer_idx: int,
+        descriptor: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        layer_idx = int(layer_idx)
+        if (
+            self.buffer_pool is None
+            or not self.buffer_pool.has_buffers()
+            or descriptor is None
+        ):
+            raise RuntimeError("COTS KV prefetch attention requested without buffer")
+        pool = self.buffer_pool
+        if layer_idx != int(descriptor.layer_idx):
+            raise RuntimeError(
+                "COTS KV prefetch attention layer mismatch: "
+                f"layer_idx={layer_idx}, descriptor={descriptor.layer_idx}"
+            )
+        slot_idx = pool.slot_idx_for_layer(layer_idx)
+        if pool.owner_layer_in_slot[slot_idx] != layer_idx:
+            raise RuntimeError(
+                "COTS KV prefetch attention requested before layer buffer "
+                f"was staged: layer={layer_idx}, owner="
+                f"{pool.owner_layer_in_slot[slot_idx]}"
+            )
+        num_active = int(descriptor.num_active_blocks)
+        prefetch_heads = int(descriptor.prefetch_kv_heads)
+        if num_active <= 0 or prefetch_heads <= 0:
+            raise RuntimeError(
+                "COTS KV prefetch attention requires non-empty P-head cache: "
+                f"blocks={num_active}, heads={prefetch_heads}"
+            )
+        if (
+            pool.available_blocks_in_slot[slot_idx] < num_active
+            or pool.available_heads_in_slot[slot_idx] < prefetch_heads
+        ):
+            raise RuntimeError(
+                "COTS KV prefetch attention requested more data than staged: "
+                f"staged_blocks={pool.available_blocks_in_slot[slot_idx]}, "
+                f"staged_heads={pool.available_heads_in_slot[slot_idx]}, "
+                f"requested_blocks={num_active}, requested_heads={prefetch_heads}"
+            )
+        table_rows, table_cols = pool.available_block_table_shape_in_slot[slot_idx]
+        expected_rows = int(descriptor.compact_block_table.shape[0])
+        expected_cols = int(descriptor.compact_block_table.shape[1])
+        if table_rows < expected_rows or table_cols < expected_cols:
+            raise RuntimeError(
+                "COTS KV prefetch compact block table was not staged for "
+                "the active descriptor"
+            )
+        key_slot, value_slot = pool.key_value_slots(layer_idx)
+        block_table = pool.compact_block_table_slot(layer_idx)
+        return (
+            key_slot[:num_active, :, :prefetch_heads, :],
+            value_slot[:num_active, :, :prefetch_heads, :],
+            block_table[:expected_rows, :expected_cols],
+        )
+
+    def patch_current_kv(
+        self,
+        *,
+        layer_idx: int,
+        descriptor: Any,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        cpu_slot_mapping: torch.Tensor,
+        gpu_kv_heads: int,
+        num_actual_tokens: int,
+    ) -> None:
+        layer_idx = int(layer_idx)
+        if (
+            self.buffer_pool is None
+            or not self.buffer_pool.has_buffers()
+            or descriptor is None
+            or int(descriptor.prefetch_kv_heads) <= 0
+            or int(descriptor.num_active_blocks) <= 0
+            or int(num_actual_tokens) <= 0
+        ):
+            return
+        pool = self.buffer_pool
+        if layer_idx != int(descriptor.layer_idx):
+            raise RuntimeError(
+                "COTS KV prefetch current patch layer mismatch: "
+                f"layer_idx={layer_idx}, descriptor={descriptor.layer_idx}"
+            )
+        if int(descriptor.block_size) != pool.block_size:
+            raise RuntimeError(
+                "COTS KV prefetch current patch block size mismatch: "
+                f"descriptor={descriptor.block_size}, buffer={pool.block_size}"
+            )
+        num_active = int(descriptor.num_active_blocks)
+        prefetch_heads = int(descriptor.prefetch_kv_heads)
+        if prefetch_heads > pool.max_prefetch_kv_heads:
+            raise RuntimeError(
+                "COTS KV prefetch current patch exceeds buffer head capacity: "
+                f"P={prefetch_heads}, max={pool.max_prefetch_kv_heads}"
+            )
+
+        slot_cpu = cpu_slot_mapping[: int(num_actual_tokens)]
+        if slot_cpu.device.type != "cpu":
+            raise RuntimeError(
+                "COTS KV prefetch current patch requires CPU slot mapping, "
+                f"got {slot_cpu.device}"
+            )
+        valid = slot_cpu >= 0
+        if not bool(valid.any().item()):
+            return
+        slot_cpu = slot_cpu[valid].to(dtype=torch.long)
+        block_ids_cpu = torch.div(
+            slot_cpu, pool.block_size, rounding_mode="floor"
+        ).contiguous()
+        offsets_cpu = torch.remainder(slot_cpu, pool.block_size).contiguous()
+        source_ids_cpu = descriptor.source_block_ids[:num_active].to(dtype=torch.long)
+        compact_cpu = torch.searchsorted(source_ids_cpu, block_ids_cpu)
+        compact_for_check = compact_cpu.clamp(max=max(0, num_active - 1))
+        if not bool(
+            (
+                (compact_cpu >= 0)
+                & (compact_cpu < num_active)
+                & (source_ids_cpu[compact_for_check] == block_ids_cpu)
+            )
+            .all()
+            .item()
+        ):
+            raise RuntimeError(
+                "COTS KV prefetch current patch found a current-token block "
+                "outside the compact active block set"
+            )
+
+        valid_gpu = valid.to(device=key.device, non_blocking=True)
+        compact_gpu = compact_cpu.to(device=key.device, non_blocking=True)
+        offsets_gpu = offsets_cpu.to(device=key.device, non_blocking=True)
+        head_start = int(gpu_kv_heads) + int(descriptor.prefetch_cpu_kv_start)
+        head_end = head_start + prefetch_heads
+        key_src = key[: int(num_actual_tokens), head_start:head_end, :][valid_gpu]
+        value_src = value[: int(num_actual_tokens), head_start:head_end, :][valid_gpu]
+        key_dst, value_dst = pool.key_value_slots(layer_idx)
+        slot_idx = pool.slot_idx_for_layer(layer_idx)
+        if self._writeback_pending[slot_idx]:
+            self.wait_for_slot_writeback(slot_idx)
+        flat_indices = compact_gpu * pool.block_size + offsets_gpu
+        key_dst.view(-1, pool.max_prefetch_kv_heads, pool.head_dim).narrow(
+            1, 0, prefetch_heads
+        ).index_copy_(0, flat_indices, key_src)
+        value_dst.view(-1, pool.max_prefetch_kv_heads, pool.head_dim).narrow(
+            1, 0, prefetch_heads
+        ).index_copy_(0, flat_indices, value_src)
+
+        fork_event = torch.cuda.Event()
+        torch.cuda.current_stream(key.device).record_event(fork_event)
+        self.writeback_stream.wait_event(fork_event)
+        block_ids = block_ids_cpu.tolist()
+        offsets = offsets_cpu.tolist()
+        cache_head_start = int(descriptor.prefetch_cpu_kv_start)
+        with torch.cuda.stream(self.writeback_stream):
+            for row_idx, (block_id, block_offset) in enumerate(zip(block_ids, offsets)):
+                compact_idx = int(compact_cpu[row_idx].item())
+                src_key = key_dst[compact_idx, int(block_offset), :prefetch_heads, :]
+                src_value = value_dst[
+                    compact_idx, int(block_offset), :prefetch_heads, :
+                ]
+                dst_key = descriptor.source_key_cache[
+                    int(block_id),
+                    cache_head_start : cache_head_start + prefetch_heads,
+                    int(block_offset),
+                    :,
+                ]
+                dst_value = descriptor.source_value_cache[
+                    int(block_id),
+                    cache_head_start : cache_head_start + prefetch_heads,
+                    int(block_offset),
+                    :,
+                ]
+                dst_key.copy_(src_key, non_blocking=True)
+                dst_value.copy_(src_value, non_blocking=True)
+        self._writeback_done_events[slot_idx].record(self.writeback_stream)
+        self._writeback_pending[slot_idx] = True
+        self._writeback_owner_layer[slot_idx] = layer_idx
+
+        from vllm.utils.cots_diag import COUNTERS_ENABLED as _COTS_COUNTERS_ENABLED
+
+        if _COTS_COUNTERS_ENABLED:
+            from vllm.model_executor.offloader import cots_ops
+
+            rows = int(slot_cpu.shape[0])
+            element_bytes = int(torch.empty((), dtype=pool.dtype).element_size())
+            patch_bytes = rows * prefetch_heads * pool.head_dim * 2 * element_bytes
+            cots_ops.add_python_counter(
+                "head_split_kv_prefetch_current_patch_rows", rows
+            )
+            cots_ops.add_python_counter(
+                "head_split_kv_prefetch_current_patch_bytes", patch_bytes
+            )
+            cots_ops.add_python_counter("head_split_kv_prefetch_writeback_rows", rows)
+            cots_ops.add_python_counter(
+                "head_split_kv_prefetch_writeback_d2h_bytes", patch_bytes
+            )
+
+    def wait(self, layer_idx: int) -> None:
+        layer_idx = int(layer_idx)
+        if not 0 <= layer_idx < self.n_layers:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            if not self._prefetch_in_capture[layer_idx]:
+                return
+            torch.cuda.current_stream().wait_event(self._copy_done_events[layer_idx])
+            self._prefetch_in_capture[layer_idx] = False
+        else:
+            if self._event_valid_for_eager[layer_idx]:
+                torch.cuda.current_stream().wait_event(
+                    self._copy_done_events[layer_idx]
+                )
+            else:
+                torch.cuda.current_stream().wait_stream(self.copy_stream)
+
+    def sync_prev_onload(self) -> None:
+        torch.cuda.current_stream().wait_stream(self.copy_stream)
+
+    def join_after_forward(self) -> None:
         for i, in_capture in enumerate(self._prefetch_in_capture):
             if in_capture:
                 torch.cuda.current_stream().wait_event(self._copy_done_events[i])
