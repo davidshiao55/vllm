@@ -23,6 +23,7 @@ from vllm.model_executor.offloader.cots_storage import (  # noqa: E402
     WO_INPUT_ROLE,
 )
 from vllm.v1.attention.backends.cots_head_split_attention import (  # noqa: E402
+    CotsHeadSplitAttentionMetadata,
     cots_head_split_decode_attention,
     cots_head_split_kv_cache_update,
     cots_head_split_prefill_attention,
@@ -300,35 +301,89 @@ def test_cots_head_split_cpu_rope_uses_published_cpu_positions() -> None:
     )
 
 
+def test_cots_head_split_qkv_route_uses_live_rows_for_padded_capacity() -> None:
+    offloader = CotsOffloader(
+        CotsOffloadConfig(kv_mode="head_split", f_cpu_kv_store=0.25)
+    )
+    handle = _make_qkv_route_handle(cpu_weight_groups=1)
+    num_tokens_capacity = 4
+    num_live_tokens = 1
+    qkv_group = handle.gqa_qkv_group_size
+    offloader.set_live_num_tokens(num_live_tokens)
+
+    out_perm = torch.zeros(
+        (num_tokens_capacity, handle.gpu_indices_cuda.numel()),
+        dtype=torch.bfloat16,
+    )
+    out_cpu = torch.arange(qkv_group, dtype=torch.bfloat16).view(
+        num_live_tokens, qkv_group
+    )
+
+    qkv_out = offloader.route_head_split_qkv_output(
+        handle=handle,
+        bucket=num_tokens_capacity,
+        num_tokens=num_tokens_capacity,
+        reference=out_perm,
+        out_perm=out_perm,
+        out_pref=None,
+        out_cpu=out_cpu,
+        pref_idx=torch.empty(0, dtype=torch.long),
+        bias=None,
+    )
+    sidecar = offloader.lookup_head_split_qkv_sidecar(qkv_out)
+    assert sidecar is not None
+    assert qkv_out.shape == (num_tokens_capacity, handle.out_dim)
+    assert sidecar.num_live_tokens == num_live_tokens
+    assert sidecar.query.shape[0] == num_live_tokens
+    assert torch.equal(
+        sidecar.query.reshape(num_live_tokens, handle.gqa_q_group_size),
+        out_cpu[:, : handle.gqa_q_group_size],
+    )
+
+    offloader.set_head_split_cpu_positions(torch.tensor([0]), num_live_tokens)
+    offloader.maybe_apply_head_split_cpu_rope(
+        positions=torch.empty(num_tokens_capacity, dtype=torch.long, device="meta"),
+        query=qkv_out,
+        key=qkv_out,
+        head_size=handle.head_dim,
+        rotary_dim=handle.head_dim,
+        cos_sin_cache=torch.tensor([[1.0, 0.0]], dtype=torch.bfloat16),
+        is_neox_style=True,
+    )
+    assert sidecar.rope_applied
+
+
 def test_cots_head_split_wo_route_fills_preallocated_cpu_input() -> None:
     offloader = CotsOffloader(
         CotsOffloadConfig(kv_mode="head_split", f_cpu_kv_store=0.25)
     )
-    num_tokens = 1
+    num_tokens_capacity = 4
+    num_live_tokens = 1
     num_groups = 4
     q_heads_per_kv = 2
     head_dim = 2
     q_group = q_heads_per_kv * head_dim
     handle = _make_wo_route_handle(cpu_weight_groups=2)
-    x = torch.arange(num_tokens * num_groups * q_group, dtype=torch.bfloat16).view(
-        num_tokens, num_groups * q_group
-    )
+    x = torch.arange(
+        num_tokens_capacity * num_groups * q_group,
+        dtype=torch.bfloat16,
+    ).view(num_tokens_capacity, num_groups * q_group)
     output_cpu = torch.full(
-        (num_tokens, q_heads_per_kv, head_dim),
+        (num_live_tokens, q_heads_per_kv, head_dim),
         9.0,
         dtype=torch.bfloat16,
     )
     qkv_sidecar = CotsHeadSplitQKVSidecar(
         storage_key=123,
-        num_tokens=num_tokens,
+        num_live_tokens=num_live_tokens,
         num_groups=num_groups,
         cpu_attention_groups=1,
         cpu_weight_groups=2,
         q_heads_per_kv=q_heads_per_kv,
         head_dim=head_dim,
-        query=torch.empty(num_tokens, q_heads_per_kv, head_dim),
-        key=torch.empty(num_tokens, 1, head_dim),
-        value=torch.empty(num_tokens, 1, head_dim),
+        query=torch.empty(num_live_tokens, q_heads_per_kv, head_dim),
+        key=torch.empty(num_live_tokens, 1, head_dim),
+        value=torch.empty(num_live_tokens, 1, head_dim),
     )
     offloader.register_head_split_attention_output(
         output=x,
@@ -336,18 +391,32 @@ def test_cots_head_split_wo_route_fills_preallocated_cpu_input() -> None:
         output_cpu=output_cpu,
     )
 
-    dst = torch.empty(num_tokens, 2 * q_group, dtype=torch.bfloat16)
+    dst = torch.full(
+        (num_tokens_capacity, 2 * q_group),
+        -1.0,
+        dtype=torch.bfloat16,
+    )
     routed = offloader.build_head_split_wo_cpu_input(
         x=x,
         handle=handle,
         bucket=1,
-        num_tokens=num_tokens,
+        num_tokens=num_tokens_capacity,
         out=dst,
     )
 
     assert routed is dst
-    assert torch.equal(dst[:, :q_group], x[:, 2 * q_group : 3 * q_group])
-    assert torch.equal(dst[:, q_group:], output_cpu.reshape(num_tokens, q_group))
+    assert torch.equal(
+        dst[:num_live_tokens, :q_group],
+        x[:num_live_tokens, 2 * q_group : 3 * q_group],
+    )
+    assert torch.equal(
+        dst[:num_live_tokens, q_group:],
+        output_cpu.reshape(num_live_tokens, q_group),
+    )
+    assert torch.equal(
+        dst[num_live_tokens:],
+        torch.full_like(dst[num_live_tokens:], -1.0),
+    )
     assert offloader.lookup_head_split_attention_output(x) is None
 
 
@@ -407,6 +476,84 @@ def test_cots_head_split_a_zero_uses_gpu_attention_sidecar_for_wo() -> None:
     assert routed is dst
     assert torch.equal(dst, attn_out[:, 3 * q_group : 4 * q_group])
     assert offloader.lookup_head_split_attention_output(attn_out) is None
+
+
+def _make_cpu_kv_update_metadata(
+    *,
+    routed_key_cpu: torch.Tensor | None = None,
+    routed_value_cpu: torch.Tensor | None = None,
+) -> CotsHeadSplitAttentionMetadata:
+    return CotsHeadSplitAttentionMetadata(
+        cpu_key_cache=torch.zeros(2, 1, 4, 128, dtype=torch.bfloat16),
+        cpu_value_cache=torch.zeros(2, 1, 4, 128, dtype=torch.bfloat16),
+        cpu_block_table=torch.empty(1, 2, dtype=torch.int32),
+        cpu_slot_mapping=torch.tensor([0, -1, 5], dtype=torch.long),
+        cpu_seq_lens=torch.empty(1, dtype=torch.int32),
+        gpu_kv_heads=3,
+        cpu_kv_heads=1,
+        q_heads_per_kv=7,
+        cpu_query_start=21,
+        cpu_query_heads=7,
+        is_decode=False,
+        num_actual_tokens=3,
+        routed_key_cpu=routed_key_cpu,
+        routed_value_cpu=routed_value_cpu,
+    )
+
+
+def test_cots_head_split_kv_update_skips_invalid_cpu_slots() -> None:
+    metadata = _make_cpu_kv_update_metadata()
+    key = torch.zeros(3, 4, 128, dtype=torch.bfloat16)
+    value = torch.zeros_like(key)
+    key[0, 3, :].fill_(1.0)
+    key[1, 3, :].fill_(2.0)
+    key[2, 3, :].fill_(3.0)
+    value[0, 3, :].fill_(11.0)
+    value[1, 3, :].fill_(12.0)
+    value[2, 3, :].fill_(13.0)
+
+    cots_head_split_kv_cache_update(
+        key,
+        value,
+        torch.empty(3, dtype=torch.long, device="meta"),
+        metadata,
+    )
+
+    assert torch.equal(metadata.cpu_key_cache[0, 0, 0], key[0, 3])
+    assert torch.equal(metadata.cpu_key_cache[1, 0, 1], key[2, 3])
+    assert torch.equal(metadata.cpu_value_cache[0, 0, 0], value[0, 3])
+    assert torch.equal(metadata.cpu_value_cache[1, 0, 1], value[2, 3])
+    assert torch.count_nonzero(metadata.cpu_key_cache[0, 0, 1]) == 0
+    assert torch.count_nonzero(metadata.cpu_value_cache[0, 0, 1]) == 0
+
+
+def test_cots_head_split_kv_update_masks_routed_cpu_kv_sidecar() -> None:
+    routed_key_cpu = torch.zeros(3, 1, 128, dtype=torch.bfloat16)
+    routed_value_cpu = torch.zeros_like(routed_key_cpu)
+    routed_key_cpu[0, 0, :].fill_(21.0)
+    routed_key_cpu[1, 0, :].fill_(22.0)
+    routed_key_cpu[2, 0, :].fill_(23.0)
+    routed_value_cpu[0, 0, :].fill_(31.0)
+    routed_value_cpu[1, 0, :].fill_(32.0)
+    routed_value_cpu[2, 0, :].fill_(33.0)
+    metadata = _make_cpu_kv_update_metadata(
+        routed_key_cpu=routed_key_cpu,
+        routed_value_cpu=routed_value_cpu,
+    )
+
+    cots_head_split_kv_cache_update(
+        torch.empty(3, 4, 128, dtype=torch.bfloat16),
+        torch.empty(3, 4, 128, dtype=torch.bfloat16),
+        torch.empty(3, dtype=torch.long, device="meta"),
+        metadata,
+    )
+
+    assert torch.equal(metadata.cpu_key_cache[0, 0, 0], routed_key_cpu[0, 0])
+    assert torch.equal(metadata.cpu_key_cache[1, 0, 1], routed_key_cpu[2, 0])
+    assert torch.equal(metadata.cpu_value_cache[0, 0, 0], routed_value_cpu[0, 0])
+    assert torch.equal(metadata.cpu_value_cache[1, 0, 1], routed_value_cpu[2, 0])
+    assert torch.count_nonzero(metadata.cpu_key_cache[0, 0, 1]) == 0
+    assert torch.count_nonzero(metadata.cpu_value_cache[0, 0, 1]) == 0
 
 
 def test_cots_head_split_store_updates_cpu_heads_and_decodes() -> None:

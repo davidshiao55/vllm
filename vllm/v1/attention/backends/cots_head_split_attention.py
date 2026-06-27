@@ -80,11 +80,17 @@ class CotsHeadSplitAttentionMetadata:
 
 
 def _copy_cpu_head_slice(
-    tensor: torch.Tensor, metadata: CotsHeadSplitAttentionMetadata
+    tensor: torch.Tensor,
+    metadata: CotsHeadSplitAttentionMetadata,
+    *,
+    valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     start = metadata.gpu_kv_heads
     end = start + metadata.cpu_kv_heads
-    return tensor[:, start:end, :].detach().to(device="cpu")
+    view = tensor[:, start:end, :]
+    if valid_mask is not None:
+        view = view[valid_mask]
+    return view.detach().to(device="cpu").contiguous()
 
 
 def cots_head_split_kv_cache_update(
@@ -97,20 +103,11 @@ def cots_head_split_kv_cache_update(
 
     total_start = _timer_start()
     del slot_mapping
-    num_tokens = int(metadata.num_actual_tokens)
-    if num_tokens <= 0:
+    num_live_tokens = int(metadata.num_actual_tokens)
+    if num_live_tokens <= 0:
         return
     prepare_start = _timer_start()
-    used_routed_kv = (
-        metadata.routed_key_cpu is not None and metadata.routed_value_cpu is not None
-    )
-    if metadata.routed_key_cpu is not None and metadata.routed_value_cpu is not None:
-        key_cpu = metadata.routed_key_cpu[:num_tokens].contiguous()
-        value_cpu = metadata.routed_value_cpu[:num_tokens].contiguous()
-    else:
-        key_cpu = _copy_cpu_head_slice(key[:num_tokens], metadata).contiguous()
-        value_cpu = _copy_cpu_head_slice(value[:num_tokens], metadata).contiguous()
-    slot_cpu = metadata.cpu_slot_mapping[:num_tokens]
+    slot_cpu = metadata.cpu_slot_mapping[:num_live_tokens]
     if slot_cpu.device.type != "cpu":
         raise RuntimeError(
             "COTS head-split CPU KV update requires CPU slot mapping, "
@@ -119,10 +116,52 @@ def cots_head_split_kv_cache_update(
     valid = slot_cpu >= 0
     if not bool(valid.any().item()):
         return
-    if not bool(valid.all().item()):
-        key_cpu = key_cpu[valid].contiguous()
-        value_cpu = value_cpu[valid].contiguous()
+    valid_all = bool(valid.all().item())
+    if valid_all:
+        slot_cpu = slot_cpu.contiguous()
+        valid_mask = None
+    else:
         slot_cpu = slot_cpu[valid].contiguous()
+        valid_mask = (
+            valid
+            if key.device.type == "cpu"
+            else valid.to(device=key.device, non_blocking=True)
+        )
+
+    used_routed_kv = (
+        metadata.routed_key_cpu is not None and metadata.routed_value_cpu is not None
+    )
+    if metadata.routed_key_cpu is not None and metadata.routed_value_cpu is not None:
+        key_cpu = metadata.routed_key_cpu[:num_live_tokens]
+        value_cpu = metadata.routed_value_cpu[:num_live_tokens]
+        if int(key_cpu.shape[1]) != int(metadata.cpu_kv_heads):
+            raise RuntimeError(
+                "COTS routed CPU key sidecar has wrong head count: "
+                f"got={int(key_cpu.shape[1])}, "
+                f"expected={int(metadata.cpu_kv_heads)}"
+            )
+        if int(value_cpu.shape[1]) != int(metadata.cpu_kv_heads):
+            raise RuntimeError(
+                "COTS routed CPU value sidecar has wrong head count: "
+                f"got={int(value_cpu.shape[1])}, "
+                f"expected={int(metadata.cpu_kv_heads)}"
+            )
+        if not valid_all:
+            key_cpu = key_cpu[valid]
+            value_cpu = value_cpu[valid]
+        key_cpu = key_cpu.contiguous()
+        value_cpu = value_cpu.contiguous()
+    else:
+        key_cpu = _copy_cpu_head_slice(
+            key[:num_live_tokens],
+            metadata,
+            valid_mask=valid_mask,
+        )
+        value_cpu = _copy_cpu_head_slice(
+            value[:num_live_tokens],
+            metadata,
+            valid_mask=valid_mask,
+        )
     _timing("head_split_kv_update_prepare", prepare_start)
 
     block_size = int(metadata.cpu_key_cache.shape[2])
@@ -139,17 +178,18 @@ def cots_head_split_kv_cache_update(
     )
     _timing("head_split_kv_scatter", scatter_start)
     if _COTS_COUNTERS_ENABLED:
-        phase = _phase_for_tokens(num_tokens)
+        phase = _phase_for_tokens(num_live_tokens)
         element_bytes = _dtype_nbytes(key_cpu.dtype)
+        valid_rows = int(slot_cpu.shape[0])
         kv_bytes = (
-            int(key_cpu.shape[0])
+            valid_rows
             * int(metadata.cpu_kv_heads)
             * int(metadata.cpu_key_cache.shape[-1])
             * 2
             * element_bytes
         )
-        _counter("head_split_kv_update_tokens", num_tokens)
-        _counter(f"head_split_kv_update_{phase}_tokens", num_tokens)
+        _counter("head_split_kv_update_tokens", num_live_tokens)
+        _counter(f"head_split_kv_update_{phase}_tokens", num_live_tokens)
         _counter("head_split_kv_update_layers")
         _counter(f"head_split_kv_update_{phase}_layers")
         _counter("head_split_kv_update_cpu_kv_heads", metadata.cpu_kv_heads)
@@ -160,8 +200,8 @@ def cots_head_split_kv_cache_update(
         )
         _counter("head_split_kv_update_scatter_bytes", kv_bytes)
         _counter(f"head_split_kv_update_{phase}_scatter_bytes", kv_bytes)
-        _counter("head_split_kv_update_valid_rows", int(key_cpu.shape[0]))
-        _counter(f"head_split_kv_update_{phase}_valid_rows", int(key_cpu.shape[0]))
+        _counter("head_split_kv_update_valid_rows", valid_rows)
+        _counter(f"head_split_kv_update_{phase}_valid_rows", valid_rows)
         _timing(f"head_split_kv_update_prepare_{phase}", prepare_start)
         _timing(f"head_split_kv_scatter_{phase}", scatter_start)
         _timing(f"head_split_kv_update_total_{phase}", total_start)
