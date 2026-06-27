@@ -5,9 +5,6 @@ import pytest
 import torch
 
 from vllm._custom_ops import merge_attn_states as merge_attn_states_cuda
-from vllm._custom_ops import (
-    merge_attn_states_indexed as merge_attn_states_indexed_cuda,
-)
 from vllm.platforms import current_platform
 from vllm.v1.attention.ops.triton_merge_attn_states import (
     merge_attn_states as merge_attn_states_triton,
@@ -320,81 +317,3 @@ def test_merge_attn_states(
         len(NUM_BATCH_TOKENS) * len(HEAD_SIZES) * len(NUM_QUERY_HEADS) * len(DTYPES)
     ):
         generate_markdown_table()
-
-
-@pytest.mark.parametrize("head_size", [64, 128])
-@pytest.mark.parametrize("output_dtype", [torch.half, torch.bfloat16])
-@torch.inference_mode()
-def test_merge_attn_states_indexed(head_size: int, output_dtype: torch.dtype):
-    if not current_platform.is_cuda():
-        pytest.skip("indexed merge_attn_states CUDA kernel requires CUDA")
-
-    torch.manual_seed(0)
-    num_prefix_tokens = 17
-    num_suffix_tokens = 7
-    num_heads = 8
-    token_indices = torch.tensor(
-        [0, 3, 4, 8, 11, 13, 16], dtype=torch.long, device="cuda"
-    )
-    prefix_output = torch.randn(
-        (num_prefix_tokens, num_heads, head_size), dtype=output_dtype, device="cuda"
-    )
-    suffix_output = torch.randn(
-        (num_suffix_tokens, num_heads, head_size), dtype=output_dtype, device="cuda"
-    )
-    prefix_lse = torch.randn(
-        (num_heads, num_prefix_tokens), dtype=torch.float32, device="cuda"
-    )
-    suffix_lse = torch.randn(
-        (num_heads, num_suffix_tokens), dtype=torch.float32, device="cuda"
-    )
-    output_init = torch.randn_like(prefix_output)
-    output_lse_init = torch.randn_like(prefix_lse)
-
-    compact_prefix_output = prefix_output.index_select(0, token_indices)
-    compact_prefix_lse = prefix_lse.index_select(1, token_indices)
-    compact_output = torch.empty_like(suffix_output)
-    compact_output_lse = torch.empty_like(suffix_lse)
-    merge_attn_states_cuda(
-        compact_output,
-        compact_prefix_output,
-        compact_prefix_lse,
-        suffix_output,
-        suffix_lse,
-        compact_output_lse,
-    )
-    expected_output = output_init.clone()
-    expected_output.index_copy_(0, token_indices, compact_output)
-    expected_lse = output_lse_init.clone()
-    expected_lse.index_copy_(1, token_indices, compact_output_lse)
-
-    output = output_init.clone()
-    output_lse = output_lse_init.clone()
-    merge_attn_states_indexed_cuda(
-        output,
-        prefix_output,
-        prefix_lse,
-        suffix_output,
-        suffix_lse,
-        token_indices,
-        output_lse,
-    )
-
-    rtol = 1e-2 if output_dtype == torch.bfloat16 else 1e-3
-    torch.testing.assert_close(
-        output.float(), expected_output.float(), atol=1e-3, rtol=rtol
-    )
-    torch.testing.assert_close(output_lse, expected_lse, atol=1e-3, rtol=1e-3)
-
-    output_without_lse = output_init.clone()
-    merge_attn_states_indexed_cuda(
-        output_without_lse,
-        prefix_output,
-        prefix_lse,
-        suffix_output,
-        suffix_lse,
-        token_indices,
-    )
-    torch.testing.assert_close(
-        output_without_lse.float(), expected_output.float(), atol=1e-3, rtol=rtol
-    )

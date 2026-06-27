@@ -474,9 +474,6 @@ class EngineArgs:
         CotsOffloadConfig.dispatch_table
     )
     cots_weight_modules: set[str] = get_field(CotsOffloadConfig, "weight_modules")
-    cots_kv_split_blocks: int = CotsOffloadConfig.kv_split_blocks
-    cots_kv_cpu_pool_bytes: int = CotsOffloadConfig.kv_cpu_pool_bytes
-    cots_kv_h2d_mode: Literal["uva"] = CotsOffloadConfig.kv_h2d_mode
     cots_cpu_num_threads: int = CotsOffloadConfig.cpu_num_threads
     cots_cpu_num_threads_by_bucket: dict[int, int] | None = (
         CotsOffloadConfig.cpu_num_threads_by_bucket
@@ -1094,13 +1091,6 @@ class EngineArgs:
         offload_group.add_argument(
             "--cots-weight-modules", **cots_kwargs["weight_modules"]
         )
-        offload_group.add_argument(
-            "--cots-kv-split-blocks", **cots_kwargs["kv_split_blocks"]
-        )
-        offload_group.add_argument(
-            "--cots-kv-cpu-pool-bytes", **cots_kwargs["kv_cpu_pool_bytes"]
-        )
-        offload_group.add_argument("--cots-kv-h2d-mode", **cots_kwargs["kv_h2d_mode"])
         offload_group.add_argument(
             "--cots-cpu-num-threads", **cots_kwargs["cpu_num_threads"]
         )
@@ -2027,9 +2017,6 @@ class EngineArgs:
             f_prefetch=self.cots_f_prefetch,
             dispatch_table=self.cots_dispatch_table,
             weight_modules=self.cots_weight_modules,
-            kv_split_blocks=self.cots_kv_split_blocks,
-            kv_cpu_pool_bytes=self.cots_kv_cpu_pool_bytes,
-            kv_h2d_mode=self.cots_kv_h2d_mode,
             cpu_num_threads=self.cots_cpu_num_threads,
             cpu_num_threads_by_bucket=self.cots_cpu_num_threads_by_bucket,
             cpu_runner=self.cots_cpu_runner,

@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import json
 import os
 import queue
 import signal
@@ -185,15 +184,7 @@ class EngineCore:
         # to eliminate pipeline bubbles.
         self.batch_queue_size = self.model_executor.max_concurrent_batches
         self.batch_queue: (
-            deque[
-                tuple[
-                    Future[ModelRunnerOutput],
-                    SchedulerOutput,
-                    Future[Any],
-                    dict[str, Any] | None,
-                ]
-            ]
-            | None
+            deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
         ) = None
         if self.batch_queue_size > 1:
             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
@@ -397,58 +388,23 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
-        cots_timing = os.environ.get("VLLM_COTS_HYBRID_ENGINE_TIMING") == "1"
-        step_start = time.perf_counter() if cots_timing else 0.0
         scheduler_output = self.scheduler.schedule()
-        schedule_end = time.perf_counter() if cots_timing else 0.0
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
-        execute_submit_end = time.perf_counter() if cots_timing else 0.0
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
-        grammar_end = time.perf_counter() if cots_timing else 0.0
         with (
             self.log_error_detail(scheduler_output),
             self.log_iteration_details(scheduler_output),
         ):
             model_output = future.result()
-            future_end = time.perf_counter() if cots_timing else 0.0
-            sample_end = future_end
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
-                sample_end = time.perf_counter() if cots_timing else 0.0
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
-        abort_end = time.perf_counter() if cots_timing else 0.0
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
-        update_end = time.perf_counter() if cots_timing else 0.0
-
-        if cots_timing:
-            timing_iter = getattr(self, "_cots_engine_timing_iter", 0)
-            details = compute_iteration_details(scheduler_output)
-            logger.info(
-                "COTS engine timing iter=%d ctx_req=%d ctx_tok=%d "
-                "gen_req=%d gen_tok=%d schedule_ms=%.3f "
-                "execute_submit_ms=%.3f grammar_ms=%.3f future_ms=%.3f "
-                "sample_ms=%.3f abort_ms=%.3f update_ms=%.3f "
-                "total_step_ms=%.3f",
-                timing_iter,
-                details.num_ctx_requests,
-                details.num_ctx_tokens,
-                details.num_generation_requests,
-                details.num_generation_tokens,
-                (schedule_end - step_start) * 1000.0,
-                (execute_submit_end - schedule_end) * 1000.0,
-                (grammar_end - execute_submit_end) * 1000.0,
-                (future_end - grammar_end) * 1000.0,
-                (sample_end - future_end) * 1000.0,
-                (abort_end - sample_end) * 1000.0,
-                (update_end - abort_end) * 1000.0,
-                (update_end - step_start) * 1000.0,
-            )
-            self._cots_engine_timing_iter = timing_iter + 1
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
@@ -489,88 +445,36 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
-        cots_timing_enabled = (
-            os.environ.get("VLLM_COTS_HYBRID_ENGINE_TIMING") == "1"
-            or os.environ.get("VLLM_COTS_DISPATCH_TRACE") == "1"
-        )
-        scheduled_timing_info = None
-        deferred_timing_info = None
         if self.scheduler.has_requests():
-            schedule_start = time.perf_counter() if cots_timing_enabled else 0.0
             scheduler_output = self.scheduler.schedule()
-            schedule_end = time.perf_counter() if cots_timing_enabled else 0.0
-            if cots_timing_enabled:
-                timing_iter = getattr(self, "_cots_engine_queue_timing_iter", 0)
-                self._cots_engine_queue_timing_iter = timing_iter + 1
-                details = compute_iteration_details(scheduler_output)
-                scheduled_timing_info = {
-                    "event": "cots_engine_queue_trace",
-                    "iter": int(timing_iter),
-                    "ctx_req": int(details.num_ctx_requests),
-                    "ctx_tok": int(details.num_ctx_tokens),
-                    "gen_req": int(details.num_generation_requests),
-                    "gen_tok": int(details.num_generation_tokens),
-                    "num_tokens": int(scheduler_output.total_num_scheduled_tokens),
-                    "schedule_start": schedule_start,
-                    "schedule_ms": (schedule_end - schedule_start) * 1000.0,
-                }
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
                 )
-            execute_submit_end = time.perf_counter() if cots_timing_enabled else 0.0
-            if scheduled_timing_info is not None:
-                scheduled_timing_info["execute_submit_ms"] = (
-                    execute_submit_end - schedule_end
-                ) * 1000.0
             if self.is_ec_consumer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
             if self.is_pooling_model or not model_executed:
                 # No sampling required (no requests scheduled).
                 future = cast(Future[ModelRunnerOutput], exec_future)
-                sample_submit_end = execute_submit_end
             else:
                 if not scheduler_output.pending_structured_output_tokens:
                     # We aren't waiting for any tokens, get any grammar output
                     # and sample immediately.
-                    grammar_start = time.perf_counter() if cots_timing_enabled else 0.0
                     grammar_output = self.scheduler.get_grammar_bitmask(
                         scheduler_output
                     )
-                    grammar_end = time.perf_counter() if cots_timing_enabled else 0.0
                     future = self.model_executor.sample_tokens(
                         grammar_output, non_block=True
                     )
-                    sample_submit_end = (
-                        time.perf_counter() if cots_timing_enabled else 0.0
-                    )
-                    if scheduled_timing_info is not None:
-                        scheduled_timing_info["grammar_ms"] = (
-                            grammar_end - grammar_start
-                        ) * 1000.0
-                        scheduled_timing_info["sample_submit_ms"] = (
-                            sample_submit_end - grammar_end
-                        ) * 1000.0
                 else:
                     # We need to defer sampling until we have processed the model output
                     # from the prior step.
                     deferred_scheduler_output = scheduler_output
-                    deferred_timing_info = scheduled_timing_info
-                    sample_submit_end = execute_submit_end
-                    if scheduled_timing_info is not None:
-                        scheduled_timing_info["grammar_ms"] = 0.0
-                        scheduled_timing_info["sample_submit_ms"] = 0.0
-            if scheduled_timing_info is not None:
-                scheduled_timing_info["submit_total_ms"] = (
-                    sample_submit_end - schedule_start
-                ) * 1000.0
 
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
-                batch_queue.appendleft(
-                    (future, scheduler_output, exec_future, scheduled_timing_info)
-                )
+                batch_queue.appendleft((future, scheduler_output, exec_future))
                 if (
                     model_executed
                     and len(batch_queue) < self.batch_queue_size
@@ -587,14 +491,12 @@ class EngineCore:
             return None, False
 
         # Block until the next result is available.
-        future, scheduler_output, exec_model_fut, cots_timing_info = batch_queue.pop()
-        result_wait_start = time.perf_counter() if cots_timing_info is not None else 0.0
+        future, scheduler_output, exec_model_fut = batch_queue.pop()
         with (
             self.log_error_detail(scheduler_output),
             self.log_iteration_details(scheduler_output),
         ):
             model_output = future.result()
-            result_end = time.perf_counter() if cots_timing_info is not None else 0.0
             if model_output is None:
                 # None from sample_tokens() implies that the original execute_model()
                 # call failed - raise that exception.
@@ -604,31 +506,9 @@ class EngineCore:
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
-        update_start = time.perf_counter() if cots_timing_info is not None else 0.0
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
-        update_end = time.perf_counter() if cots_timing_info is not None else 0.0
-        if cots_timing_info is not None:
-            cots_timing_info.update(
-                {
-                    "future_wait_ms": (result_end - result_wait_start) * 1000.0,
-                    "schedule_to_result_ms": (
-                        result_end - float(cots_timing_info["schedule_start"])
-                    )
-                    * 1000.0,
-                    "update_ms": (update_end - update_start) * 1000.0,
-                    "schedule_to_update_ms": (
-                        update_end - float(cots_timing_info["schedule_start"])
-                    )
-                    * 1000.0,
-                }
-            )
-            del cots_timing_info["schedule_start"]
-            logger.info(
-                "COTS_ENGINE_QUEUE_TRACE %s",
-                json.dumps(cots_timing_info, sort_keys=True),
-            )
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
@@ -652,9 +532,7 @@ class EngineCore:
                 deferred_scheduler_output
             )
             future = self.model_executor.sample_tokens(grammar_output, non_block=True)
-            batch_queue.appendleft(
-                (future, deferred_scheduler_output, exec_future, deferred_timing_info)
-            )
+            batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
 
         return engine_core_outputs, model_executed
 

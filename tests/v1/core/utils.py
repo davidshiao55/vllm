@@ -9,7 +9,6 @@ from vllm.config import (
     ECTransferConfig,
     KVTransferConfig,
     ModelConfig,
-    OffloadConfig,
     ParallelConfig,
     SchedulerConfig,
     SpeculativeConfig,
@@ -58,8 +57,6 @@ def create_scheduler(
     pipeline_parallel_size: int = 1,
     use_ec_connector: bool = False,
     ec_role: str | None = None,
-    offload_config: OffloadConfig | None = None,
-    enforce_eager: bool = False,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -74,21 +71,12 @@ def create_scheduler(
     Returns:
       {class}`Scheduler` instance
     """
-    model_dtype = "float16"
-    if (
-        offload_config is not None
-        and offload_config.offload_backend == "cots"
-        and offload_config.cots.hybrid_kv_enabled
-    ):
-        model_dtype = "bfloat16"
-
     model_config = ModelConfig(
         model=model,
         trust_remote_code=True,
-        dtype=model_dtype,
+        dtype="float16",
         seed=42,
         skip_tokenizer_init=skip_tokenizer_init,
-        enforce_eager=enforce_eager,
     )
     if max_model_len is None:
         max_model_len = max_num_batched_tokens
@@ -155,7 +143,6 @@ def create_scheduler(
         kv_transfer_config=kv_transfer_config,
         speculative_config=speculative_config,
         ec_transfer_config=ec_transfer_config,
-        offload_config=offload_config,
     )
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,  # A large number of blocks to hold all requests

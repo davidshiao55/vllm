@@ -3,7 +3,6 @@
 """Attention layer with FlashAttention."""
 
 import copy
-import time
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -17,12 +16,6 @@ from vllm.v1.attention.backend import (
     AttentionType,
     MultipleOf,
     is_quantized_kv_cache,
-)
-from vllm.v1.attention.backends.cots_hybrid_attention import (
-    CotsHybridDecodeMetadata,
-    _cuda_event_timing_enabled,
-    _make_cuda_timing_events,
-    cots_hybrid_decode_attention,
 )
 from vllm.v1.attention.backends.fa_utils import (
     flash_attn_supports_fp8,
@@ -238,9 +231,6 @@ class FlashAttentionMetadata:
     max_num_splits: int = 0
 
     causal: bool = True
-
-    # COTS Phase 2: optional CPU suffix KV metadata for hybrid decode.
-    cots_hybrid_decode: CotsHybridDecodeMetadata | None = None
 
 
 def _get_sliding_window_configs(
@@ -714,255 +704,6 @@ class FlashAttentionImpl(AttentionImpl):
             key_cache = key_cache.view(dtype)
             value_cache = value_cache.view(dtype)
 
-        partial_cots_hybrid_decode = None
-        if attn_metadata.cots_hybrid_decode is not None:
-            if self.sliding_window != (-1, -1):
-                raise NotImplementedError(
-                    "COTS hybrid KV Phase 2 does not support sliding-window attention"
-                )
-            if self.alibi_slopes is not None:
-                raise NotImplementedError(
-                    "COTS hybrid KV Phase 2 does not support ALiBi attention"
-                )
-            if self.sinks is not None:
-                raise NotImplementedError(
-                    "COTS hybrid KV Phase 2 does not support attention sinks"
-                )
-            if self.kv_cache_dtype.startswith("fp8"):
-                raise NotImplementedError(
-                    "COTS hybrid KV Phase 2 supports only BF16 KV cache"
-                )
-            is_partial_cots_hybrid = (
-                attn_metadata.cots_hybrid_decode.scatter_source_indices is not None
-            )
-            if is_partial_cots_hybrid:
-                partial_cots_hybrid_decode = attn_metadata.cots_hybrid_decode
-            else:
-                cots_hybrid_decode_attention(
-                    output[:num_actual_tokens],
-                    query[:num_actual_tokens],
-                    key_cache,
-                    value_cache,
-                    attn_metadata.block_table,
-                    attn_metadata.cots_hybrid_decode,
-                    softmax_scale=self.scale,
-                    fa_version=self.vllm_flash_attn_version,
-                    q_descale=layer._q_scale,
-                    k_descale=layer._k_scale,
-                    v_descale=layer._v_scale,
-                )
-                return output
-
-        def _apply_partial_cots_hybrid_decode(
-            precomputed_prefix_out: torch.Tensor | None = None,
-            precomputed_prefix_lse: torch.Tensor | None = None,
-        ) -> None:
-            if partial_cots_hybrid_decode is None:
-                return
-            cots_hybrid_decode_attention(
-                output[:num_actual_tokens],
-                query[:num_actual_tokens],
-                key_cache,
-                value_cache,
-                attn_metadata.block_table,
-                partial_cots_hybrid_decode,
-                softmax_scale=self.scale,
-                fa_version=self.vllm_flash_attn_version,
-                q_descale=layer._q_scale,
-                k_descale=layer._k_scale,
-                v_descale=layer._v_scale,
-                precomputed_prefix_out=precomputed_prefix_out,
-                precomputed_prefix_lse=precomputed_prefix_lse,
-            )
-
-        def _apply_prefix_only_cots_hybrid_rows() -> None:
-            if partial_cots_hybrid_decode is None:
-                return
-            source_indices = partial_cots_hybrid_decode.prefix_source_indices
-            if source_indices is None or source_indices.numel() == 0:
-                return
-            if self.dcp_world_size > 1:
-                raise NotImplementedError(
-                    "COTS hybrid KV split-crossing prefill is single-GPU only"
-                )
-            req_indices = partial_cots_hybrid_decode.prefix_req_indices_gpu
-            seq_lens_cpu = partial_cots_hybrid_decode.prefix_seq_lens_cpu
-            if req_indices is None or seq_lens_cpu is None:
-                raise ValueError(
-                    "Partial COTS hybrid prefill requires prefix row request "
-                    "indices and sequence lengths"
-                )
-
-            metrics = partial_cots_hybrid_decode.metrics
-            timing_enabled = metrics is not None and _cuda_event_timing_enabled()
-            wall_start = time.perf_counter() if timing_enabled else None
-            cuda_timing = timing_enabled and torch.cuda.is_available()
-            current_stream = None
-            prefix_start = prefix_end = None
-            if cuda_timing:
-                current_stream = torch.cuda.current_stream(query.device)
-                prefix_start, prefix_end = _make_cuda_timing_events()
-                prefix_start.record(current_stream)
-
-            row_indices = source_indices.to(device=query.device, non_blocking=True)
-            req_indices = req_indices.to(
-                device=attn_metadata.block_table.device, non_blocking=True
-            )
-            row_query = query[:num_actual_tokens].index_select(0, row_indices)
-            row_output = torch.empty_like(row_query)
-            row_block_table = attn_metadata.block_table.index_select(0, req_indices)
-            row_seq_lens = seq_lens_cpu.to(
-                device=query.device, dtype=torch.int32, non_blocking=True
-            )
-            num_rows = row_query.shape[0]
-            cu_query_lens = torch.arange(
-                num_rows + 1, dtype=torch.int32, device=query.device
-            )
-            max_seqlen_k = int(seq_lens_cpu.max().item())
-            descale_shape = (num_rows, self.num_kv_heads)
-            flash_attn_varlen_func(
-                q=row_query,
-                k=key_cache,
-                v=value_cache,
-                out=row_output,
-                cu_seqlens_q=cu_query_lens,
-                max_seqlen_q=1,
-                seqused_k=row_seq_lens,
-                max_seqlen_k=max_seqlen_k,
-                softmax_scale=self.scale,
-                causal=False,
-                alibi_slopes=None,
-                window_size=None,
-                block_table=row_block_table,
-                softcap=self.logits_soft_cap,
-                scheduler_metadata=None,
-                fa_version=self.vllm_flash_attn_version,
-                q_descale=layer._q_scale.expand(descale_shape),
-                k_descale=layer._k_scale.expand(descale_shape),
-                v_descale=layer._v_scale.expand(descale_shape),
-                num_splits=attn_metadata.max_num_splits,
-                s_aux=None,
-            )
-            output[:num_actual_tokens].index_copy_(0, row_indices, row_output)
-
-            if metrics is not None:
-                metrics.hybrid_mixed_decode_calls += 1
-                metrics.hybrid_mixed_prefix_rows += int(num_rows)
-                suffix_indices = partial_cots_hybrid_decode.scatter_source_indices
-                if suffix_indices is not None:
-                    metrics.hybrid_mixed_suffix_rows += int(suffix_indices.numel())
-            if cuda_timing:
-                assert current_stream is not None
-                assert prefix_start is not None and prefix_end is not None
-                prefix_end.record(current_stream)
-                prefix_end.synchronize()
-                assert metrics is not None
-                metrics.hybrid_mixed_prefix_attn_ms += prefix_start.elapsed_time(
-                    prefix_end
-                )
-            if wall_start is not None:
-                assert metrics is not None
-                metrics.hybrid_mixed_prefix_wall_ms += (
-                    time.perf_counter() - wall_start
-                ) * 1000.0
-
-        def _apply_coalesced_cots_hybrid_prefix() -> bool:
-            if partial_cots_hybrid_decode is None:
-                return False
-            if not envs.VLLM_COTS_HYBRID_COALESCED_PREFIX:
-                return False
-            if self.dcp_world_size > 1:
-                return False
-            if attn_metadata.max_query_len != 1:
-                return False
-            if attn_metadata.seq_lens.shape[0] != num_actual_tokens:
-                return False
-            if attn_metadata.block_table.shape[0] != num_actual_tokens:
-                return False
-            if partial_cots_hybrid_decode.scatter_source_indices is None:
-                return False
-
-            split_len = partial_cots_hybrid_decode.split_blocks * key_cache.shape[-3]
-            seq_lens = attn_metadata.seq_lens[:num_actual_tokens]
-            prefix_lens = torch.minimum(
-                seq_lens, seq_lens.new_full((num_actual_tokens,), split_len)
-            )
-            descale_shape = (num_actual_tokens, self.num_kv_heads)
-            timing_enabled = (
-                partial_cots_hybrid_decode.metrics is not None
-                and _cuda_event_timing_enabled()
-            )
-            wall_start = time.perf_counter() if timing_enabled else None
-            cuda_timing = timing_enabled and torch.cuda.is_available()
-            current_stream = None
-            prefix_start = prefix_end = None
-            if cuda_timing:
-                current_stream = torch.cuda.current_stream(query.device)
-                prefix_start, prefix_end = _make_cuda_timing_events()
-                prefix_start.record(current_stream)
-
-            prefix_out, prefix_lse = flash_attn_varlen_func(
-                q=query[:num_actual_tokens],
-                k=key_cache,
-                v=value_cache,
-                out=output[:num_actual_tokens],
-                cu_seqlens_q=attn_metadata.query_start_loc,
-                max_seqlen_q=1,
-                seqused_k=prefix_lens,
-                max_seqlen_k=split_len,
-                softmax_scale=self.scale,
-                causal=False,
-                alibi_slopes=None,
-                window_size=None,
-                block_table=attn_metadata.block_table,
-                softcap=self.logits_soft_cap,
-                scheduler_metadata=None,
-                fa_version=self.vllm_flash_attn_version,
-                q_descale=layer._q_scale.expand(descale_shape),
-                k_descale=layer._k_scale.expand(descale_shape),
-                v_descale=layer._v_scale.expand(descale_shape),
-                return_softmax_lse=True,
-                num_splits=attn_metadata.max_num_splits,
-                s_aux=None,
-            )
-
-            metrics = partial_cots_hybrid_decode.metrics
-            if metrics is not None:
-                prefix_indices = partial_cots_hybrid_decode.prefix_source_indices
-                suffix_indices = partial_cots_hybrid_decode.scatter_source_indices
-                metrics.hybrid_mixed_decode_calls += 1
-                if prefix_indices is not None:
-                    metrics.hybrid_mixed_prefix_rows += int(prefix_indices.numel())
-                if suffix_indices is not None:
-                    metrics.hybrid_mixed_suffix_rows += int(suffix_indices.numel())
-            if cuda_timing:
-                assert current_stream is not None
-                assert prefix_start is not None and prefix_end is not None
-                prefix_end.record(current_stream)
-                prefix_end.synchronize()
-                assert metrics is not None
-                metrics.hybrid_mixed_prefix_attn_ms += prefix_start.elapsed_time(
-                    prefix_end
-                )
-            if wall_start is not None:
-                assert metrics is not None
-                metrics.hybrid_mixed_prefix_wall_ms += (
-                    time.perf_counter() - wall_start
-                ) * 1000.0
-
-            _apply_partial_cots_hybrid_decode(
-                precomputed_prefix_out=prefix_out,
-                precomputed_prefix_lse=prefix_lse,
-            )
-            return True
-
-        if partial_cots_hybrid_decode is not None:
-            if _apply_coalesced_cots_hybrid_prefix():
-                return output
-            _apply_prefix_only_cots_hybrid_rows()
-            _apply_partial_cots_hybrid_decode()
-            return output
-
         if not attn_metadata.use_cascade:
             cu_seqlens_q = attn_metadata.query_start_loc
             seqused_k = attn_metadata.seq_lens
@@ -970,6 +711,7 @@ class FlashAttentionImpl(AttentionImpl):
             max_seqlen_k = attn_metadata.max_seq_len
             block_table = attn_metadata.block_table
             scheduler_metadata = attn_metadata.scheduler_metadata
+
             descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
 
             q_descale = layer._q_scale.expand(descale_shape)
@@ -989,7 +731,6 @@ class FlashAttentionImpl(AttentionImpl):
                     k_descale=k_descale,
                     v_descale=v_descale,
                 )
-                _apply_partial_cots_hybrid_decode()
                 return output
             else:
                 sliding_window_size = (
@@ -1020,7 +761,6 @@ class FlashAttentionImpl(AttentionImpl):
                     num_splits=attn_metadata.max_num_splits,
                     s_aux=self.sinks,
                 )
-                _apply_partial_cots_hybrid_decode()
                 return output
 
         # Cascade attention (rare case).
@@ -1050,7 +790,6 @@ class FlashAttentionImpl(AttentionImpl):
             v_descale=layer._v_scale,
             s_aux=self.sinks,
         )
-        _apply_partial_cots_hybrid_decode()
         return output
 
     def do_kv_cache_update(

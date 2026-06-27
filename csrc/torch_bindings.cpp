@@ -75,17 +75,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "    Tensor suffix_output,"
       "    Tensor suffix_lse) -> ()");
   ops.impl("merge_attn_states", torch::kCUDA, &merge_attn_states);
-  ops.def(
-      "merge_attn_states_indexed("
-      "    Tensor! output,"
-      "    Tensor!? output_lse,"
-      "    Tensor prefix_output,"
-      "    Tensor prefix_lse,"
-      "    Tensor suffix_output,"
-      "    Tensor suffix_lse,"
-      "    Tensor token_indices) -> ()");
-  ops.impl("merge_attn_states_indexed", torch::kCUDA,
-           &merge_attn_states_indexed);
 #ifndef USE_ROCM
   ops.def(
       "convert_vertical_slash_indexes("

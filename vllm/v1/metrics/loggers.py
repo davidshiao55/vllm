@@ -255,73 +255,6 @@ class LoggingStatLogger(StatLoggerBase):
         if not self.mm_caching_metrics.empty:
             log_parts.append("MM cache hit rate: %.1f%%")
             log_args.append(self.mm_caching_metrics.hit_rate * 100)
-        if self.last_scheduler_stats.cots_hybrid_kv_stats is not None:
-            cots_stats = self.last_scheduler_stats.cots_hybrid_kv_stats
-            log_parts.extend(
-                [
-                    "COTS GPU KV blocks: %d",
-                    "COTS CPU KV blocks: %d/%d",
-                    "COTS hybrid decode calls: %d",
-                    "COTS GPU prefix/merge: %.3f/%.3f ms",
-                    "COTS mixed calls/prefix/suffix rows: %d/%d/%d",
-                    "COTS mixed prefix gpu/wall: %.3f/%.3f ms",
-                    "COTS CPU wait/read/attn: %.3f/%.3f/%.3f ms",
-                    "COTS QKV/KV ready wait: %.3f/%.3f ms",
-                    "COTS Q D2H: %.3f MB",
-                    "COTS KV D2H: %.3f MB",
-                    "COTS UVA H2D artifacts: %.3f MB",
-                    "COTS suffix submit prep/snap/launch: %.3f/%.3f/%.3f ms",
-                    "COTS suffix dispatch cb/snap/enq: %.3f/%.3f/%.3f ms",
-                    "COTS suffix native busy/queue/scatter/attn: "
-                    "%.3f/%.3f/%.3f/%.3f ms",
-                    "COTS suffix worker threads req/obs: %d/%d",
-                    "COTS suffix rows live/cap/pad/scatter: %d/%d/%d/%d",
-                    "COTS suffix wait launches/imm/lag/spins: %d/%d/%d/%d",
-                ]
-            )
-            log_args.extend(
-                [
-                    cots_stats.hybrid_gpu_kv_blocks_used,
-                    cots_stats.hybrid_cpu_kv_blocks_used,
-                    cots_stats.hybrid_cpu_kv_blocks_total,
-                    cots_stats.hybrid_decode_calls,
-                    cots_stats.gpu_prefix_attn_ms,
-                    cots_stats.hybrid_merge_ms,
-                    cots_stats.hybrid_mixed_decode_calls,
-                    cots_stats.hybrid_mixed_prefix_rows,
-                    cots_stats.hybrid_mixed_suffix_rows,
-                    cots_stats.hybrid_mixed_prefix_attn_ms,
-                    cots_stats.hybrid_mixed_prefix_wall_ms,
-                    cots_stats.cpu_suffix_wait_ms,
-                    cots_stats.cpu_suffix_read_wait_ms,
-                    cots_stats.cpu_suffix_attn_ms,
-                    cots_stats.qkv_ready_wait_ms,
-                    cots_stats.kv_ready_wait_ms,
-                    cots_stats.q_d2h_bytes / 1_000_000,
-                    cots_stats.kv_d2h_bytes / 1_000_000,
-                    cots_stats.kv_uva_h2d_bytes / 1_000_000,
-                    cots_stats.suffix_submit_prepare_ms,
-                    cots_stats.suffix_submit_metadata_snapshot_ms,
-                    cots_stats.suffix_submit_launch_hostfunc_ms,
-                    cots_stats.suffix_dispatch_cb_ms,
-                    cots_stats.suffix_dispatch_snapshot_ms,
-                    cots_stats.suffix_dispatch_enqueue_ms,
-                    cots_stats.suffix_worker_busy_ms,
-                    cots_stats.suffix_worker_queue_wait_ms,
-                    cots_stats.suffix_worker_scatter_ms,
-                    cots_stats.suffix_worker_attention_ms,
-                    cots_stats.suffix_worker_requested_num_threads,
-                    cots_stats.suffix_worker_observed_num_threads,
-                    cots_stats.suffix_worker_live_rows,
-                    cots_stats.suffix_worker_capacity_rows,
-                    cots_stats.suffix_worker_padded_rows,
-                    cots_stats.suffix_worker_scatter_rows,
-                    cots_stats.suffix_wait_kernel_launches,
-                    cots_stats.suffix_wait_kernel_immediate,
-                    cots_stats.suffix_wait_kernel_lagging,
-                    cots_stats.suffix_wait_kernel_spin_iters,
-                ]
-            )
 
         log_fn(
             self.log_prefix + ", ".join(log_parts),
@@ -556,49 +489,6 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             gauge_kv_cache_usage, per_engine_labelvalues
         )
 
-        gauge_cots_hybrid_gpu_kv_blocks_used = self._gauge_cls(
-            name="vllm:cots_hybrid_gpu_kv_blocks_used",
-            documentation="COTS hybrid KV GPU prefix blocks currently in use.",
-            multiprocess_mode="mostrecent",
-            labelnames=labelnames,
-        )
-        self.gauge_cots_hybrid_gpu_kv_blocks_used = create_metric_per_engine(
-            gauge_cots_hybrid_gpu_kv_blocks_used, per_engine_labelvalues
-        )
-
-        gauge_cots_hybrid_cpu_kv_blocks_used = self._gauge_cls(
-            name="vllm:cots_hybrid_cpu_kv_blocks_used",
-            documentation="COTS hybrid KV CPU suffix blocks currently in use.",
-            multiprocess_mode="mostrecent",
-            labelnames=labelnames,
-        )
-        self.gauge_cots_hybrid_cpu_kv_blocks_used = create_metric_per_engine(
-            gauge_cots_hybrid_cpu_kv_blocks_used, per_engine_labelvalues
-        )
-
-        gauge_cots_hybrid_cpu_kv_blocks_total = self._gauge_cls(
-            name="vllm:cots_hybrid_cpu_kv_blocks_total",
-            documentation="COTS hybrid KV CPU suffix block pool capacity.",
-            multiprocess_mode="mostrecent",
-            labelnames=labelnames,
-        )
-        self.gauge_cots_hybrid_cpu_kv_blocks_total = create_metric_per_engine(
-            gauge_cots_hybrid_cpu_kv_blocks_total, per_engine_labelvalues
-        )
-
-        gauge_cots_hybrid_overlap_ratio = self._gauge_cls(
-            name="vllm:cots_hybrid_overlap_ratio",
-            documentation=(
-                "Estimated overlap ratio between COTS GPU prefix and CPU suffix "
-                "attention for the last observed step."
-            ),
-            multiprocess_mode="mostrecent",
-            labelnames=labelnames,
-        )
-        self.gauge_cots_hybrid_overlap_ratio = create_metric_per_engine(
-            gauge_cots_hybrid_overlap_ratio, per_engine_labelvalues
-        )
-
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             counter_corrupted_requests = self._counter_cls(
                 name="vllm:corrupted_requests",
@@ -696,59 +586,6 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
         self.counter_num_preempted_reqs = create_metric_per_engine(
             counter_num_preempted_reqs, per_engine_labelvalues
-        )
-
-        counter_cots_hybrid_preemptions = self._counter_cls(
-            name="vllm:cots_hybrid_preemptions",
-            documentation="COTS hybrid KV requests preempted by the scheduler.",
-            labelnames=labelnames,
-        )
-        self.counter_cots_hybrid_preemptions = create_metric_per_engine(
-            counter_cots_hybrid_preemptions, per_engine_labelvalues
-        )
-
-        counter_cots_hybrid_recomputed_cpu_suffix_tokens = self._counter_cls(
-            name="vllm:cots_hybrid_recomputed_cpu_suffix_tokens",
-            documentation=(
-                "COTS hybrid KV CPU suffix tokens discarded by preemption and "
-                "expected to be recomputed."
-            ),
-            labelnames=labelnames,
-        )
-        self.counter_cots_hybrid_recomputed_cpu_suffix_tokens = (
-            create_metric_per_engine(
-                counter_cots_hybrid_recomputed_cpu_suffix_tokens,
-                per_engine_labelvalues,
-            )
-        )
-
-        counter_cots_hybrid_kv_d2h_bytes = self._counter_cls(
-            name="vllm:cots_hybrid_kv_d2h_bytes",
-            documentation="COTS hybrid KV bytes copied from GPU to CPU suffix KV.",
-            labelnames=labelnames,
-        )
-        self.counter_cots_hybrid_kv_d2h_bytes = create_metric_per_engine(
-            counter_cots_hybrid_kv_d2h_bytes, per_engine_labelvalues
-        )
-
-        counter_cots_hybrid_q_d2h_bytes = self._counter_cls(
-            name="vllm:cots_hybrid_q_d2h_bytes",
-            documentation="COTS hybrid query bytes copied from GPU to CPU.",
-            labelnames=labelnames,
-        )
-        self.counter_cots_hybrid_q_d2h_bytes = create_metric_per_engine(
-            counter_cots_hybrid_q_d2h_bytes, per_engine_labelvalues
-        )
-
-        counter_cots_hybrid_kv_uva_h2d_bytes = self._counter_cls(
-            name="vllm:cots_hybrid_kv_uva_h2d_bytes",
-            documentation=(
-                "COTS hybrid KV CPU artifact bytes read by GPU through UVA."
-            ),
-            labelnames=labelnames,
-        )
-        self.counter_cots_hybrid_kv_uva_h2d_bytes = create_metric_per_engine(
-            counter_cots_hybrid_kv_uva_h2d_bytes, per_engine_labelvalues
         )
 
         counter_prompt_tokens = self._counter_cls(
@@ -1053,56 +890,6 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             histogram_decode_time_request, per_engine_labelvalues
         )
 
-        histogram_cots_hybrid_cpu_suffix_attn_seconds = self._histogram_cls(
-            name="vllm:cots_hybrid_cpu_suffix_attn_seconds",
-            documentation="COTS hybrid KV CPU suffix attention wall time.",
-            buckets=[
-                0.0001,
-                0.00025,
-                0.0005,
-                0.001,
-                0.0025,
-                0.005,
-                0.01,
-                0.025,
-                0.05,
-                0.1,
-                0.25,
-                0.5,
-                1.0,
-            ],
-            labelnames=labelnames,
-        )
-        self.histogram_cots_hybrid_cpu_suffix_attn_seconds = create_metric_per_engine(
-            histogram_cots_hybrid_cpu_suffix_attn_seconds,
-            per_engine_labelvalues,
-        )
-
-        histogram_cots_hybrid_gpu_prefix_attn_seconds = self._histogram_cls(
-            name="vllm:cots_hybrid_gpu_prefix_attn_seconds",
-            documentation="COTS hybrid KV GPU prefix attention time.",
-            buckets=[
-                0.0001,
-                0.00025,
-                0.0005,
-                0.001,
-                0.0025,
-                0.005,
-                0.01,
-                0.025,
-                0.05,
-                0.1,
-                0.25,
-                0.5,
-                1.0,
-            ],
-            labelnames=labelnames,
-        )
-        self.histogram_cots_hybrid_gpu_prefix_attn_seconds = create_metric_per_engine(
-            histogram_cots_hybrid_gpu_prefix_attn_seconds,
-            per_engine_labelvalues,
-        )
-
         histogram_prefill_kv_computed_request = self._histogram_cls(
             name="vllm:request_prefill_kv_computed_tokens",
             documentation=(
@@ -1257,44 +1044,6 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 scheduler_stats.num_waiting_reqs
             )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
-
-            if scheduler_stats.cots_hybrid_kv_stats is not None:
-                cots_stats = scheduler_stats.cots_hybrid_kv_stats
-                self.gauge_cots_hybrid_gpu_kv_blocks_used[engine_idx].set(
-                    cots_stats.hybrid_gpu_kv_blocks_used
-                )
-                self.gauge_cots_hybrid_cpu_kv_blocks_used[engine_idx].set(
-                    cots_stats.hybrid_cpu_kv_blocks_used
-                )
-                self.gauge_cots_hybrid_cpu_kv_blocks_total[engine_idx].set(
-                    cots_stats.hybrid_cpu_kv_blocks_total
-                )
-                self.gauge_cots_hybrid_overlap_ratio[engine_idx].set(
-                    cots_stats.hybrid_overlap_ratio
-                )
-                self.counter_cots_hybrid_preemptions[engine_idx].inc(
-                    cots_stats.hybrid_preemptions
-                )
-                self.counter_cots_hybrid_recomputed_cpu_suffix_tokens[engine_idx].inc(
-                    cots_stats.hybrid_recomputed_cpu_suffix_tokens
-                )
-                self.counter_cots_hybrid_kv_d2h_bytes[engine_idx].inc(
-                    cots_stats.kv_d2h_bytes
-                )
-                self.counter_cots_hybrid_q_d2h_bytes[engine_idx].inc(
-                    cots_stats.q_d2h_bytes
-                )
-                self.counter_cots_hybrid_kv_uva_h2d_bytes[engine_idx].inc(
-                    cots_stats.kv_uva_h2d_bytes
-                )
-                if cots_stats.cpu_suffix_attn_ms > 0:
-                    self.histogram_cots_hybrid_cpu_suffix_attn_seconds[
-                        engine_idx
-                    ].observe(cots_stats.cpu_suffix_attn_ms / 1000.0)
-                if cots_stats.gpu_prefix_attn_ms > 0:
-                    self.histogram_cots_hybrid_gpu_prefix_attn_seconds[
-                        engine_idx
-                    ].observe(cots_stats.gpu_prefix_attn_ms / 1000.0)
 
             self.counter_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries

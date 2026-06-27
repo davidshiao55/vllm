@@ -755,16 +755,6 @@ class VllmConfig:
         elif self.scheduler_config.async_scheduling is None:
             # Enable async scheduling unless there is an incompatible option.
             if (
-                self.offload_config.offload_backend == "cots"
-                and self.offload_config.cots.hybrid_kv_enabled
-            ):
-                logger.warning_once(
-                    "Async scheduling is not compatible with COTS hybrid KV "
-                    "in the Phase 2 first attempt and will be disabled.",
-                    scope="local",
-                )
-                self.scheduler_config.async_scheduling = False
-            elif (
                 self.speculative_config is not None
                 and self.speculative_config.method not in get_args(EagleModelTypes)
                 and self.speculative_config.method not in get_args(NgramGPUTypes)
@@ -1105,7 +1095,6 @@ class VllmConfig:
             if self.model_config is None or self.model_config.is_moe
             else 1
         )
-        self._validate_cots_hybrid_kv_config()
         extra_splitting_ops = self._apply_cots_graph_defaults()
         self.compilation_config.set_splitting_ops_for_v1(
             all2all_backend=self.parallel_config.all2all_backend,
@@ -1322,90 +1311,14 @@ class VllmConfig:
             if size % self.parallel_config.tensor_parallel_size == 0
         ]
 
-    def _validate_cots_hybrid_kv_config(self) -> None:
-        cots_config = self.offload_config.cots
-        if (
-            self.offload_config.offload_backend != "cots"
-            or not cots_config.hybrid_kv_enabled
-        ):
-            return
-        graph_enabled = self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
-        if graph_enabled and (
-            self.model_config is None or not self.model_config.enforce_eager
-        ):
-            logger.warning_once(
-                "COTS hybrid KV with CUDA graphs is experimental. The prepared "
-                "suffix runner is graph-capturable, but Phase 2 still supports "
-                "only single-GPU decode after a block-aligned split.",
-                scope="local",
-            )
-        if self.cache_config.kv_offloading_size is not None:
-            raise ValueError(
-                "COTS hybrid KV is incompatible with native vLLM KV "
-                "offloading. Disable kv_offloading_size or set "
-                "cots_kv_split_blocks=0 / cots_kv_cpu_pool_bytes=0 to "
-                "disable hybrid KV."
-            )
-        if self.kv_transfer_config is not None:
-            raise ValueError(
-                "COTS hybrid KV does not support vLLM KV transfer/connectors "
-                "in the Phase 2 runtime. Disable kv_transfer_config or set "
-                "cots_kv_split_blocks=0 / cots_kv_cpu_pool_bytes=0 to "
-                "disable hybrid KV."
-            )
-        parallel_config = self.parallel_config
-        if (
-            parallel_config.tensor_parallel_size != 1
-            or parallel_config.pipeline_parallel_size != 1
-            or parallel_config.prefill_context_parallel_size != 1
-            or parallel_config.decode_context_parallel_size != 1
-            or parallel_config.data_parallel_size != 1
-        ):
-            raise ValueError(
-                "COTS hybrid KV Phase 2 supports only single-GPU execution: "
-                f"tp={parallel_config.tensor_parallel_size}, "
-                f"pp={parallel_config.pipeline_parallel_size}, "
-                f"pcp={parallel_config.prefill_context_parallel_size}, "
-                f"dcp={parallel_config.decode_context_parallel_size}, "
-                f"dp={parallel_config.data_parallel_size}. Set all parallel "
-                "sizes to 1 or disable hybrid KV."
-            )
-        if self.model_config is not None:
-            if self.model_config.is_encoder_decoder:
-                raise ValueError(
-                    "COTS hybrid KV Phase 2 supports decoder-only models. "
-                    "Disable hybrid KV for encoder-decoder models."
-                )
-            if self.model_config.dtype != torch.bfloat16:
-                raise ValueError(
-                    "COTS hybrid KV Phase 2 supports only BF16 model/KV "
-                    f"dtype; got dtype={self.model_config.dtype}. Use "
-                    "dtype=bfloat16 or disable hybrid KV."
-                )
-        if self.cache_config.cache_dtype not in ("auto", "bfloat16"):
-            raise ValueError(
-                "COTS hybrid KV Phase 2 supports only BF16 KV cache dtype; "
-                f"got cache_dtype={self.cache_config.cache_dtype}. Use "
-                "kv_cache_dtype=auto with a BF16 model, kv_cache_dtype=bfloat16, "
-                "or disable hybrid KV."
-            )
-        if self.scheduler_config.async_scheduling:
-            raise ValueError(
-                "COTS hybrid KV does not support async scheduling in the "
-                "Phase 2 first attempt. Set async_scheduling=False or set "
-                "cots_kv_split_blocks=0 / cots_kv_cpu_pool_bytes=0 to "
-                "disable hybrid KV."
-            )
-
     def _apply_cots_graph_defaults(self) -> list[str] | None:
         cots_config = self.offload_config.cots
         has_native_weight_graph = (
             cots_config.f_cpu_store > 0 and cots_config.cpu_runner == "native"
         )
-        has_hybrid_kv_graph = cots_config.hybrid_kv_enabled
         if (
             self.offload_config.offload_backend != "cots"
-            or not (has_native_weight_graph or has_hybrid_kv_graph)
+            or not has_native_weight_graph
             or not cots_config.auto_graph_split
             or self.compilation_config.mode != CompilationMode.VLLM_COMPILE
             or self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
@@ -1428,8 +1341,7 @@ class VllmConfig:
             logger.info_once(
                 "COTS graph mode is defaulting to PIECEWISE CUDA graphs. "
                 "Phase 1 weight offload needs COTS weight submit/sync work "
-                "at graph boundaries, and Phase 2 hybrid KV relies on the "
-                "normal attention piecewise boundary for suffix attention. "
+                "at graph boundaries. "
                 "Use --no-cots-auto-graph-split to keep the configured "
                 "cudagraph_mode."
             )
@@ -1450,12 +1362,7 @@ class VllmConfig:
                 cots=replace(cots_config, weight_capture_sync_mode="wait_kernel"),
             )
 
-        # Only Phase 1 weight offload adds COTS custom-op split points.
-        # Phase 2 hybrid KV is captured through the regular attention piecewise
-        # boundary; its prepared suffix submit/sync ops live inside that piece.
-        return (
-            CompilationConfig.cots_splitting_ops() if has_native_weight_graph else None
-        )
+        return CompilationConfig.cots_splitting_ops()
 
     def _set_max_num_scheduled_tokens(self):
         """

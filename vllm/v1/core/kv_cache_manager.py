@@ -8,18 +8,11 @@ from typing import Literal, overload
 
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
-from vllm.v1.core.hybrid_kv_cache_manager import CPUKVBlockPool, HybridKVAccounting
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
-from vllm.v1.kv_cache_interface import (
-    AttentionSpec,
-    EncoderOnlyAttentionSpec,
-    FullAttentionSpec,
-    KVCacheConfig,
-    UniformTypeKVCacheSpecs,
-)
-from vllm.v1.metrics.stats import CotsHybridKVStats, PrefixCacheStats
+from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -34,7 +27,6 @@ class KVCacheBlocks:
     """
 
     blocks: tuple[Sequence[KVCacheBlock], ...]
-    cpu_block_ids: tuple[list[int], ...] | None = None
     """
     `blocks[i][j]` refers to the i-th kv_cache_group
     and the j-th block of tokens.We don't use block of
@@ -51,13 +43,11 @@ class KVCacheBlocks:
 
     def __add__(self, other: "KVCacheBlocks") -> "KVCacheBlocks":
         """Adds two KVCacheBlocks instances."""
-        cpu_block_ids = self._add_cpu_block_ids(self.cpu_block_ids, other.cpu_block_ids)
         return KVCacheBlocks(
             tuple(
                 list(itertools.chain(blk1, blk2))
                 for blk1, blk2 in zip(self.blocks, other.blocks)
-            ),
-            cpu_block_ids,
+            )
         )
 
     @overload
@@ -88,44 +78,6 @@ class KVCacheBlocks:
         if allow_none and all(len(group) == 0 for group in self.blocks):
             return None
         return tuple([blk.block_id for blk in group] for group in self.blocks)
-
-    @staticmethod
-    def _add_cpu_block_ids(
-        left: tuple[list[int], ...] | None,
-        right: tuple[list[int], ...] | None,
-    ) -> tuple[list[int], ...] | None:
-        if left is None:
-            return right
-        if right is None:
-            return left
-        return tuple(
-            list(itertools.chain(left_group, right_group))
-            for left_group, right_group in zip(left, right)
-        )
-
-    @overload
-    def get_cpu_block_ids(
-        self,
-        allow_none: Literal[False] = False,
-    ) -> tuple[list[int], ...]: ...
-
-    @overload
-    def get_cpu_block_ids(
-        self,
-        allow_none: Literal[True] = True,
-    ) -> tuple[list[int], ...] | None: ...
-
-    def get_cpu_block_ids(
-        self,
-        allow_none: bool = False,
-    ) -> tuple[list[int], ...] | None:
-        if self.cpu_block_ids is None:
-            if allow_none:
-                return None
-            return tuple([] for _ in range(len(self.blocks)))
-        if allow_none and all(len(group) == 0 for group in self.cpu_block_ids):
-            return None
-        return tuple(list(group) for group in self.cpu_block_ids)
 
     def get_unhashed_block_ids(self) -> list[int]:
         """Get block_ids of unhashed blocks from KVCacheBlocks instance."""
@@ -164,8 +116,6 @@ class KVCacheManager:
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
-        cots_kv_split_blocks: int = 0,
-        cots_kv_cpu_pool_bytes: int = 0,
     ) -> None:
         self.max_model_len = max_model_len
 
@@ -202,149 +152,6 @@ class KVCacheManager:
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
 
-        self.cots_kv_split_blocks = int(cots_kv_split_blocks)
-        self.cots_kv_cpu_pool_bytes = int(cots_kv_cpu_pool_bytes)
-        self.cots_hybrid_kv_enabled = (
-            self.cots_kv_split_blocks > 0 and self.cots_kv_cpu_pool_bytes > 0
-        )
-        self.cots_kv_split_tokens = 0
-        self.cots_hybrid_preemptions = 0
-        self.cots_hybrid_recomputed_cpu_suffix_tokens = 0
-        self.cots_hybrid_accounting: HybridKVAccounting | None = None
-        self.cots_cpu_block_pool: CPUKVBlockPool | None = None
-        if self.cots_hybrid_kv_enabled:
-            self._init_cots_hybrid_kv(kv_cache_config)
-
-    def _init_cots_hybrid_kv(self, kv_cache_config: KVCacheConfig) -> None:
-        if self.num_kv_cache_groups != 1:
-            raise ValueError(
-                "COTS hybrid KV Phase 2 supports exactly one decoder KV cache group"
-            )
-
-        layer_names: list[str] = []
-        attention_spec: AttentionSpec | None = None
-        for kv_cache_group in kv_cache_config.kv_cache_groups:
-            kv_cache_spec = kv_cache_group.kv_cache_spec
-            if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
-                layer_specs = kv_cache_spec.kv_cache_specs
-            else:
-                layer_specs = {
-                    layer_name: kv_cache_spec
-                    for layer_name in kv_cache_group.layer_names
-                }
-
-            for layer_name, layer_spec in layer_specs.items():
-                if isinstance(layer_spec, EncoderOnlyAttentionSpec):
-                    continue
-                if not isinstance(layer_spec, FullAttentionSpec):
-                    raise ValueError(
-                        "COTS hybrid KV Phase 2 supports only decoder full attention; "
-                        f"got {type(layer_spec).__name__} for {layer_name}"
-                    )
-                if (
-                    layer_spec.sliding_window is not None
-                    or layer_spec.attention_chunk_size is not None
-                ):
-                    raise ValueError(
-                        "COTS hybrid KV Phase 2 does not support sliding-window or "
-                        "chunked-local attention"
-                    )
-                if attention_spec is None:
-                    attention_spec = layer_spec
-                elif layer_spec != attention_spec:
-                    raise ValueError(
-                        "COTS hybrid KV Phase 2 requires uniform attention KV specs"
-                    )
-                layer_names.append(layer_name)
-
-        if attention_spec is None or not layer_names:
-            raise ValueError("COTS hybrid KV enabled but no attention layers exist")
-
-        split_tokens = self.cots_kv_split_blocks * attention_spec.block_size
-        num_cpu_blocks = self.cots_kv_cpu_pool_bytes // (
-            attention_spec.real_page_size_bytes * len(layer_names)
-        )
-        if num_cpu_blocks <= 0:
-            raise ValueError(
-                "COTS hybrid KV CPU pool is too small for one suffix block per "
-                "layer: "
-                f"pool_bytes={self.cots_kv_cpu_pool_bytes}, "
-                f"bytes_per_block_per_layer={attention_spec.real_page_size_bytes}, "
-                f"num_layers={len(layer_names)}"
-            )
-
-        self.cots_hybrid_accounting = HybridKVAccounting(
-            block_sizes=[attention_spec.block_size],
-            split_blocks=self.cots_kv_split_blocks,
-        )
-        self.cots_kv_split_tokens = split_tokens
-        self.cots_cpu_block_pool = CPUKVBlockPool([int(num_cpu_blocks)])
-
-    def _cots_gpu_num_tokens(self, num_tokens: int) -> int:
-        if not self.cots_hybrid_kv_enabled:
-            return num_tokens
-        return min(num_tokens, self.cots_kv_split_tokens)
-
-    def _cots_cpu_blocks_for_tokens(self, num_tokens: int) -> list[int]:
-        if self.cots_hybrid_accounting is None:
-            return []
-        return self.cots_hybrid_accounting.cpu_blocks_for_tokens(num_tokens)
-
-    def _cots_can_allocate_cpu_blocks(
-        self,
-        request_id: str,
-        num_tokens: int,
-        computed_cpu_block_ids: tuple[list[int], ...] | None = None,
-    ) -> bool:
-        if self.cots_cpu_block_pool is None:
-            return True
-        return self.cots_cpu_block_pool.can_extend_with_computed(
-            request_id,
-            computed_cpu_block_ids,
-            self._cots_cpu_blocks_for_tokens(num_tokens),
-        )
-
-    def _cots_allocate_new_computed_cpu_blocks(
-        self,
-        request_id: str,
-        computed_cpu_block_ids: tuple[list[int], ...] | None,
-    ) -> None:
-        if self.cots_cpu_block_pool is None:
-            return
-        self.cots_cpu_block_pool.allocate_new_computed_blocks(
-            request_id, computed_cpu_block_ids
-        )
-
-    def _cots_allocate_cpu_blocks(
-        self, request_id: str, num_tokens: int
-    ) -> tuple[list[int], ...] | None:
-        if self.cots_cpu_block_pool is None:
-            return None
-        target_blocks = self._cots_cpu_blocks_for_tokens(num_tokens)
-        current_blocks = self.cots_cpu_block_pool.get_block_ids(request_id)
-        if len(current_blocks) == len(target_blocks) and all(
-            len(current) >= target
-            for current, target in zip(current_blocks, target_blocks)
-        ):
-            return tuple([] for _ in target_blocks)
-        allocated = self.cots_cpu_block_pool.extend_to(request_id, target_blocks)
-        if allocated is None:
-            raise RuntimeError(
-                "COTS hybrid KV CPU allocation failed after can_extend succeeded"
-            )
-        return allocated
-
-    def _cots_cache_cpu_blocks(self, request: Request, num_tokens: int) -> None:
-        if self.cots_cpu_block_pool is None or self.cots_hybrid_accounting is None:
-            return
-        self.cots_cpu_block_pool.cache_blocks(
-            request_id=request.request_id,
-            block_hashes=request.block_hashes,
-            num_tokens=num_tokens,
-            block_size=self.cots_hybrid_accounting.block_sizes[0],
-            split_blocks=self.cots_hybrid_accounting.split_blocks,
-        )
-
     @property
     def usage(self) -> float:
         """Get the KV cache usage.
@@ -364,55 +171,6 @@ class KVCacheManager:
             return None
         stats = self.prefix_cache_stats
         self.prefix_cache_stats = PrefixCacheStats()
-        return stats
-
-    def record_cots_hybrid_preemption(self, request: Request) -> None:
-        if not self.cots_hybrid_kv_enabled:
-            return
-        self.cots_hybrid_preemptions += 1
-        self.cots_hybrid_recomputed_cpu_suffix_tokens += max(
-            min(request.num_computed_tokens, self.max_model_len)
-            - self.cots_kv_split_tokens,
-            0,
-        )
-
-    def make_cots_hybrid_kv_stats(
-        self,
-        worker_stats: CotsHybridKVStats | None = None,
-    ) -> CotsHybridKVStats | None:
-        if not self.cots_hybrid_kv_enabled:
-            if worker_stats and worker_stats.has_worker_activity():
-                return worker_stats
-            return None
-
-        total_gpu_blocks = max(self.block_pool.num_gpu_blocks - 1, 0)
-        gpu_blocks_used = max(
-            self.block_pool.num_gpu_blocks - self.block_pool.get_num_free_blocks() - 1,
-            0,
-        )
-        cpu_blocks_used = (
-            self.cots_cpu_block_pool.used_blocks
-            if self.cots_cpu_block_pool is not None
-            else 0
-        )
-        cpu_blocks_total = (
-            self.cots_cpu_block_pool.total_blocks
-            if self.cots_cpu_block_pool is not None
-            else 0
-        )
-        stats = CotsHybridKVStats(
-            hybrid_gpu_kv_blocks_used=min(gpu_blocks_used, total_gpu_blocks),
-            hybrid_cpu_kv_blocks_used=cpu_blocks_used,
-            hybrid_cpu_kv_blocks_total=cpu_blocks_total,
-            hybrid_preemptions=self.cots_hybrid_preemptions,
-            hybrid_recomputed_cpu_suffix_tokens=(
-                self.cots_hybrid_recomputed_cpu_suffix_tokens
-            ),
-        )
-        if worker_stats is not None:
-            stats.merge_worker_stats(worker_stats)
-        self.cots_hybrid_preemptions = 0
-        self.cots_hybrid_recomputed_cpu_suffix_tokens = 0
         return stats
 
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
@@ -441,33 +199,11 @@ class KVCacheManager:
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
         max_cache_hit_length = request.num_tokens - 1
-        gpu_max_cache_hit_length = self._cots_gpu_num_tokens(max_cache_hit_length)
         computed_blocks, num_new_computed_tokens = (
             self.coordinator.find_longest_cache_hit(
-                request.block_hashes, gpu_max_cache_hit_length
+                request.block_hashes, max_cache_hit_length
             )
         )
-
-        cpu_block_ids: tuple[list[int], ...] | None = None
-        if (
-            self.cots_hybrid_kv_enabled
-            and self.cots_cpu_block_pool is not None
-            and self.cots_hybrid_accounting is not None
-            and num_new_computed_tokens >= self.cots_kv_split_tokens
-            and max_cache_hit_length > self.cots_kv_split_tokens
-        ):
-            cpu_block_ids, cpu_hit_tokens = (
-                self.cots_cpu_block_pool.find_longest_cache_hit(
-                    request.block_hashes,
-                    max_cache_hit_length,
-                    self.cots_hybrid_accounting.block_sizes[0],
-                    self.cots_hybrid_accounting.split_blocks,
-                )
-            )
-            if cpu_block_ids is not None and any(cpu_block_ids):
-                num_new_computed_tokens = max(num_new_computed_tokens, cpu_hit_tokens)
-            else:
-                cpu_block_ids = None
 
         if self.log_stats:
             assert self.prefix_cache_stats is not None
@@ -477,10 +213,7 @@ class KVCacheManager:
                 preempted=request.num_preemptions > 0,
             )
 
-        return (
-            self.create_kv_cache_blocks(computed_blocks, cpu_block_ids),
-            num_new_computed_tokens,
-        )
+        return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
 
     def can_fit_full_sequence(
         self,
@@ -498,12 +231,8 @@ class KVCacheManager:
         """
         if new_computed_blocks is not None:
             new_computed_block_list = new_computed_blocks.blocks
-            new_computed_cpu_block_ids = new_computed_blocks.get_cpu_block_ids(
-                allow_none=True
-            )
         else:
             new_computed_block_list = self.empty_kv_cache_blocks.blocks
-            new_computed_cpu_block_ids = None
 
         num_local_computed_tokens = (
             request.num_computed_tokens + num_new_computed_tokens
@@ -513,22 +242,17 @@ class KVCacheManager:
             self.max_model_len,
         )
         full_num_tokens = min(request.num_tokens, self.max_model_len)
-        gpu_full_num_tokens = self._cots_gpu_num_tokens(full_num_tokens)
-        gpu_total_computed_tokens = self._cots_gpu_num_tokens(total_computed_tokens)
+
         num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,
-            num_tokens=gpu_full_num_tokens,
+            num_tokens=full_num_tokens,
             new_computed_blocks=new_computed_block_list,
             num_encoder_tokens=num_encoder_tokens,
-            total_computed_tokens=gpu_total_computed_tokens,
-            num_tokens_main_model=gpu_full_num_tokens,
+            total_computed_tokens=total_computed_tokens,
+            num_tokens_main_model=full_num_tokens,
         )
 
-        gpu_fits = num_blocks_to_allocate <= self.block_pool.get_num_free_blocks()
-        cpu_fits = self._cots_can_allocate_cpu_blocks(
-            request.request_id, full_num_tokens, new_computed_cpu_block_ids
-        )
-        return gpu_fits and cpu_fits
+        return num_blocks_to_allocate <= self.block_pool.get_num_free_blocks()
 
     def allocate_slots(
         self,
@@ -622,12 +346,8 @@ class KVCacheManager:
 
         if new_computed_blocks is not None:
             new_computed_block_list = new_computed_blocks.blocks
-            new_computed_cpu_block_ids = new_computed_blocks.get_cpu_block_ids(
-                allow_none=True
-            )
         else:
             new_computed_block_list = self.empty_kv_cache_blocks.blocks
-            new_computed_cpu_block_ids = None
 
         # The number of computed tokens is the number of computed tokens plus
         # the new prefix caching hits
@@ -644,10 +364,6 @@ class KVCacheManager:
             self.max_model_len,
         )
 
-        gpu_total_computed_tokens = self._cots_gpu_num_tokens(total_computed_tokens)
-        gpu_num_tokens_main_model = self._cots_gpu_num_tokens(num_tokens_main_model)
-        gpu_num_tokens_need_slot = self._cots_gpu_num_tokens(num_tokens_need_slot)
-
         # Free the blocks that are skipped during the attention computation
         # (e.g., tokens outside the sliding window).
         # We can do this even if we cannot schedule this request due to
@@ -655,31 +371,25 @@ class KVCacheManager:
         # Should call this function before allocating new blocks to reduce
         # the number of evicted blocks.
         self.coordinator.remove_skipped_blocks(
-            request.request_id, gpu_total_computed_tokens
+            request.request_id, total_computed_tokens
         )
 
         num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,
-            num_tokens=gpu_num_tokens_need_slot,
+            num_tokens=num_tokens_need_slot,
             new_computed_blocks=new_computed_block_list,
             num_encoder_tokens=num_encoder_tokens,
-            total_computed_tokens=gpu_total_computed_tokens,
-            num_tokens_main_model=gpu_num_tokens_main_model,
+            total_computed_tokens=num_local_computed_tokens
+            + num_external_computed_tokens,
+            num_tokens_main_model=num_tokens_main_model,
         )
 
         if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
-            # Cannot allocate new GPU prefix blocks.
-            return None
-        if not self._cots_can_allocate_cpu_blocks(
-            request.request_id, num_tokens_need_slot, new_computed_cpu_block_ids
-        ):
-            # Cannot allocate new CPU suffix blocks. Report failure before
-            # mutating either tier so the scheduler can preempt/recompute.
+            # Cannot allocate new blocks
             return None
 
         if (
             new_computed_block_list is not self.empty_kv_cache_blocks.blocks
-            or new_computed_cpu_block_ids is not None
             or num_external_computed_tokens > 0
         ):
             # Append the new computed blocks to the request blocks until now to
@@ -687,31 +397,21 @@ class KVCacheManager:
             self.coordinator.allocate_new_computed_blocks(
                 request_id=request.request_id,
                 new_computed_blocks=new_computed_block_list,
-                num_local_computed_tokens=self._cots_gpu_num_tokens(
-                    num_local_computed_tokens
-                ),
-                num_external_computed_tokens=0
-                if self.cots_hybrid_kv_enabled
-                else num_external_computed_tokens,
-            )
-            self._cots_allocate_new_computed_cpu_blocks(
-                request.request_id, new_computed_cpu_block_ids
+                num_local_computed_tokens=num_local_computed_tokens,
+                num_external_computed_tokens=num_external_computed_tokens,
             )
 
         new_blocks = self.coordinator.allocate_new_blocks(
             request.request_id,
-            gpu_num_tokens_need_slot,
-            gpu_num_tokens_main_model,
+            num_tokens_need_slot,
+            num_tokens_main_model,
             num_encoder_tokens,
-        )
-        new_cpu_block_ids = self._cots_allocate_cpu_blocks(
-            request.request_id, num_tokens_need_slot
         )
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
         if not self.enable_caching or delay_cache_blocks:
-            return self.create_kv_cache_blocks(new_blocks, new_cpu_block_ids)
+            return self.create_kv_cache_blocks(new_blocks)
 
         # NOTE(woosuk): We want to commit (cache) up to num_local_computed_tokens
         # + num_external_computed_tokens + num_new_tokens, but must exclude
@@ -722,13 +422,9 @@ class KVCacheManager:
             total_computed_tokens + num_new_tokens,
             request.num_tokens,
         )
-        self.coordinator.cache_blocks(
-            request,
-            self._cots_gpu_num_tokens(num_tokens_to_cache),
-        )
-        self._cots_cache_cpu_blocks(request, num_tokens_to_cache)
+        self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
-        return self.create_kv_cache_blocks(new_blocks, new_cpu_block_ids)
+        return self.create_kv_cache_blocks(new_blocks)
 
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
@@ -739,8 +435,6 @@ class KVCacheManager:
             request: The request to free the blocks.
         """
         self.coordinator.free(request.request_id)
-        if self.cots_cpu_block_pool is not None:
-            self.cots_cpu_block_pool.free(request.request_id)
 
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int
@@ -772,17 +466,7 @@ class KVCacheManager:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
-        if (
-            self.cots_cpu_block_pool is not None
-            and not self.cots_cpu_block_pool.can_reset_prefix_cache()
-        ):
-            return False
         if not self.block_pool.reset_prefix_cache():
-            return False
-        if (
-            self.cots_cpu_block_pool is not None
-            and not self.cots_cpu_block_pool.reset_prefix_cache()
-        ):
             return False
         if self.log_stats:
             assert self.prefix_cache_stats is not None
@@ -833,14 +517,7 @@ class KVCacheManager:
 
     def get_blocks(self, request_id: str) -> KVCacheBlocks:
         """Get the blocks of a request."""
-        cpu_block_ids = (
-            self.cots_cpu_block_pool.get_block_ids(request_id)
-            if self.cots_cpu_block_pool is not None
-            else None
-        )
-        return self.create_kv_cache_blocks(
-            self.coordinator.get_blocks(request_id), cpu_block_ids
-        )
+        return self.create_kv_cache_blocks(self.coordinator.get_blocks(request_id))
 
     def get_block_ids(self, request_id: str) -> tuple[list[int], ...]:
         """Get the block ids of a request."""
@@ -855,22 +532,13 @@ class KVCacheManager:
                 that are already cached and tokens to be cached.
         """
         if self.enable_caching:
-            self.coordinator.cache_blocks(
-                request,
-                self._cots_gpu_num_tokens(num_computed_tokens),
-            )
-            self._cots_cache_cpu_blocks(request, num_computed_tokens)
+            self.coordinator.cache_blocks(request, num_computed_tokens)
 
     def create_kv_cache_blocks(
-        self,
-        blocks: tuple[list[KVCacheBlock], ...],
-        cpu_block_ids: tuple[list[int], ...] | None = None,
+        self, blocks: tuple[list[KVCacheBlock], ...]
     ) -> KVCacheBlocks:
-        # Only create new KVCacheBlocks for non-empty blocks.
-        has_cpu_blocks = cpu_block_ids is not None and any(cpu_block_ids)
-        if any(blocks) or has_cpu_blocks:
-            return KVCacheBlocks(blocks, cpu_block_ids)
-        return self.empty_kv_cache_blocks
+        # Only create new KVCacheBlocks for non-empty blocks
+        return KVCacheBlocks(blocks) if any(blocks) else self.empty_kv_cache_blocks
 
     def take_new_block_ids(self) -> list[int]:
         """Drain and return new attention block IDs for zeroing."""

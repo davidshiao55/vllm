@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
-// pybind11 bindings for COTS native task runners and CPU GQA attention ops.
+// pybind11 bindings for the COTS native weight task runner.
 // No torch.ops.* registration in C++ - the torch.ops.vllm.cots_* ops are
 // registered Python-side in vllm/model_executor/offloader/cots_ops.py via
 // direct_register_custom_op.
@@ -9,123 +9,12 @@
 #include <torch/extension.h>
 
 #include "cots_weight_task_runner.h"
-#include "cots_suffix_attention_task_runner.h"
 
 namespace py = pybind11;
-using vllm::cots::CotsSuffixAttentionTaskRunner;
 using vllm::cots::CotsWeightTaskRunner;
 
-namespace vllm::cots {
-void gqa_bf16_suffix_attention_at(const at::Tensor& query,
-                                  const at::Tensor& key_cache,
-                                  const at::Tensor& value_cache,
-                                  const at::Tensor& block_table,
-                                  const at::Tensor& seq_lens, double scale,
-                                  at::Tensor& output, at::Tensor& output_lse);
-void gqa_bf16_decode_attention_at(const at::Tensor& query,
-                                  const at::Tensor& key_cache,
-                                  const at::Tensor& value_cache,
-                                  const at::Tensor& block_table,
-                                  const at::Tensor& seq_lens, double scale,
-                                  at::Tensor& output, at::Tensor& output_lse);
-void gqa_bf16_prefill_attention_at(const at::Tensor& query,
-                                   const at::Tensor& key_cache,
-                                   const at::Tensor& value_cache,
-                                   const at::Tensor& block_table,
-                                   const at::Tensor& query_to_seq,
-                                   const at::Tensor& seq_lens, double scale,
-                                   at::Tensor& output, at::Tensor& output_lse);
-void gqa_bf16_scatter_suffix_kv_at(const at::Tensor& key,
-                                   const at::Tensor& value,
-                                   const at::Tensor& block_ids,
-                                   const at::Tensor& block_offsets,
-                                   at::Tensor& key_cache,
-                                   at::Tensor& value_cache);
-}  // namespace vllm::cots
-
 PYBIND11_MODULE(_cots_C, m) {
-  m.doc() = "COTS native weight/suffix task runners (vllm/csrc/cots/).";
-
-  m.def("gqa_bf16_suffix_attention", &vllm::cots::gqa_bf16_suffix_attention_at,
-        py::arg("query"), py::arg("key_cache"), py::arg("value_cache"),
-        py::arg("block_table"), py::arg("seq_lens"), py::arg("scale"),
-        py::arg("output"), py::arg("output_lse"));
-  m.def("gqa_bf16_decode_attention", &vllm::cots::gqa_bf16_decode_attention_at,
-        py::arg("query"), py::arg("key_cache"), py::arg("value_cache"),
-        py::arg("block_table"), py::arg("seq_lens"), py::arg("scale"),
-        py::arg("output"), py::arg("output_lse"));
-  m.def("gqa_bf16_prefill_attention",
-        &vllm::cots::gqa_bf16_prefill_attention_at, py::arg("query"),
-        py::arg("key_cache"), py::arg("value_cache"), py::arg("block_table"),
-        py::arg("query_to_seq"), py::arg("seq_lens"), py::arg("scale"),
-        py::arg("output"), py::arg("output_lse"));
-  m.def("gqa_bf16_scatter_suffix_kv",
-        &vllm::cots::gqa_bf16_scatter_suffix_kv_at, py::arg("key"),
-        py::arg("value"), py::arg("block_ids"), py::arg("block_offsets"),
-        py::arg("key_cache"), py::arg("value_cache"));
-  py::class_<CotsSuffixAttentionTaskRunner>(m, "CotsSuffixAttentionTaskRunner")
-      .def(py::init<>())
-      .def("install", &CotsSuffixAttentionTaskRunner::install,
-           py::arg("n_tasks"))
-      .def("populate_task", &CotsSuffixAttentionTaskRunner::populate_task,
-           py::arg("task_id"), py::arg("query_ptr"), py::arg("query_capacity"),
-           py::arg("num_q_heads"), py::arg("num_kv_heads"), py::arg("head_dim"),
-           py::arg("query_stride0"), py::arg("query_stride1"),
-           py::arg("query_stride2"), py::arg("key_cache_ptr"),
-           py::arg("num_cpu_blocks"), py::arg("block_size"),
-           py::arg("value_cache_ptr"), py::arg("block_table_ptr"),
-           py::arg("max_suffix_blocks"), py::arg("seq_lens_ptr"),
-           py::arg("output_ptr"), py::arg("output_lse_ptr"),
-           py::arg("scatter_block_ids_ptr"),
-           py::arg("scatter_block_offsets_ptr"), py::arg("scatter_key_ptr"),
-           py::arg("scatter_value_ptr"), py::arg("scatter_count"),
-           py::arg("scatter_from_qkv"), py::arg("scatter_from_separate_kv"),
-           py::arg("snapshot_inputs"), py::arg("scale"))
-      .def("submit_prepared_on_stream",
-           &CotsSuffixAttentionTaskRunner::submit_prepared_on_stream,
-           py::arg("task_id"), py::arg("cuda_stream"))
-      .def("set_runtime_counts",
-           &CotsSuffixAttentionTaskRunner::set_runtime_counts,
-           py::arg("num_tokens"), py::arg("scatter_count"))
-      .def("sync_on_stream", &CotsSuffixAttentionTaskRunner::sync_on_stream,
-           py::arg("cuda_stream"))
-      .def("sync_or_wait_on_stream",
-           &CotsSuffixAttentionTaskRunner::sync_or_wait_on_stream,
-           py::arg("task_id"), py::arg("cuda_stream"))
-      .def("install_wait_kernel_sync_for_task",
-           &CotsSuffixAttentionTaskRunner::install_wait_kernel_sync_for_task,
-           py::arg("task_id"))
-      .def("wait_kernel_sync_installed_for_task",
-           &CotsSuffixAttentionTaskRunner::wait_kernel_sync_installed_for_task,
-           py::arg("task_id"))
-      .def("wait_kernel_sync_on_stream",
-           &CotsSuffixAttentionTaskRunner::wait_kernel_sync_on_stream,
-           py::arg("task_id"), py::arg("cuda_stream"))
-      .def("wait_kernel_get_req_slot",
-           &CotsSuffixAttentionTaskRunner::wait_kernel_get_req_slot,
-           py::arg("task_id"))
-      .def("wait_kernel_get_done_slot",
-           &CotsSuffixAttentionTaskRunner::wait_kernel_get_done_slot,
-           py::arg("task_id"))
-      .def("wait_kernel_set_req_slot",
-           &CotsSuffixAttentionTaskRunner::wait_kernel_set_req_slot,
-           py::arg("task_id"), py::arg("value"))
-      .def("wait_kernel_set_done_slot",
-           &CotsSuffixAttentionTaskRunner::wait_kernel_set_done_slot,
-           py::arg("task_id"), py::arg("value"))
-      .def("sync_blocking", &CotsSuffixAttentionTaskRunner::sync_blocking)
-      .def("get_counters",
-           [](const CotsSuffixAttentionTaskRunner& self) {
-             py::dict out;
-             for (auto& [name, value] : self.get_counters()) {
-               out[py::str(name)] = value;
-             }
-             return out;
-           })
-      .def("reset_counters", &CotsSuffixAttentionTaskRunner::reset_counters)
-      .def("has_error", &CotsSuffixAttentionTaskRunner::has_error)
-      .def("take_error", &CotsSuffixAttentionTaskRunner::take_error)
-      .def("check_error", &CotsSuffixAttentionTaskRunner::check_error);
+  m.doc() = "COTS native weight task runner (vllm/csrc/cots/).";
 
   py::class_<CotsWeightTaskRunner>(m, "CotsWeightTaskRunner")
       .def(py::init<>())

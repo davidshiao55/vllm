@@ -19,7 +19,6 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import format_gib
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
-    EncoderOnlyAttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -654,144 +653,6 @@ def _check_enough_kv_cache_memory(
         )
 
 
-def _cots_hybrid_kv_enabled(vllm_config: VllmConfig) -> bool:
-    offload_config = vllm_config.offload_config
-    return (
-        offload_config is not None
-        and offload_config.offload_backend == "cots"
-        and offload_config.cots.hybrid_kv_enabled
-    )
-
-
-def _iter_cots_hybrid_kv_layer_specs(
-    kv_cache_groups: list[KVCacheGroupSpec],
-) -> Iterator[tuple[str, KVCacheSpec]]:
-    for group in kv_cache_groups:
-        group_spec = group.kv_cache_spec
-        if isinstance(group_spec, UniformTypeKVCacheSpecs):
-            for layer_name in group.layer_names:
-                yield layer_name, group_spec.kv_cache_specs[layer_name]
-        else:
-            for layer_name in group.layer_names:
-                yield layer_name, group_spec
-
-
-def _get_cots_hybrid_kv_attention_spec(
-    kv_cache_groups: list[KVCacheGroupSpec],
-) -> tuple[FullAttentionSpec, int] | None:
-    attention_spec: FullAttentionSpec | None = None
-    num_layers = 0
-    for layer_name, layer_spec in _iter_cots_hybrid_kv_layer_specs(kv_cache_groups):
-        if isinstance(layer_spec, EncoderOnlyAttentionSpec):
-            continue
-        if not isinstance(layer_spec, FullAttentionSpec):
-            raise ValueError(
-                "COTS hybrid KV Phase 2 supports only decoder full attention; "
-                f"got {type(layer_spec).__name__} for {layer_name}"
-            )
-        if (
-            layer_spec.sliding_window is not None
-            or layer_spec.attention_chunk_size is not None
-        ):
-            raise ValueError(
-                "COTS hybrid KV Phase 2 does not support sliding-window or "
-                "chunked-local attention"
-            )
-        if attention_spec is None:
-            attention_spec = layer_spec
-        elif layer_spec != attention_spec:
-            raise ValueError(
-                "COTS hybrid KV Phase 2 requires uniform attention KV specs"
-            )
-        num_layers += 1
-
-    if attention_spec is None or num_layers == 0:
-        return None
-    return attention_spec, num_layers
-
-
-def _max_memory_usage_bytes_from_groups_for_model_len(
-    vllm_config: VllmConfig,
-    kv_cache_groups: list[KVCacheGroupSpec],
-    model_len: int,
-) -> int:
-    original_max_model_len = vllm_config.model_config.max_model_len
-    vllm_config.model_config.max_model_len = model_len
-    try:
-        return _max_memory_usage_bytes_from_groups(vllm_config, kv_cache_groups)
-    finally:
-        vllm_config.model_config.max_model_len = original_max_model_len
-
-
-@dataclass(frozen=True)
-class _CotsHybridKVCapacity:
-    gpu_prefix_blocks_per_request: int
-    gpu_prefix_concurrency: float
-    cpu_suffix_blocks_per_request: int
-    cpu_blocks_total: int
-    cpu_suffix_concurrency: float
-
-    @property
-    def effective_concurrency(self) -> float:
-        return min(self.gpu_prefix_concurrency, self.cpu_suffix_concurrency)
-
-
-def _check_enough_cots_hybrid_kv_cache_memory(
-    vllm_config: VllmConfig,
-    kv_cache_groups: list[KVCacheGroupSpec],
-    available_memory: int,
-) -> None:
-    spec_info = _get_cots_hybrid_kv_attention_spec(kv_cache_groups)
-    if spec_info is None:
-        return
-
-    attention_spec, num_layers = spec_info
-    cots_config = vllm_config.offload_config.cots
-    max_model_len = vllm_config.model_config.max_model_len
-    split_tokens = cots_config.kv_split_blocks * attention_spec.block_size
-    gpu_required_tokens = min(max_model_len, split_tokens)
-
-    _check_enough_kv_cache_memory(
-        available_memory,
-        lambda: _max_memory_usage_bytes_from_groups_for_model_len(
-            vllm_config, kv_cache_groups, gpu_required_tokens
-        ),
-        gpu_required_tokens,
-        lambda am: min(
-            _estimate_max_model_len_from_groups(vllm_config, kv_cache_groups, am),
-            gpu_required_tokens,
-        ),
-    )
-
-    min_cpu_blocks = cdiv(
-        max(max_model_len - split_tokens, 0), attention_spec.block_size
-    )
-    if min_cpu_blocks <= 0:
-        raise ValueError(
-            "COTS hybrid KV split leaves no CPU suffix capacity: "
-            f"max_model_len={max_model_len}, split_tokens={split_tokens}"
-        )
-
-    bytes_per_block_per_layer = attention_spec.real_page_size_bytes
-    bytes_per_cpu_block = bytes_per_block_per_layer * num_layers
-    num_cpu_blocks = cots_config.kv_cpu_pool_bytes // bytes_per_cpu_block
-    if num_cpu_blocks < min_cpu_blocks:
-        min_cpu_pool_bytes = min_cpu_blocks * bytes_per_cpu_block
-        raise ValueError(
-            "COTS hybrid KV CPU pool must fit at least one max-length "
-            "request suffix: "
-            f"pool_bytes={cots_config.kv_cpu_pool_bytes}, "
-            f"min_pool_bytes={min_cpu_pool_bytes}, "
-            f"num_cpu_blocks={num_cpu_blocks}, "
-            f"min_cpu_blocks={min_cpu_blocks}, "
-            f"max_model_len={max_model_len}, "
-            f"split_tokens={split_tokens}, "
-            f"block_size={attention_spec.block_size}, "
-            f"bytes_per_block_per_layer={bytes_per_block_per_layer}, "
-            f"num_layers={num_layers}"
-        )
-
-
 def max_memory_usage_bytes(
     vllm_config: VllmConfig, kv_cache_specs: Iterable[KVCacheSpec]
 ) -> int:
@@ -938,67 +799,12 @@ def is_kv_cache_spec_uniform(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
     return True
 
 
-def _get_cots_hybrid_kv_capacity(
-    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
-) -> _CotsHybridKVCapacity | None:
-    if not _cots_hybrid_kv_enabled(vllm_config):
-        return None
-
-    spec_info = _get_cots_hybrid_kv_attention_spec(kv_cache_config.kv_cache_groups)
-    if spec_info is None:
-        return None
-
-    attention_spec, num_layers = spec_info
-    cots_config = vllm_config.offload_config.cots
-    max_model_len = vllm_config.model_config.max_model_len
-    split_tokens = cots_config.kv_split_blocks * attention_spec.block_size
-
-    num_layer_per_group = max(
-        len(group.layer_names) for group in kv_cache_config.kv_cache_groups
-    )
-    memory_per_gpu_block = (
-        kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
-        * num_layer_per_group
-    )
-    gpu_prefix_memory_per_request = _max_memory_usage_bytes_from_groups_for_model_len(
-        vllm_config,
-        kv_cache_config.kv_cache_groups,
-        min(max_model_len, split_tokens),
-    )
-    gpu_prefix_blocks_per_request = max(
-        cdiv(gpu_prefix_memory_per_request, memory_per_gpu_block), 1
-    )
-    gpu_prefix_concurrency = kv_cache_config.num_blocks / gpu_prefix_blocks_per_request
-
-    cpu_suffix_blocks_per_request = cdiv(
-        max(max_model_len - split_tokens, 0), attention_spec.block_size
-    )
-    if cpu_suffix_blocks_per_request <= 0:
-        return None
-    cpu_blocks_total = cots_config.kv_cpu_pool_bytes // (
-        attention_spec.real_page_size_bytes * num_layers
-    )
-    cpu_suffix_concurrency = cpu_blocks_total / cpu_suffix_blocks_per_request
-
-    return _CotsHybridKVCapacity(
-        gpu_prefix_blocks_per_request=gpu_prefix_blocks_per_request,
-        gpu_prefix_concurrency=gpu_prefix_concurrency,
-        cpu_suffix_blocks_per_request=cpu_suffix_blocks_per_request,
-        cpu_blocks_total=cpu_blocks_total,
-        cpu_suffix_concurrency=cpu_suffix_concurrency,
-    )
-
-
 def get_max_concurrency_for_kv_cache_config(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> float:
     """
     Get the maximum concurrency for the given KV cache configuration.
     """
-    cots_capacity = _get_cots_hybrid_kv_capacity(vllm_config, kv_cache_config)
-    if cots_capacity is not None:
-        return cots_capacity.effective_concurrency
-
     num_layer_per_group = max(
         len(group.layer_names) for group in kv_cache_config.kv_cache_groups
     )
@@ -1512,32 +1318,15 @@ def _report_kv_cache_config(
     num_tokens_str = f"{num_tokens:,}"
     logger.info_once("GPU KV cache size: %s tokens", num_tokens_str, scope="local")
     max_model_len_str = f"{vllm_config.model_config.max_model_len:,}"
-    cots_capacity = _get_cots_hybrid_kv_capacity(vllm_config, kv_cache_config)
-    if cots_capacity is not None:
-        logger.info_once(
-            "COTS hybrid KV capacity for %s tokens per request: "
-            "GPU prefix %d blocks/request -> %.2fx; "
-            "CPU suffix %d blocks/request over %d CPU blocks -> %.2fx; "
-            "effective %.2fx",
-            max_model_len_str,
-            cots_capacity.gpu_prefix_blocks_per_request,
-            cots_capacity.gpu_prefix_concurrency,
-            cots_capacity.cpu_suffix_blocks_per_request,
-            cots_capacity.cpu_blocks_total,
-            cots_capacity.cpu_suffix_concurrency,
-            cots_capacity.effective_concurrency,
-            scope="local",
-        )
-    else:
-        max_concurrency = get_max_concurrency_for_kv_cache_config(
-            vllm_config, kv_cache_config
-        )
-        logger.info_once(
-            "Maximum concurrency for %s tokens per request: %.2fx",
-            max_model_len_str,
-            max_concurrency,
-            scope="local",
-        )
+    max_concurrency = get_max_concurrency_for_kv_cache_config(
+        vllm_config, kv_cache_config
+    )
+    logger.info_once(
+        "Maximum concurrency for %s tokens per request: %.2fx",
+        max_model_len_str,
+        max_concurrency,
+        scope="local",
+    )
 
 
 def _max_memory_usage_bytes_from_groups(
@@ -1787,15 +1576,12 @@ def get_kv_cache_configs(
     for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
         if not groups:
             continue
-        if _cots_hybrid_kv_enabled(vllm_config):
-            _check_enough_cots_hybrid_kv_cache_memory(vllm_config, groups, avail_mem)
-        else:
-            _check_enough_kv_cache_memory(
-                avail_mem,
-                partial(_max_memory_usage_bytes_from_groups, vllm_config, groups),
-                vllm_config.model_config.max_model_len,
-                partial(_estimate_max_model_len_from_groups, vllm_config, groups),
-            )
+        _check_enough_kv_cache_memory(
+            avail_mem,
+            partial(_max_memory_usage_bytes_from_groups, vllm_config, groups),
+            vllm_config.model_config.max_model_len,
+            partial(_estimate_max_model_len_from_groups, vllm_config, groups),
+        )
 
     kv_cache_configs: list[KVCacheConfig] = []
     for projected_groups, kv_cache_spec_one_worker, available_memory_one_worker in zip(

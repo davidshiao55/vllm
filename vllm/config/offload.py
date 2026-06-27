@@ -143,20 +143,6 @@ class CotsOffloadConfig:
       quantum so the first CPU-compute slice amortizes WO's extra per-layer
       task/sync cost."""
 
-    kv_split_blocks: int = Field(default=0, ge=0)
-    """Phase 2 hybrid-KV split point in KV-cache blocks. Blocks before this
-    point remain GPU-resident and blocks at/after this point belong to the CPU
-    suffix pool. Default 0 disables the hybrid-KV path."""
-
-    kv_cpu_pool_bytes: int = Field(default=0, ge=0)
-    """Phase 2 CPU suffix KV pool size in bytes. This is planner-owned
-    capacity, distinct from vLLM's native prefix-cache KV offload feature."""
-
-    kv_h2d_mode: Literal["uva"] = "uva"
-    """Phase 2 CPU->GPU artifact path. MVP supports only UVA so small CPU
-    attention outputs/LSE and CPU-produced prefix K/V do not use the explicit
-    weight-prefetch H2D copy path."""
-
     cpu_dtype: Literal["bfloat16"] = "bfloat16"
     """CPU weight dtype. Locked to BF16: phase0 §0.3.2 confirmed F.linear with
     BF16 weights uses oneDNN's optimized BF16 path (2x faster than FP32 at
@@ -229,11 +215,9 @@ class CotsOffloadConfig:
     the measured fast graph policy.
 
     Phase 1 weight offload uses piecewise CUDA graphs, COTS weight
-    submit/sync split points, and `wait_kernel` weight sync. Phase 2 hybrid KV
-    uses piecewise CUDA graphs through the normal attention split points and
-    does not add Phase 1 weight split points unless weight offload is also
-    active. Disable this with `--no-cots-auto-graph-split` to reproduce
-    full-capture or host-callback weight-capture experiments explicitly."""
+    submit/sync split points, and `wait_kernel` weight sync. Disable this with
+    `--no-cots-auto-graph-split` to reproduce full-capture or host-callback
+    weight-capture experiments explicitly."""
 
     weight_capture_sync_mode: Literal["host_callback", "wait_kernel"] = "host_callback"
     """Phase 1 weight-offload sync mechanism for the captured-replay path.
@@ -262,22 +246,13 @@ class CotsOffloadConfig:
       as a captured node.
     * Requires CUDA + `_cots_C` extension built.
 
-    This knob controls only the Phase 1 weight runner. Phase 2 hybrid KV
-    suffix attention has its own prepared suffix runner and wait-kernel sync
-    path; graph mode for hybrid KV uses piecewise attention boundaries, not
-    the Phase 1 weight custom-op split points. Full-capture weight modes
-    remain available by disabling `auto_graph_split`.
+    Full-capture weight modes remain available by disabling `auto_graph_split`.
     """
 
     @field_validator("weight_modules", mode="before")
     @classmethod
     def normalize_weight_modules_field(cls, value: object) -> set[str]:
         return normalize_cots_weight_modules(value)
-
-    @property
-    def hybrid_kv_enabled(self) -> bool:
-        """Whether the Phase 2 hybrid CPU-suffix KV path is configured."""
-        return self.kv_split_blocks > 0 and self.kv_cpu_pool_bytes > 0
 
     @model_validator(mode="after")
     def validate_cots_config(self) -> "CotsOffloadConfig":
@@ -373,7 +348,7 @@ class OffloadConfig:
         # Warn if both backends have non-default values
         uva_active = self.uva.cpu_offload_gb > 0
         prefetch_active = self.prefetch.offload_group_size > 0
-        cots_active = self.cots.f_cpu_store > 0 or self.cots.hybrid_kv_enabled
+        cots_active = self.cots.f_cpu_store > 0
         if self.offload_backend == "uva" and prefetch_active:
             warnings.warn(
                 "Prefetch offload fields are set but offload_backend='uva'. "

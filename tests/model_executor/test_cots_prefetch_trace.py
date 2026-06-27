@@ -12,7 +12,7 @@ from vllm.model_executor.offloader.cots_storage import CotsLinearHandle
 
 def _stale_prefetch_handle() -> CotsLinearHandle:
     handle = CotsLinearHandle(
-        kind="row",
+        role="mlp_down",
         linear=torch.nn.Linear(2, 2, bias=False),
         qualified_name="test.row",
         in_dim=2,

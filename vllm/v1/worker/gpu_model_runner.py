@@ -124,7 +124,6 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import (
-    PAD_SLOT_ID,
     create_fast_prefill_custom_backend,
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
@@ -183,7 +182,6 @@ from vllm.v1.utils import (
     record_function_or_nullcontext,
 )
 from vllm.v1.worker import mamba_utils
-from vllm.v1.worker.cots_hybrid_kv import CotsHybridKVStore
 from vllm.v1.worker.cots_runtime import CotsRuntime
 from vllm.v1.worker.cp_utils import (
     check_attention_cp_compatibility,
@@ -500,7 +498,6 @@ class GPUModelRunner(
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
         self.cots_runtime = CotsRuntime()
-        self.cots_hybrid_kv: CotsHybridKVStore | None = None
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -1076,8 +1073,6 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
-            if self.cots_hybrid_kv is not None:
-                self.cots_hybrid_kv.invalidate_common_metadata_cache()
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -1328,8 +1323,6 @@ class GPUModelRunner(
             else:
                 assert req_index is None
                 assert new_block_ids is not None
-                if self.cots_hybrid_kv is not None:
-                    self.cots_hybrid_kv.invalidate_common_metadata_cache()
                 # The request is resumed from preemption.
                 # Replace the existing block IDs with the new ones.
                 req_state.block_ids = new_block_ids
@@ -1847,11 +1840,6 @@ class GPUModelRunner(
             self.input_batch.num_computed_tokens_cpu[req_indices]
             + self.query_pos.np[: cu_num_tokens[-1]]
         )
-        self.cots_hybrid_positions_cpu = positions_np
-        hybrid_kv = self.cots_hybrid_kv
-        self.cots_hybrid_has_suffix_positions = hybrid_kv is not None and bool(
-            np.any(positions_np[:total_num_scheduled_tokens] >= hybrid_kv.split_tokens)
-        )
 
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -2041,10 +2029,6 @@ class GPUModelRunner(
             self.query_start_loc.gpu[: num_reqs + 1],
             self.positions[:total_num_scheduled_tokens],
         )
-        self._mask_cots_hybrid_suffix_slot_mapping(
-            total_num_scheduled_tokens,
-            positions_np,
-        )
 
         # Copy the tensors to the GPU.
         self._prepare_input_ids(
@@ -2130,65 +2114,6 @@ class GPUModelRunner(
             spec_decode_metadata,
         )
 
-    def _mask_cots_hybrid_suffix_slot_mapping(
-        self,
-        num_tokens: int,
-        positions_np: np.ndarray | None = None,
-    ) -> None:
-        hybrid_kv = self.cots_hybrid_kv
-        if hybrid_kv is None or num_tokens == 0:
-            return
-        if (
-            positions_np is not None
-            and getattr(self, "cots_hybrid_has_suffix_positions", True) is False
-        ):
-            return
-
-        def _cpu_suffix_mask_from_positions(positions: np.ndarray) -> np.ndarray:
-            suffix_mask = positions[:num_tokens] >= hybrid_kv.split_tokens
-            if not bool(np.any(suffix_mask)):
-                return suffix_mask
-            req_indices = self.req_indices.np[:num_tokens]
-            for token_idx in np.nonzero(suffix_mask)[0]:
-                req_index = int(req_indices[token_idx])
-                if req_index < 0 or req_index >= len(self.input_batch.req_ids):
-                    suffix_mask[token_idx] = False
-                    continue
-                req_id = self.input_batch.req_ids[req_index]
-                req_state = self.requests.get(req_id)
-                has_cpu_suffix = (
-                    req_state is not None
-                    and req_state.cpu_block_ids is not None
-                    and any(req_state.cpu_block_ids)
-                )
-                if not has_cpu_suffix:
-                    suffix_mask[token_idx] = False
-            return suffix_mask
-
-        if positions_np is not None:
-            suffix_mask_np = _cpu_suffix_mask_from_positions(positions_np)
-            if not bool(np.any(suffix_mask_np)):
-                return
-            suffix_mask = torch.as_tensor(
-                suffix_mask_np,
-                dtype=torch.bool,
-                device=self.positions.device,
-            )
-        else:
-            positions_cpu = self.positions[:num_tokens].detach().cpu().numpy()
-            suffix_mask_np = _cpu_suffix_mask_from_positions(positions_cpu)
-            if not bool(np.any(suffix_mask_np)):
-                return
-            suffix_mask = torch.as_tensor(
-                suffix_mask_np,
-                dtype=torch.bool,
-                device=self.positions.device,
-            )
-
-        for kv_cache_gid in range(len(self.input_batch.block_table.block_tables)):
-            slot_mapping = self.input_batch.block_table[kv_cache_gid].slot_mapping.gpu
-            slot_mapping[:num_tokens].masked_fill_(suffix_mask, PAD_SLOT_ID)
-
     def _build_attention_metadata(
         self,
         num_tokens: int,
@@ -2214,12 +2139,6 @@ class GPUModelRunner(
         num_tokens_padded = num_tokens_padded or num_tokens
         num_reqs_padded = num_reqs_padded or num_reqs
         assert num_reqs_padded is not None and num_tokens_padded is not None
-        cots_submit_timing = envs.VLLM_COTS_HYBRID_SUBMIT_TIMING
-        cots_attn_start = time.perf_counter() if cots_submit_timing else 0.0
-        cots_attn_base_ms = 0.0
-        cots_attn_stats: dict[str, float] = {}
-        if cots_submit_timing and self.cots_hybrid_kv is not None:
-            self.cots_hybrid_kv.reset_submit_timing_stats()
 
         attn_metadata: PerLayerAttnMetadata = {}
         if ubatch_slices is not None:
@@ -2324,8 +2243,6 @@ class GPUModelRunner(
         cached_attn_metadata: dict[
             tuple[KVCacheSpec, type[AttentionMetadataBuilder]], AttentionMetadata
         ] = {}
-        if cots_submit_timing:
-            cots_attn_base_ms = (time.perf_counter() - cots_attn_start) * 1000.0
 
         def _build_attn_group_metadata(
             kv_cache_gid: int,
@@ -2358,7 +2275,6 @@ class GPUModelRunner(
                     ],
                 )
 
-            cots_builder_start = time.perf_counter() if cots_submit_timing else 0.0
             if for_cudagraph_capture:
                 attn_metadata_i = builder.build_for_cudagraph_capture(
                     common_attn_metadata
@@ -2380,14 +2296,6 @@ class GPUModelRunner(
                 )
                 if builder.supports_update_block_table:
                     cached_attn_metadata[cache_key] = attn_metadata_i
-            if cots_submit_timing:
-                cots_attn_stats["builder_ms"] = (
-                    cots_attn_stats.get("builder_ms", 0.0)
-                    + (time.perf_counter() - cots_builder_start) * 1000.0
-                )
-                cots_attn_stats["builder_calls"] = (
-                    cots_attn_stats.get("builder_calls", 0.0) + 1.0
-                )
 
             if ubid is None:
                 assert isinstance(attn_metadata, dict)
@@ -2396,135 +2304,8 @@ class GPUModelRunner(
                 assert isinstance(attn_metadata, list)
                 attn_metadata_dict = attn_metadata[ubid]
 
-            cots_scan_start = time.perf_counter() if cots_submit_timing else 0.0
-            cots_hybrid_positions_cpu = getattr(self, "cots_hybrid_positions_cpu", None)
-            cots_hybrid_has_suffix_positions = True
-            if self.cots_hybrid_kv is not None and not for_cudagraph_capture:
-                cached_has_suffix = getattr(
-                    self, "cots_hybrid_has_suffix_positions", None
-                )
-                if cached_has_suffix is None and cots_hybrid_positions_cpu is not None:
-                    cots_hybrid_has_suffix_positions = bool(
-                        np.any(
-                            cots_hybrid_positions_cpu[:num_tokens]
-                            >= self.cots_hybrid_kv.split_tokens
-                        )
-                    )
-                elif cached_has_suffix is not None:
-                    cots_hybrid_has_suffix_positions = bool(cached_has_suffix)
-            if cots_submit_timing:
-                cots_attn_stats["suffix_scan_ms"] = (
-                    cots_attn_stats.get("suffix_scan_ms", 0.0)
-                    + (time.perf_counter() - cots_scan_start) * 1000.0
-                )
-                suffix_bucket = (
-                    "suffix_scan_true"
-                    if cots_hybrid_has_suffix_positions
-                    else "suffix_scan_false"
-                )
-                cots_attn_stats[suffix_bucket] = (
-                    cots_attn_stats.get(suffix_bucket, 0.0) + 1.0
-                )
-            cots_hybrid_common_metadata = None
-
-            def _with_cots_hybrid_decode_metadata(
-                metadata: AttentionMetadata,
-                layer_name: str,
-            ) -> AttentionMetadata:
-                if self.cots_hybrid_kv is None:
-                    return metadata
-                if ubid is not None:
-                    raise ValueError(
-                        "COTS hybrid KV Phase 2 does not support ubatched attention"
-                    )
-                if not hasattr(metadata, "cots_hybrid_decode"):
-                    raise ValueError(
-                        "COTS hybrid KV Phase 2 currently requires FlashAttention "
-                        f"metadata, got {type(metadata).__name__}"
-                    )
-                if not for_cudagraph_capture and not cots_hybrid_has_suffix_positions:
-                    return metadata
-
-                cpu_block_ids_by_req: list[tuple[list[int], ...] | None]
-                hybrid_req_ids: Sequence[str]
-                if for_cudagraph_capture:
-                    cpu_block_ids_by_req = [
-                        ([req_index % self.cots_hybrid_kv.num_cpu_blocks],)
-                        for req_index in range(num_reqs)
-                    ]
-                    hybrid_req_ids = tuple(
-                        f"cots_cudagraph_capture_{req_index}"
-                        for req_index in range(num_reqs)
-                    )
-                    hybrid_prompt_lens_cpu = torch.zeros(
-                        num_reqs,
-                        dtype=self.input_batch.num_prompt_tokens_cpu_tensor.dtype,
-                    )
-                    hybrid_is_prefilling_cpu = torch.zeros(
-                        num_reqs,
-                        dtype=torch.bool,
-                    )
-                else:
-                    cpu_block_ids_by_req = [
-                        self.requests[req_id].cpu_block_ids
-                        for req_id in self.input_batch.req_ids[:num_reqs]
-                    ]
-                    hybrid_req_ids = self.input_batch.req_ids[:num_reqs]
-                    hybrid_prompt_lens_cpu = (
-                        self.input_batch.num_prompt_tokens_cpu_tensor
-                    )
-                    hybrid_is_prefilling_cpu = common_attn_metadata.is_prefilling
-                cots_hybrid_start = time.perf_counter() if cots_submit_timing else 0.0
-                nonlocal cots_hybrid_common_metadata
-                if cots_hybrid_common_metadata is None:
-                    hybrid_decode_metadata = self.cots_hybrid_kv.build_decode_metadata(
-                        layer_name=layer_name,
-                        req_ids=hybrid_req_ids,
-                        seq_lens_cpu=self.optimistic_seq_lens_cpu,
-                        prompt_lens_cpu=hybrid_prompt_lens_cpu,
-                        is_prefilling_cpu=hybrid_is_prefilling_cpu,
-                        max_query_len=common_attn_metadata.max_query_len,
-                        num_actual_tokens=num_tokens,
-                        cpu_block_ids_by_req=cpu_block_ids_by_req,
-                        req_indices_cpu=self.req_indices.np[:num_tokens],
-                        req_indices_gpu=self.req_indices.gpu[:num_tokens],
-                        positions_cpu=cots_hybrid_positions_cpu[:num_tokens]
-                        if cots_hybrid_positions_cpu is not None
-                        else None,
-                    )
-                    if hybrid_decode_metadata is not None:
-                        cots_hybrid_common_metadata = hybrid_decode_metadata
-                else:
-                    hybrid_decode_metadata = (
-                        self.cots_hybrid_kv.build_decode_metadata_from_common(
-                            layer_name=layer_name,
-                            common_metadata=cots_hybrid_common_metadata,
-                        )
-                    )
-                if cots_submit_timing:
-                    cots_attn_stats["hybrid_build_ms"] = (
-                        cots_attn_stats.get("hybrid_build_ms", 0.0)
-                        + (time.perf_counter() - cots_hybrid_start) * 1000.0
-                    )
-                    cots_attn_stats["hybrid_build_calls"] = (
-                        cots_attn_stats.get("hybrid_build_calls", 0.0) + 1.0
-                    )
-                if hybrid_decode_metadata is None:
-                    return metadata
-                if cots_submit_timing:
-                    cots_attn_stats["hybrid_attached"] = (
-                        cots_attn_stats.get("hybrid_attached", 0.0) + 1.0
-                    )
-                layer_metadata = copy(metadata)
-                layer_metadata.cots_hybrid_decode = (  # type: ignore[attr-defined]
-                    hybrid_decode_metadata
-                )
-                return layer_metadata
-
             for layer_name in attn_group.layer_names:
-                attn_metadata_dict[layer_name] = _with_cots_hybrid_decode_metadata(
-                    attn_metadata_i, layer_name
-                )
+                attn_metadata_dict[layer_name] = attn_metadata_i
 
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
@@ -2587,37 +2368,6 @@ class GPUModelRunner(
             # padded attention metadata.
             spec_decode_common_attn_metadata = (
                 spec_decode_common_attn_metadata.unpadded(num_tokens, num_reqs)
-            )
-
-        if cots_submit_timing:
-            cots_attn_total_ms = (time.perf_counter() - cots_attn_start) * 1000.0
-            kv_submit_stats = (
-                self.cots_hybrid_kv.drain_submit_timing_stats()
-                if self.cots_hybrid_kv is not None
-                else {}
-            )
-            cots_attn_parts = " ".join(
-                f"{name}={value:.3f}" for name, value in sorted(cots_attn_stats.items())
-            )
-            kv_submit_parts = " ".join(
-                f"kv_{name}={value:.3f}"
-                for name, value in sorted(kv_submit_stats.items())
-            )
-            logger.info(
-                "COTS submit attention timing tokens=%d reqs=%d max_query_len=%d "
-                "padded_tokens=%d padded_reqs=%d capture=%d hybrid=%d "
-                "total_ms=%.3f base_ms=%.3f %s %s",
-                num_tokens,
-                num_reqs,
-                max_query_len,
-                num_tokens_padded,
-                num_reqs_padded,
-                int(for_cudagraph_capture),
-                int(self.cots_hybrid_kv is not None),
-                cots_attn_total_ms,
-                cots_attn_base_ms,
-                cots_attn_parts,
-                kv_submit_parts,
             )
 
         return attn_metadata, spec_decode_common_attn_metadata
@@ -4055,10 +3805,6 @@ class GPUModelRunner(
         self.cots_runtime.on_dispatch(
             batch_descriptor=batch_descriptor,
             num_tokens_unpadded=num_tokens_unpadded,
-            positions_cpu=getattr(self, "cots_hybrid_positions_cpu", None),
-            positions_have_suffix=getattr(
-                self, "cots_hybrid_has_suffix_positions", None
-            ),
             trace_context=trace_context,
         )
 
@@ -4120,26 +3866,12 @@ class GPUModelRunner(
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        cots_submit_timing = envs.VLLM_COTS_HYBRID_SUBMIT_TIMING
-        cots_submit_start = time.perf_counter() if cots_submit_timing else 0.0
-        cots_submit_last = cots_submit_start
-        cots_submit_segments: list[tuple[str, float]] = []
-
-        def _cots_submit_mark(bucket: str) -> None:
-            nonlocal cots_submit_last
-            if not cots_submit_timing:
-                return
-            now = time.perf_counter()
-            cots_submit_segments.append((bucket, (now - cots_submit_last) * 1000.0))
-            cots_submit_last = now
-
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
         ):
             # Update persistent batch states.
             deferred_state_corrections_fn = self._update_states(scheduler_output)
-            _cots_submit_mark("update_states_ms")
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
@@ -4180,13 +3912,11 @@ class GPUModelRunner(
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
-            _cots_submit_mark("batch_arrays_ms")
 
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
-            _cots_submit_mark("prepare_inputs_ms")
 
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
@@ -4197,7 +3927,6 @@ class GPUModelRunner(
                     self.input_batch.num_computed_tokens_cpu[:num_reqs],
                     scheduler_output.num_common_prefix_blocks,
                 )
-            _cots_submit_mark("cascade_prefix_ms")
 
             (
                 cudagraph_mode,
@@ -4213,7 +3942,6 @@ class GPUModelRunner(
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
-            _cots_submit_mark("batch_descriptor_ms")
 
             logger.debug(
                 "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
@@ -4235,7 +3963,6 @@ class GPUModelRunner(
                 num_reqs_padded,
                 self.parallel_config.num_ubatches,
             )
-            _cots_submit_mark("ubatch_slices_ms")
 
             logger.debug(
                 "ubatch_slices: %s, ubatch_slices_padded: %s",
@@ -4255,7 +3982,6 @@ class GPUModelRunner(
                 if not isinstance(spec.kv_cache_spec, EncoderOnlyAttentionSpec)
             )
             pad_attn = cudagraph_mode == CUDAGraphMode.FULL
-            _cots_submit_mark("kv_update_check_ms")
 
             if self.cache_config.mamba_cache_mode == "align":
                 # preprocess_mamba reads req_state.num_computed_tokens (CPU)
@@ -4283,7 +4009,6 @@ class GPUModelRunner(
                     self.input_batch.num_accepted_tokens_cpu[:num_reqs]
                 )
                 self.num_accepted_tokens.copy_to_gpu(num_reqs)
-            _cots_submit_mark("mamba_ms")
 
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
@@ -4298,7 +4023,6 @@ class GPUModelRunner(
                 num_tokens_unpadded=num_tokens_unpadded,
                 ubatch_slices=ubatch_slices_padded,
             )
-            _cots_submit_mark("slot_mappings_ms")
 
             attn_metadata, spec_decode_common_attn_metadata = (
                 self._build_attention_metadata(
@@ -4315,7 +4039,6 @@ class GPUModelRunner(
                     slot_mappings=slot_mappings_by_group,
                 )
             )
-            _cots_submit_mark("attention_metadata_ms")
 
             (
                 input_ids,
@@ -4327,7 +4050,6 @@ class GPUModelRunner(
             ) = self._preprocess(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
-            _cots_submit_mark("preprocess_inputs_ms")
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
@@ -4365,7 +4087,6 @@ class GPUModelRunner(
                 "cudagraph_mode": cudagraph_mode.name,
                 "should_ubatch": bool(should_ubatch),
                 "pad_attn": bool(pad_attn),
-                "hybrid_kv": bool(self.cots_hybrid_kv is not None),
             }
             trace_forward_start = time.perf_counter()
 
@@ -4375,7 +4096,6 @@ class GPUModelRunner(
             num_tokens_unpadded,
             trace_context=trace_context,
         )
-        _cots_submit_mark("publish_dispatch_ms")
 
         # Use persistent buffers for CUDA graphs.
         # When spec decode is enabled, defer connector finalization
@@ -4429,7 +4149,6 @@ class GPUModelRunner(
                     )
                 finally:
                     torch.cuda.nvtx.range_pop()
-        _cots_submit_mark("forward_launch_ms")
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4489,7 +4208,6 @@ class GPUModelRunner(
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
-        _cots_submit_mark("postprocess_ms")
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
@@ -4509,7 +4227,6 @@ class GPUModelRunner(
         # previous model forward without breaking async scheduling.
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
-        _cots_submit_mark("deferred_corrections_ms")
 
         if trace_context is not None:
             payload = {
@@ -4519,26 +4236,6 @@ class GPUModelRunner(
                 * 1000.0,
             }
             logger.info("COTS_FORWARD_TRACE %s", json.dumps(payload, sort_keys=True))
-
-        if cots_submit_timing:
-            cots_submit_total_ms = (time.perf_counter() - cots_submit_start) * 1000.0
-            cots_submit_parts = " ".join(
-                f"{name}={value:.3f}" for name, value in cots_submit_segments
-            )
-            logger.info(
-                "COTS submit timing tokens=%d reqs=%d max_query_len=%d "
-                "padded_tokens=%d pad_attn=%d cudagraph_mode=%s hybrid=%d "
-                "total_ms=%.3f %s",
-                num_tokens_unpadded,
-                num_reqs,
-                max_num_scheduled_tokens,
-                num_tokens_padded,
-                int(pad_attn),
-                cudagraph_mode.name,
-                int(self.cots_hybrid_kv is not None),
-                cots_submit_total_ms,
-                cots_submit_parts,
-            )
 
         return None
 
@@ -4749,9 +4446,6 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
-                cots_hybrid_kv_stats=self.cots_hybrid_kv.drain_runtime_stats()
-                if self.cots_hybrid_kv is not None
-                else None,
             )
 
         if not self.use_async_scheduling:
@@ -5800,25 +5494,6 @@ class GPUModelRunner(
                     )
                 else:
                     seq_lens = max_query_len  # type: ignore[assignment]
-                if (
-                    is_graph_capturing
-                    and self.cots_hybrid_kv is not None
-                    and uniform_decode
-                    and max_query_len == 1
-                ):
-                    seq_lens = (  # type: ignore[assignment]
-                        self.cots_hybrid_kv.split_tokens + 1
-                    )
-                    self.cots_hybrid_positions_cpu = np.full(
-                        num_tokens_unpadded,
-                        self.cots_hybrid_kv.split_tokens,
-                        dtype=np.int64,
-                    )
-                    self.cots_hybrid_has_suffix_positions = True
-                    self.req_indices.np[:num_tokens_unpadded] = np.arange(
-                        num_tokens_unpadded, dtype=np.int64
-                    )
-                    self.req_indices.copy_to_gpu(num_tokens_unpadded)
                 self.optimistic_seq_lens_cpu[:num_reqs] = seq_lens
                 self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
                 self.seq_lens.copy_(self.optimistic_seq_lens_cpu, non_blocking=True)
@@ -7194,96 +6869,6 @@ class GPUModelRunner(
         )
         return kv_caches
 
-    def _maybe_initialize_cots_hybrid_kv(
-        self,
-        kv_cache_config: KVCacheConfig,
-        kv_caches: dict[str, torch.Tensor],
-        kernel_block_sizes: list[int],
-    ) -> None:
-        self.cots_hybrid_kv = None
-        self.cots_runtime.set_hybrid_kv(None)
-        cots_config = self.offload_config.cots
-        if (
-            self.offload_config.offload_backend != "cots"
-            or not cots_config.hybrid_kv_enabled
-        ):
-            return
-        if len(kernel_block_sizes) != 1:
-            raise ValueError(
-                "COTS hybrid KV Phase 2 supports exactly one decoder KV cache group"
-            )
-
-        layer_names: list[str] = []
-        attention_spec: AttentionSpec | None = None
-        for kv_cache_group in kv_cache_config.kv_cache_groups:
-            kv_cache_spec = kv_cache_group.kv_cache_spec
-            if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
-                layer_specs = kv_cache_spec.kv_cache_specs
-            else:
-                layer_specs = {
-                    layer_name: kv_cache_spec
-                    for layer_name in kv_cache_group.layer_names
-                }
-
-            for layer_name, layer_spec in layer_specs.items():
-                if layer_name in self.runner_only_attn_layers:
-                    continue
-                if isinstance(layer_spec, EncoderOnlyAttentionSpec):
-                    continue
-                if not isinstance(layer_spec, FullAttentionSpec):
-                    raise ValueError(
-                        "COTS hybrid KV Phase 2 supports only decoder full attention; "
-                        f"got {type(layer_spec).__name__} for {layer_name}"
-                    )
-                if (
-                    layer_spec.sliding_window is not None
-                    or layer_spec.attention_chunk_size is not None
-                ):
-                    raise ValueError(
-                        "COTS hybrid KV Phase 2 does not support sliding-window or "
-                        "chunked-local attention"
-                    )
-                if attention_spec is None:
-                    attention_spec = layer_spec
-                elif layer_spec != attention_spec:
-                    raise ValueError(
-                        "COTS hybrid KV Phase 2 requires uniform attention KV specs"
-                    )
-                if layer_name in kv_caches:
-                    layer_names.append(layer_name)
-
-        if attention_spec is None or not layer_names:
-            raise ValueError(
-                "COTS hybrid KV was enabled but no attention KV layers exist"
-            )
-
-        self.cots_hybrid_kv = CotsHybridKVStore(
-            layer_names=layer_names,
-            split_blocks=cots_config.kv_split_blocks,
-            cpu_pool_bytes=cots_config.kv_cpu_pool_bytes,
-            block_size=kernel_block_sizes[0],
-            num_kv_heads=attention_spec.num_kv_heads,
-            head_size=attention_spec.head_size,
-            dtype=attention_spec.dtype,
-            num_query_heads=self.num_query_heads,
-            max_num_reqs=self.max_num_reqs,
-            max_model_len=self.max_model_len,
-            pin_memory=self.pin_memory,
-            enable_suffix_read_events=self.model_config.enforce_eager,
-        )
-        self.cots_runtime.set_hybrid_kv(self.cots_hybrid_kv)
-        logger.info(
-            "Initialized COTS hybrid CPU KV store: split_blocks=%d, "
-            "block_size=%d, split_tokens=%d, cpu_blocks=%d, layers=%d, "
-            "cpu_pool_bytes=%d",
-            self.cots_hybrid_kv.split_blocks,
-            self.cots_hybrid_kv.block_size,
-            self.cots_hybrid_kv.split_tokens,
-            self.cots_hybrid_kv.num_cpu_blocks,
-            len(layer_names),
-            cots_config.kv_cpu_pool_bytes,
-        )
-
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(
         self, kv_cache_config: KVCacheConfig
     ) -> None:
@@ -7342,9 +6927,6 @@ class GPUModelRunner(
         self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
         kv_caches = self.initialize_kv_cache_tensors(
             kv_cache_config, kernel_block_sizes
-        )
-        self._maybe_initialize_cots_hybrid_kv(
-            kv_cache_config, kv_caches, kernel_block_sizes
         )
 
         if (
