@@ -1849,7 +1849,7 @@ class CotsOffloader(BaseOffloader):
                 "GPU attention group"
             )
         cpu_weight_groups = n_cpu // qkv_group
-        cpu_compute_kv_heads, prefetch_kv_heads = self._head_split_kv_group_plan(
+        cpu_compute_kv_heads, prefetch_kv_heads = self._lookup_head_split_kv_dispatch(
             bucket=bucket,
             cpu_attention_groups=cpu_attention_groups,
             cpu_weight_groups=cpu_weight_groups,
@@ -1864,19 +1864,20 @@ class CotsOffloader(BaseOffloader):
             int(h.head_dim),
         )
 
-    def _head_split_kv_group_plan(
+    def _lookup_head_split_kv_dispatch(
         self,
         *,
         bucket: int,
         cpu_attention_groups: int,
         cpu_weight_groups: int,
     ) -> tuple[int, int]:
-        """Return the 3-way KV group geometry for one bucket.
+        """Return the planner-emitted 3-way KV dispatch row for one bucket.
 
         ``cpu_attention_groups`` is the static CPU-owned KV count ``A``. The
         returned pair is ``(C, P)`` where ``C`` is the CPU-compute attention
         island and ``P`` is the CPU-owned KV prefix that the 3-way path
-        prefetches to GPU attention.
+        prefetches to GPU attention. vLLM validates this row but does not
+        derive policy when 3-way KV prefetch is enabled.
         """
 
         if not self.kv_head_prefetch_enabled:
@@ -1891,18 +1892,18 @@ class CotsOffloader(BaseOffloader):
         cpu_compute, prefetch = entry.kv_group_pair
         if cpu_compute < 0 or prefetch < 0:
             raise RuntimeError(
-                "COTS head-split KV group plan must be non-negative: "
+                "COTS head-split KV dispatch row must be non-negative: "
                 f"C={cpu_compute}, P={prefetch}"
             )
         if cpu_compute + prefetch != int(cpu_attention_groups):
             raise RuntimeError(
-                "COTS head-split KV group plan must cover all CPU-owned "
+                "COTS head-split KV dispatch row must cover all CPU-owned "
                 f"KV groups: C={cpu_compute}, P={prefetch}, "
                 f"A={cpu_attention_groups}"
             )
         if int(cpu_compute) != int(cpu_weight_groups):
             raise RuntimeError(
-                "COTS head-split KV group plan must match snapped WQKV "
+                "COTS head-split KV dispatch row must match snapped WQKV "
                 f"CPU-compute groups: C={cpu_compute}, "
                 f"WQKV={cpu_weight_groups}, bucket={bucket}"
             )
