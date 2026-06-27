@@ -3,7 +3,7 @@
 """Configuration for model weight offloading."""
 
 import warnings
-from typing import Any, Literal, TypeAlias
+from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 
@@ -15,105 +15,6 @@ from vllm.config.cots import (
 from vllm.config.utils import config
 
 OffloadBackend = Literal["auto", "uva", "prefetch", "prefetch_defer", "cots"]
-
-CotsDispatchWeightEntry: TypeAlias = tuple[float, float]
-CotsDispatchKVGroupEntry: TypeAlias = tuple[int, int]
-CotsDispatchTableEntry: TypeAlias = (
-    CotsDispatchWeightEntry | tuple[CotsDispatchWeightEntry, CotsDispatchKVGroupEntry]
-)
-
-
-def _dispatch_entry_context(label: str, bucket: int | None) -> str:
-    if bucket is None:
-        return label
-    return f"{label} entry for bucket {bucket}"
-
-
-def _dispatch_pair(value: Any, *, context: str, name: str) -> tuple[Any, Any]:
-    if not isinstance(value, (list, tuple)) or len(value) != 2:
-        raise ValueError(f"{context} {name} must be a two-item sequence")
-    return value[0], value[1]
-
-
-def _dispatch_float_pair(
-    value: Any, *, context: str, name: str
-) -> CotsDispatchWeightEntry:
-    left, right = _dispatch_pair(value, context=context, name=name)
-    try:
-        return float(left), float(right)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{context} {name} values must be numeric") from exc
-
-
-def _dispatch_group_count(value: Any, *, context: str, name: str) -> int:
-    if isinstance(value, bool):
-        raise ValueError(f"{context} {name} must be a non-negative integer")
-    if isinstance(value, float) and not value.is_integer():
-        raise ValueError(f"{context} {name} must be a non-negative integer")
-    try:
-        group_count = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{context} {name} must be a non-negative integer") from exc
-    if group_count < 0:
-        raise ValueError(f"{context} {name} must be non-negative")
-    return group_count
-
-
-def _dispatch_group_pair(
-    value: Any, *, context: str, name: str
-) -> CotsDispatchKVGroupEntry:
-    left, right = _dispatch_pair(value, context=context, name=name)
-    return (
-        _dispatch_group_count(left, context=context, name=f"{name}[0]"),
-        _dispatch_group_count(right, context=context, name=f"{name}[1]"),
-    )
-
-
-def normalize_cots_dispatch_table_entry(
-    entry: Any,
-    *,
-    label: str = "cots.dispatch_table",
-    bucket: int | None = None,
-) -> CotsDispatchTableEntry:
-    """Normalize one COTS dispatch row.
-
-    Accepted row forms:
-      * ``(f_cpu_compute, f_prefetch_compute)`` for legacy weight-only rows.
-      * ``((f_cpu_compute, f_prefetch_compute), (C, P))`` where ``C`` is the
-        CPU-attention GQA group count and ``P`` is the KV-prefetch group count.
-    """
-
-    context = _dispatch_entry_context(label, bucket)
-    first, second = _dispatch_pair(entry, context=context, name="value")
-    nested = isinstance(first, (list, tuple)) or isinstance(second, (list, tuple))
-    if not nested:
-        return _dispatch_float_pair(entry, context=context, name="weight tuple")
-    return (
-        _dispatch_float_pair(first, context=context, name="weight tuple"),
-        _dispatch_group_pair(second, context=context, name="KV group tuple"),
-    )
-
-
-def cots_dispatch_weight_pair(
-    entry: CotsDispatchTableEntry,
-) -> CotsDispatchWeightEntry:
-    first, second = _dispatch_pair(
-        entry, context="cots.dispatch_table entry", name="value"
-    )
-    if isinstance(first, tuple) and isinstance(second, tuple):
-        return first
-    return float(first), float(second)
-
-
-def cots_dispatch_kv_group_pair(
-    entry: CotsDispatchTableEntry,
-) -> CotsDispatchKVGroupEntry | None:
-    first, second = _dispatch_pair(
-        entry, context="cots.dispatch_table entry", name="value"
-    )
-    if isinstance(first, tuple) and isinstance(second, tuple):
-        return second
-    return None
 
 
 @config
@@ -218,7 +119,7 @@ class CotsOffloadConfig:
     CPU-stored bytes; the f_cpu_compute = f_cpu_store - f_prefetch portion is
     CPU-computed). Default 0.0 keeps the CPU-stored slice CPU-computed."""
 
-    dispatch_table: dict[int, CotsDispatchTableEntry] | None = Field(default=None)
+    dispatch_table: dict[int, tuple[float, float]] | None = Field(default=None)
     """Optional engine-local COTS compute dispatch table emitted by the
     Planner. Keys are vLLM `BatchDescriptor.num_tokens` bucket values. Values
     are `(f_cpu_compute, f_prefetch_compute)` for that bucket. When set, this
@@ -272,23 +173,6 @@ class CotsOffloadConfig:
     """Phase 2 CPU->GPU artifact path. MVP supports only UVA so small CPU
     attention outputs/LSE and CPU-produced prefix K/V do not use the explicit
     weight-prefetch H2D copy path."""
-
-    kv_head_prefetch_enabled: bool = Field(default=False)
-    """Experimental 3-way head-split KV prefetch gate.
-
-    When enabled with ``kv_mode='head_split'``, the runtime may split CPU-owned
-    GQA groups between CPU attention and GPU attention fed by an H2D KV
-    prefetch buffer. Default false preserves the current 2-way head-split path.
-    """
-
-    kv_prefetch_max_active_blocks: int = Field(default=0, ge=0)
-    """Workload-contract capacity for the 3-way head-split KV prefetch buffer.
-
-    This is the maximum number of compact logical KV blocks that one forward is
-    allowed to stage for prefetched CPU-owned GQA groups. It is not the global
-    vLLM KV-cache block count. Required when ``kv_head_prefetch_enabled`` is
-    true; default 0 keeps the field inert for 2-way head-split KV.
-    """
 
     cpu_dtype: Literal["bfloat16"] = "bfloat16"
     """CPU weight dtype. Locked to BF16: phase0 §0.3.2 confirmed F.linear with
@@ -422,11 +306,6 @@ class CotsOffloadConfig:
         return self.kv_mode == "head_split" and self.f_cpu_kv_store > 0
 
     @property
-    def head_split_kv_prefetch_enabled(self) -> bool:
-        """Whether experimental 3-way head-split KV prefetch is configured."""
-        return self.head_split_kv_enabled and self.kv_head_prefetch_enabled
-
-    @property
     def cots_kv_enabled(self) -> bool:
         """Whether any COTS KV offload path is configured."""
         return self.hybrid_kv_enabled or self.head_split_kv_enabled
@@ -442,21 +321,17 @@ class CotsOffloadConfig:
                 "CPU-stored bytes."
             )
 
-        def validate_table(
-            label: str, table: dict[int, CotsDispatchTableEntry]
-        ) -> dict[int, CotsDispatchTableEntry]:
-            normalized: dict[int, CotsDispatchTableEntry] = {}
+        def validate_table(label: str, table: dict[int, tuple[float, float]]) -> None:
             for bucket, entry in table.items():
                 if bucket <= 0:
                     raise ValueError(
                         f"{label} bucket keys must be positive; got {bucket}"
                     )
-                normalized_entry = normalize_cots_dispatch_table_entry(
-                    entry, label=label, bucket=int(bucket)
-                )
-                f_cpu_compute, f_prefetch_compute = cots_dispatch_weight_pair(
-                    normalized_entry
-                )
+                if len(entry) != 2:
+                    raise ValueError(
+                        f"{label} values must be (f_cpu_compute, f_prefetch_compute)"
+                    )
+                f_cpu_compute, f_prefetch_compute = entry
                 if f_cpu_compute < 0 or f_prefetch_compute < 0:
                     raise ValueError(
                         f"{label} fractions must be non-negative; "
@@ -475,15 +350,9 @@ class CotsOffloadConfig:
                         f"bucket={bucket}, entry={entry}, "
                         f"f_cpu_store={self.f_cpu_store}"
                     )
-                normalized[int(bucket)] = normalized_entry
-            return normalized
 
         if self.dispatch_table is not None:
-            object.__setattr__(
-                self,
-                "dispatch_table",
-                validate_table("cots.dispatch_table", self.dispatch_table),
-            )
+            validate_table("cots.dispatch_table", self.dispatch_table)
 
         if self.kv_mode == "prefix_suffix" and self.f_cpu_kv_store > 0:
             raise ValueError(
@@ -496,16 +365,6 @@ class CotsOffloadConfig:
                 "cots.kv_split_blocks/cots.kv_cpu_pool_bytes apply only to "
                 "cots.kv_mode='prefix_suffix'. Use cots.f_cpu_kv_store for "
                 "head_split KV."
-            )
-        if self.kv_head_prefetch_enabled and not self.head_split_kv_enabled:
-            raise ValueError(
-                "cots.kv_head_prefetch_enabled requires cots.kv_mode='head_split' "
-                "and cots.f_cpu_kv_store > 0."
-            )
-        if self.kv_head_prefetch_enabled and self.kv_prefetch_max_active_blocks <= 0:
-            raise ValueError(
-                "cots.kv_prefetch_max_active_blocks must be > 0 when "
-                "cots.kv_head_prefetch_enabled is true."
             )
 
         return self

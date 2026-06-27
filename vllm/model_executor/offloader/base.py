@@ -257,22 +257,14 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
         # hybrid KV runtime, but with zero weight placement there is no Phase 1
         # weight work to install or dispatch. Keep that path as a true no-op so
         # every forward does not pay CotsOffloader bucket bookkeeping.
-        if (
-            cots.f_cpu_store == 0.0
-            and cots.f_prefetch == 0.0
-            and not cots.head_split_kv_prefetch_enabled
-        ):
+        if cots.f_cpu_store == 0.0 and cots.f_prefetch == 0.0:
             return NoopOffloader()
 
         dispatch_table_factory = None
         if cots.dispatch_table is not None:
-            from vllm.config.offload import normalize_cots_dispatch_table_entry
-
             configured_table = {
-                int(bucket): normalize_cots_dispatch_table_entry(
-                    entry, label="cots.dispatch_table", bucket=int(bucket)
-                )
-                for bucket, entry in cots.dispatch_table.items()
+                int(bucket): (float(pair[0]), float(pair[1]))
+                for bucket, pair in cots.dispatch_table.items()
             }
 
             def dispatch_table_factory(dispatch_buckets):

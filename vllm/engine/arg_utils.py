@@ -83,7 +83,6 @@ from vllm.config.model import (
 )
 from vllm.config.multimodal import MMCacheType, MMEncoderTPMode, MMTensorIPC
 from vllm.config.observability import DetailedTraceModules
-from vllm.config.offload import CotsDispatchTableEntry
 from vllm.config.parallel import (
     All2AllBackend,
     DataParallelBackend,
@@ -471,7 +470,7 @@ class EngineArgs:
     prefetch_dry_run: bool = PrefetchOffloadConfig.dry_run
     cots_f_cpu_store: float = CotsOffloadConfig.f_cpu_store
     cots_f_prefetch: float = CotsOffloadConfig.f_prefetch
-    cots_dispatch_table: dict[int, CotsDispatchTableEntry] | None = (
+    cots_dispatch_table: dict[int, tuple[float, float]] | None = (
         CotsOffloadConfig.dispatch_table
     )
     cots_weight_modules: set[str] = get_field(CotsOffloadConfig, "weight_modules")
@@ -480,10 +479,6 @@ class EngineArgs:
     cots_f_cpu_kv_store: float = CotsOffloadConfig.f_cpu_kv_store
     cots_kv_mode: Literal["prefix_suffix", "head_split"] = CotsOffloadConfig.kv_mode
     cots_kv_h2d_mode: Literal["uva"] = CotsOffloadConfig.kv_h2d_mode
-    cots_kv_head_prefetch_enabled: bool = CotsOffloadConfig.kv_head_prefetch_enabled
-    cots_kv_prefetch_max_active_blocks: int = (
-        CotsOffloadConfig.kv_prefetch_max_active_blocks
-    )
     cots_cpu_num_threads: int = CotsOffloadConfig.cpu_num_threads
     cots_cpu_num_threads_by_bucket: dict[int, int] | None = (
         CotsOffloadConfig.cpu_num_threads_by_bucket
@@ -1112,14 +1107,6 @@ class EngineArgs:
         )
         offload_group.add_argument("--cots-kv-mode", **cots_kwargs["kv_mode"])
         offload_group.add_argument("--cots-kv-h2d-mode", **cots_kwargs["kv_h2d_mode"])
-        offload_group.add_argument(
-            "--cots-kv-head-prefetch-enabled",
-            **cots_kwargs["kv_head_prefetch_enabled"],
-        )
-        offload_group.add_argument(
-            "--cots-kv-prefetch-max-active-blocks",
-            **cots_kwargs["kv_prefetch_max_active_blocks"],
-        )
         offload_group.add_argument(
             "--cots-cpu-num-threads", **cots_kwargs["cpu_num_threads"]
         )
@@ -2051,8 +2038,6 @@ class EngineArgs:
             f_cpu_kv_store=self.cots_f_cpu_kv_store,
             kv_mode=self.cots_kv_mode,
             kv_h2d_mode=self.cots_kv_h2d_mode,
-            kv_head_prefetch_enabled=self.cots_kv_head_prefetch_enabled,
-            kv_prefetch_max_active_blocks=(self.cots_kv_prefetch_max_active_blocks),
             cpu_num_threads=self.cots_cpu_num_threads,
             cpu_num_threads_by_bucket=self.cots_cpu_num_threads_by_bucket,
             cpu_runner=self.cots_cpu_runner,

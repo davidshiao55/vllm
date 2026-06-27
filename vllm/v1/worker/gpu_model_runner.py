@@ -85,7 +85,6 @@ from vllm.model_executor.models.interfaces_base import (
     is_text_generation_model,
 )
 from vllm.model_executor.offloader import (
-    CotsOffloader,
     create_offloader,
     get_offloader,
     set_offloader,
@@ -2592,18 +2591,6 @@ class GPUModelRunner(
                             layer_name=layer_name,
                             common_metadata=cots_head_split_common_metadata,
                         )
-                    )
-                if self.offload_config.cots.head_split_kv_prefetch_enabled:
-                    offloader = get_offloader()
-                    if not isinstance(offloader, CotsOffloader):
-                        raise RuntimeError(
-                            "COTS head-split KV prefetch descriptor publication "
-                            "requires CotsOffloader, got "
-                            f"{type(offloader).__name__}."
-                        )
-                    offloader.publish_head_split_kv_prefetch_descriptor(
-                        self.cots_head_split_kv.layer_index(layer_name),
-                        head_split_metadata.kv_prefetch,
                     )
 
                 layer_metadata = copy(metadata)
@@ -7394,17 +7381,25 @@ class GPUModelRunner(
             cots_config.kv_cpu_pool_bytes,
         )
 
-    def _collect_cots_head_split_kv_specs(
+    def _maybe_initialize_cots_head_split_kv(
         self,
         kv_cache_config: KVCacheConfig,
-        kv_caches: dict[str, torch.Tensor] | None = None,
-    ) -> tuple[list[str], AttentionSpec] | None:
+        kv_caches: dict[str, torch.Tensor],
+        kernel_block_sizes: list[int],
+    ) -> None:
+        self.cots_head_split_kv = None
         cots_config = self.offload_config.cots
         if (
             self.offload_config.offload_backend != "cots"
             or not cots_config.head_split_kv_enabled
         ):
-            return None
+            return
+        if len(kernel_block_sizes) != 1:
+            raise ValueError(
+                "COTS head-split KV supports exactly one decoder KV cache group"
+            )
+        if not self.model_config.enforce_eager:
+            raise ValueError("COTS head-split KV currently requires enforce_eager=True")
 
         layer_names: list[str] = []
         attention_spec: AttentionSpec | None = None
@@ -7446,105 +7441,13 @@ class GPUModelRunner(
                     raise ValueError(
                         "COTS head-split KV requires uniform attention KV specs"
                     )
-                if kv_caches is None or layer_name in kv_caches:
+                if layer_name in kv_caches:
                     layer_names.append(layer_name)
 
         if attention_spec is None or not layer_names:
             raise ValueError(
                 "COTS head-split KV was enabled but no attention KV layers exist"
             )
-        return layer_names, attention_spec
-
-    def _maybe_validate_cots_head_split_kv_prefetch_buffer(
-        self,
-        kv_cache_config: KVCacheConfig,
-        kernel_block_sizes: list[int],
-    ) -> None:
-        cots_config = self.offload_config.cots
-        if (
-            self.offload_config.offload_backend != "cots"
-            or not cots_config.head_split_kv_prefetch_enabled
-        ):
-            return
-        if len(kernel_block_sizes) != 1:
-            raise ValueError(
-                "COTS head-split KV supports exactly one decoder KV cache group"
-            )
-        collected = self._collect_cots_head_split_kv_specs(kv_cache_config)
-        if collected is None:
-            return
-        _, attention_spec = collected
-        offloader = get_offloader()
-        if not isinstance(offloader, CotsOffloader):
-            raise RuntimeError(
-                "COTS head-split KV prefetch requires the global offloader to "
-                f"be CotsOffloader, got {type(offloader).__name__}."
-            )
-        pool = offloader._kv_prefetch_buffer_pool
-        if pool is None:
-            raise RuntimeError(
-                "COTS head-split KV prefetch buffer was not allocated during "
-                "model wrapping. The buffer must be created before KV-cache "
-                "block-count sizing so vLLM reserves its memory."
-            )
-        if pool.max_active_blocks != cots_config.kv_prefetch_max_active_blocks:
-            raise RuntimeError(
-                "COTS head-split KV prefetch buffer active-block budget "
-                "mismatch: "
-                f"buffer={pool.max_active_blocks}, "
-                f"config={cots_config.kv_prefetch_max_active_blocks}"
-            )
-        if pool.block_size != int(kernel_block_sizes[0]):
-            raise RuntimeError(
-                "COTS head-split KV prefetch buffer block_size mismatch: "
-                f"buffer={pool.block_size}, kernel={kernel_block_sizes[0]}. "
-                "The experimental path currently requires cache block_size to "
-                "match the attention kernel block_size."
-            )
-        if pool.head_dim != int(attention_spec.head_size):
-            raise RuntimeError(
-                "COTS head-split KV prefetch buffer head_dim mismatch: "
-                f"buffer={pool.head_dim}, attention={attention_spec.head_size}"
-            )
-        if pool.dtype != attention_spec.dtype:
-            raise RuntimeError(
-                "COTS head-split KV prefetch buffer dtype mismatch: "
-                f"buffer={pool.dtype}, attention={attention_spec.dtype}"
-            )
-        logger.info(
-            "Validated COTS head-split KV prefetch buffer: "
-            "max_active_blocks=%d, block_size=%d, head_dim=%d, "
-            "prefetch_kv_heads=%d",
-            pool.max_active_blocks,
-            pool.block_size,
-            pool.head_dim,
-            pool.max_prefetch_kv_heads,
-        )
-
-    def _maybe_initialize_cots_head_split_kv(
-        self,
-        kv_cache_config: KVCacheConfig,
-        kv_caches: dict[str, torch.Tensor],
-        kernel_block_sizes: list[int],
-    ) -> None:
-        self.cots_head_split_kv = None
-        cots_config = self.offload_config.cots
-        if (
-            self.offload_config.offload_backend != "cots"
-            or not cots_config.head_split_kv_enabled
-        ):
-            return
-        if len(kernel_block_sizes) != 1:
-            raise ValueError(
-                "COTS head-split KV supports exactly one decoder KV cache group"
-            )
-        if not self.model_config.enforce_eager:
-            raise ValueError("COTS head-split KV currently requires enforce_eager=True")
-
-        collected = self._collect_cots_head_split_kv_specs(kv_cache_config, kv_caches)
-        if collected is None:
-            return
-        layer_names, attention_spec = collected
 
         first_cache = kv_caches[layer_names[0]]
         if first_cache.dim() != 5:
@@ -7555,15 +7458,6 @@ class GPUModelRunner(
             )
         num_blocks = int(first_cache.shape[1])
         full_num_kv_heads = self.model_config.get_num_kv_heads(self.parallel_config)
-        kv_group_plan_by_bucket = None
-        if cots_config.head_split_kv_prefetch_enabled:
-            offloader = get_offloader()
-            if not isinstance(offloader, CotsOffloader):
-                raise RuntimeError(
-                    "COTS head-split KV prefetch requires CotsOffloader "
-                    f"when initializing KV store, got {type(offloader).__name__}."
-                )
-            kv_group_plan_by_bucket = offloader.head_split_kv_group_plan_by_bucket()
 
         self.cots_head_split_kv = CotsHeadSplitKVStore(
             layer_names=layer_names,
@@ -7578,9 +7472,6 @@ class GPUModelRunner(
             max_num_tokens=self.max_num_tokens,
             max_model_len=self.max_model_len,
             pin_memory=self.pin_memory,
-            kv_head_prefetch_enabled=cots_config.head_split_kv_prefetch_enabled,
-            kv_prefetch_max_active_blocks=cots_config.kv_prefetch_max_active_blocks,
-            kv_group_plan_by_bucket=kv_group_plan_by_bucket,
         )
         if attention_spec.num_kv_heads != self.cots_head_split_kv.gpu_kv_heads:
             raise ValueError(
@@ -7656,9 +7547,6 @@ class GPUModelRunner(
 
         # Reinitialize need to after initialize_attn_backend
         self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
-        self._maybe_validate_cots_head_split_kv_prefetch_buffer(
-            kv_cache_config, kernel_block_sizes
-        )
         kv_caches = self.initialize_kv_cache_tensors(
             kv_cache_config, kernel_block_sizes
         )

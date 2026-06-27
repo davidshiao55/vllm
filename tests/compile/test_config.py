@@ -399,16 +399,6 @@ def test_cots_head_split_kv_mode_uses_fraction_knob():
     )
     assert not enabled_head_split.hybrid_kv_enabled
     assert enabled_head_split.head_split_kv_enabled
-    assert not enabled_head_split.head_split_kv_prefetch_enabled
-
-    prefetch_enabled_head_split = CotsOffloadConfig(
-        f_cpu_kv_store=0.25,
-        kv_mode="head_split",
-        kv_head_prefetch_enabled=True,
-        kv_prefetch_max_active_blocks=16,
-    )
-    assert prefetch_enabled_head_split.head_split_kv_enabled
-    assert prefetch_enabled_head_split.head_split_kv_prefetch_enabled
 
     config = VllmConfig(
         offload_config=OffloadConfig(offload_backend="cots", cots=enabled_head_split),
@@ -421,16 +411,6 @@ def test_cots_head_split_kv_mode_uses_fraction_knob():
             f_cpu_kv_store=0.25,
             kv_split_blocks=128,
             kv_mode="head_split",
-        )
-
-    with pytest.raises(ValueError, match="kv_head_prefetch_enabled requires"):
-        CotsOffloadConfig(kv_head_prefetch_enabled=True)
-
-    with pytest.raises(ValueError, match="kv_prefetch_max_active_blocks"):
-        CotsOffloadConfig(
-            f_cpu_kv_store=0.25,
-            kv_mode="head_split",
-            kv_head_prefetch_enabled=True,
         )
 
 
