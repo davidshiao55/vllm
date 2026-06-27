@@ -1038,8 +1038,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     "csrc/cots/bf16_gemm_natural.cpp"
     # CPU MLP block fast path: gate/up/SwiGLU into BF16 scratch, then down.
     "csrc/cots/bf16_mlp_gate_up_silu.cpp"
-    # CPU GQA attention kernels: suffix decode baseline plus TP-style
-    # decode/prefill paths with output+LSE for online-softmax merge.
+    # CPU GQA attention kernels: production suffix attention plus standalone
+    # decode/prefill probes with output+LSE for online-softmax measurements.
     "csrc/cots/cpu_gqa_attention.cpp"
     # §1c.29 wait kernel — compiled as CUDA so nvcc handles
     # the __global__ kernel and PTX inline asm. The other

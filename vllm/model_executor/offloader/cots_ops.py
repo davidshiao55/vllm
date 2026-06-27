@@ -293,12 +293,7 @@ def get_all_counters() -> dict[int, dict[str, int]]:
 
 
 def add_python_counter(name: str, value: int = 1) -> None:
-    """Add an env-gated Python-side diagnostic counter.
-
-    Runner-native counters cover the C++ weight worker. The experimental
-    head-split KV path is still Python orchestrated, so it uses this tiny
-    shared counter bucket when ``VLLM_COTS_COUNTERS=1``.
-    """
+    """Add an env-gated Python-side diagnostic counter."""
 
     if not _COTS_COUNTERS_ENABLED:
         return
@@ -307,6 +302,8 @@ def add_python_counter(name: str, value: int = 1) -> None:
 
 
 def add_python_timing(name: str, elapsed_ns: int, *, count: int = 1) -> None:
+    """Record a Python-side timing sample in nanoseconds."""
+
     if not _COTS_COUNTERS_ENABLED:
         return
     add_python_counter(f"{name}_total_ns", int(elapsed_ns))
@@ -338,73 +335,6 @@ def sync_blocking(runner_id: int) -> None:
         # Already torn down — nothing to drain.
         return
     runner.sync_blocking()
-
-
-def sync_and_get_pinned_output(
-    runner_id: int,
-    layer_idx: int,
-    op_kind_code: int,
-    tensor_rows: int,
-) -> torch.Tensor:
-    """Eager-only helper: drain a native task and expose its pinned output.
-
-    The graph-capturable path must keep CPU tensors out of custom-op schemas,
-    so `cots_sync_then_uva` reaches this view internally. The TP-style
-    head-split experiment needs the same CPU output as a CPU-side activation,
-    and head-split is gated to eager mode, so a blocking stream synchronize is
-    acceptable here.
-    """
-    task_id, bucket, _live_num_tokens = _resolve_task_for_dispatch(
-        runner_id, layer_idx, op_kind_code, "sync_and_get_pinned_output"
-    )
-    num_transfer_rows = _bounded_transfer_rows(
-        bucket, int(tensor_rows), "sync_and_get_pinned_output"
-    )
-    runner = lookup_weight_runner(runner_id, "sync_and_get_pinned_output")
-    stream = torch.cuda.current_stream()
-    runner.sync_or_wait_on_stream(task_id, stream.cuda_stream)
-    stream.synchronize()
-    return runner.y_pinned_view(task_id, num_transfer_rows)
-
-
-def submit_preloaded_pinned_gemm(
-    runner_id: int,
-    layer_idx: int,
-    op_kind_code: int,
-    tensor_rows: int,
-) -> None:
-    """Eager-only helper: submit a slab whose pinned input is already filled.
-
-    Routed head-split WO assembles its CPU input from CPU attention output plus
-    optional GPU-attention mismatch groups. That input already lives in the
-    slab's pinned buffer, so the native worker should enqueue the normal CPU
-    GEMM without replaying the built-in x_gpu -> x_pinned copy.
-    """
-    task_id, bucket, _live_num_tokens = _resolve_task_for_dispatch(
-        runner_id, layer_idx, op_kind_code, "submit_preloaded_pinned_gemm"
-    )
-    num_transfer_rows = _bounded_transfer_rows(
-        bucket, int(tensor_rows), "submit_preloaded_pinned_gemm"
-    )
-    runner = lookup_weight_runner(runner_id, "submit_preloaded_pinned_gemm")
-    stream = torch.cuda.current_stream().cuda_stream
-    if _COTS_NVTX_ENABLED:
-        torch.cuda.nvtx.range_push("cots:py_submit_preloaded_gemm")
-    try:
-        # x_gpu_ptr=0 is the native runner's explicit "input already in
-        # x_pinned" mode. Shape/stride values are ignored in that branch.
-        runner.submit_on_stream(
-            task_id,
-            num_transfer_rows,
-            0,
-            0,
-            0,
-            1,
-            stream,
-        )
-    finally:
-        if _COTS_NVTX_ENABLED:
-            torch.cuda.nvtx.range_pop()
 
 
 # --- vllm.cots_submit_gemm -------------------------------------------------

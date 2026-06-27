@@ -7,12 +7,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
-from cots.snap import (
-    gqa_head_group_geometry,
-)
-from cots.snap import (
-    qkv_kv_biased_counts as _shared_qkv_kv_biased_counts,
-)
+from cots.snap import qkv_kv_biased_counts as _shared_qkv_kv_biased_counts
 
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
@@ -254,99 +249,6 @@ def _qkv_kv_biased_indices(
         device="cpu",
     )
     return torch.cat([idx_q_tail, idx_k, idx_v])
-
-
-def _gqa_cpu_group_ids(num_kv_heads: int, n_cpu_groups: int) -> tuple[int, ...]:
-    """Use the last GQA groups as the CPU-owned groups.
-
-    This mirrors the existing COTS convention where rank-0/GPU keeps the
-    leading rows and COTS owns the tail. Keeping the group list contiguous
-    lets loader closures split full weights with simple prefix/tail copies.
-    """
-
-    num_kv_heads = int(num_kv_heads)
-    n_cpu_groups = int(n_cpu_groups)
-    if not (0 <= n_cpu_groups <= num_kv_heads):
-        raise ValueError(
-            f"n_cpu_groups={n_cpu_groups} out of range [0, {num_kv_heads}]"
-        )
-    return tuple(range(num_kv_heads - n_cpu_groups, num_kv_heads))
-
-
-def _gqa_qkv_group_indices(
-    *,
-    num_q_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
-    n_cpu_groups: int,
-) -> torch.Tensor:
-    """Return group-major WQKV output indices for whole GQA groups."""
-
-    _, q_group_size, _ = gqa_head_group_geometry(
-        num_q_heads=num_q_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-    )
-    q_size = int(num_q_heads) * int(head_dim)
-    kv_size = int(num_kv_heads) * int(head_dim)
-    rows: list[torch.Tensor] = []
-    for group in _gqa_cpu_group_ids(num_kv_heads, n_cpu_groups):
-        q_start = group * q_group_size
-        k_start = q_size + group * head_dim
-        v_start = q_size + kv_size + group * head_dim
-        rows.extend(
-            [
-                torch.arange(
-                    q_start,
-                    q_start + q_group_size,
-                    dtype=torch.long,
-                    device="cpu",
-                ),
-                torch.arange(
-                    k_start,
-                    k_start + head_dim,
-                    dtype=torch.long,
-                    device="cpu",
-                ),
-                torch.arange(
-                    v_start,
-                    v_start + head_dim,
-                    dtype=torch.long,
-                    device="cpu",
-                ),
-            ]
-        )
-    if not rows:
-        return torch.empty(0, dtype=torch.long, device="cpu")
-    return torch.cat(rows)
-
-
-def _gqa_wo_input_indices(
-    *,
-    num_q_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
-    n_cpu_groups: int,
-) -> torch.Tensor:
-    """Return WO input-row indices aligned with whole GQA Q groups."""
-
-    _, q_group_size, _ = gqa_head_group_geometry(
-        num_q_heads=num_q_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-    )
-    rows = [
-        torch.arange(
-            group * q_group_size,
-            (group + 1) * q_group_size,
-            dtype=torch.long,
-            device="cpu",
-        )
-        for group in _gqa_cpu_group_ids(num_kv_heads, n_cpu_groups)
-    ]
-    if not rows:
-        return torch.empty(0, dtype=torch.long, device="cpu")
-    return torch.cat(rows)
 
 
 def _complement(idx: torch.Tensor, n: int) -> torch.Tensor:

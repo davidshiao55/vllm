@@ -12,17 +12,9 @@ import torch.nn as nn
 from cots.snap import (
     DEFAULT_QKVO_HEAD_DIM,
     WO_QKVO_GRANULARITY_MULTIPLIER,
-    gqa_head_group_geometry,
-    gqa_num_cpu_groups,
 )
 from cots.snap import (
     qkv_kv_biased_counts as _qkv_kv_biased_counts,
-)
-from cots.snap import (
-    snap_gqa_qkv_output_channels as _snap_gqa_qkv_output_channels,
-)
-from cots.snap import (
-    snap_gqa_wo_input_channels as _snap_gqa_wo_input_channels,
 )
 from cots.snap import (
     snap_mlp_channels as _snap_mlp_channels,
@@ -36,15 +28,12 @@ from cots.snap import (
 
 from vllm.model_executor.offloader.cots_utils import (
     _complement,
-    _gqa_qkv_group_indices,
-    _gqa_wo_input_indices,
     _qkv_kv_biased_indices,
 )
 from vllm.utils.platform_utils import is_pin_memory_available
 
 SplitAxis = Literal["output", "input"]
-CotsLinearRole = Literal["qkv", "mlp_gate_up", "mlp_down", "wo", "wo_input"]
-QKVCpuLayout = Literal["kv_biased", "gqa_group"]
+CotsLinearRole = Literal["qkv", "mlp_gate_up", "mlp_down", "wo"]
 
 OUTPUT_SPLIT_AXIS: SplitAxis = "output"
 INPUT_SPLIT_AXIS: SplitAxis = "input"
@@ -53,14 +42,12 @@ QKV_ROLE: CotsLinearRole = "qkv"
 MLP_GATE_UP_ROLE: CotsLinearRole = "mlp_gate_up"
 MLP_DOWN_ROLE: CotsLinearRole = "mlp_down"
 WO_ROLE: CotsLinearRole = "wo"
-WO_INPUT_ROLE: CotsLinearRole = "wo_input"
 
 ROLE_SPLIT_AXIS: dict[CotsLinearRole, SplitAxis] = {
     QKV_ROLE: OUTPUT_SPLIT_AXIS,
     MLP_GATE_UP_ROLE: OUTPUT_SPLIT_AXIS,
     MLP_DOWN_ROLE: INPUT_SPLIT_AXIS,
     WO_ROLE: OUTPUT_SPLIT_AXIS,
-    WO_INPUT_ROLE: INPUT_SPLIT_AXIS,
 }
 
 
@@ -72,7 +59,6 @@ class CotsLinearHandle:
       mlp_gate_up : MLP gate/up merged output split, two matched halves.
       mlp_down    : MLP down input split, matched to gate/up's intermediate rows.
       wo          : Dense output split, used by opt-in WO.
-      wo_input    : TP-style WO input split over GQA Q-head groups.
 
     Split axis is derived from role and decides generic storage shape:
       output : CPU weight is stored as `(n_cpu, in_dim)`.
@@ -99,11 +85,6 @@ class CotsLinearHandle:
         q_size: int | None = None,
         kv_size: int | None = None,
         head_dim: int | None = None,
-        qkv_cpu_layout: QKVCpuLayout = "kv_biased",
-        qkv_counts: tuple[int, int, int] | None = None,
-        num_q_heads: int | None = None,
-        num_kv_heads: int | None = None,
-        gqa_n_cpu_groups: int = 0,
         # Merged-col-only metadata:
         merged_partition_sizes: tuple[int, int] | None = None,
         # Dense-output-only metadata:
@@ -144,22 +125,6 @@ class CotsLinearHandle:
         self.q_size = q_size
         self.kv_size = kv_size
         self.head_dim = head_dim
-        self.qkv_cpu_layout = qkv_cpu_layout
-        self.num_q_heads = num_q_heads
-        self.num_kv_heads = num_kv_heads
-        self.gqa_n_cpu_groups = int(gqa_n_cpu_groups)
-        self.gqa_q_group_size = 0
-        self.gqa_qkv_group_size = 0
-        if (
-            num_q_heads is not None
-            and num_kv_heads is not None
-            and head_dim is not None
-        ):
-            _, self.gqa_q_group_size, self.gqa_qkv_group_size = gqa_head_group_geometry(
-                num_q_heads=num_q_heads,
-                num_kv_heads=num_kv_heads,
-                head_dim=head_dim,
-            )
         self.merged_partition_sizes = merged_partition_sizes
         self.qkvo_head_dim = qkvo_head_dim
         self.n_q_tail = 0
@@ -169,24 +134,17 @@ class CotsLinearHandle:
         if role == QKV_ROLE:
             assert q_size is not None and kv_size is not None
             assert head_dim is not None
-            if qkv_counts is None:
-                self.n_q_tail, self.n_k, self.n_v = _qkv_kv_biased_counts(
-                    q_size,
-                    kv_size,
-                    n_cpu,
-                    head_dim=head_dim,
-                )
-            else:
-                self.n_q_tail, self.n_k, self.n_v = qkv_counts
+            self.n_q_tail, self.n_k, self.n_v = _qkv_kv_biased_counts(
+                q_size,
+                kv_size,
+                n_cpu,
+                head_dim=head_dim,
+            )
             assert self.n_q_tail + self.n_k + self.n_v == n_cpu, (
                 f"QKV count mismatch at {qualified_name}: n_cpu={n_cpu} != "
                 f"sum of (n_q_tail={self.n_q_tail}, n_k={self.n_k}, "
                 f"n_v={self.n_v})."
             )
-            if qkv_cpu_layout == "gqa_group":
-                assert num_q_heads is not None and num_kv_heads is not None
-                assert self.gqa_n_cpu_groups > 0
-                assert n_cpu == self.gqa_n_cpu_groups * self.gqa_qkv_group_size
         elif role == MLP_GATE_UP_ROLE:
             assert merged_partition_sizes is not None
             assert merged_partition_sizes[0] == merged_partition_sizes[1], (
@@ -214,8 +172,6 @@ class CotsLinearHandle:
         # from the dispatch table.
         self.n_prefetch_by_bucket: dict[int, int] = {}
         self.n_cpu_compute_by_bucket: dict[int, int] = {}
-        self.prefetch_input_start_by_bucket: dict[int, int] = {}
-        self.cpu_compute_input_start_by_bucket: dict[int, int] = {}
         self.prefetch_indices_cuda_by_bucket: dict[int, torch.Tensor] = {}
         self.cpu_compute_indices_cuda_by_bucket: dict[int, torch.Tensor] = {}
         self.max_n_prefetch: int = 0
@@ -291,76 +247,6 @@ class CotsLinearHandle:
             q_size=q_part,
             kv_size=k_part,
             head_dim=head_dim,
-        )
-
-    @classmethod
-    def for_qkv_gqa_groups(
-        cls,
-        linear: nn.Module,
-        qualified_name: str,
-        *,
-        head_dim: int,
-        f_cpu_store: float,
-    ) -> CotsLinearHandle | None:
-        out_dim, in_dim = tuple(linear.weight.shape)
-        parts = linear.output_partition_sizes
-        assert len(parts) == 3, f"QKV expected 3 partitions, got {parts}"
-        q_part, k_part, v_part = parts
-        assert k_part == v_part, (
-            f"QKV expected k_part == v_part, got k={k_part}, v={v_part}"
-        )
-        assert q_part % head_dim == 0 and k_part % head_dim == 0, (
-            f"QKV parts must be head-aligned: q={q_part}, k={k_part}, "
-            f"head_dim={head_dim}"
-        )
-        num_q_heads = q_part // head_dim
-        num_kv_heads = k_part // head_dim
-        _, q_group_size, qkv_group_size = gqa_head_group_geometry(
-            num_q_heads=num_q_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-        )
-        n_cpu_groups = gqa_num_cpu_groups(
-            f_cpu_store,
-            num_kv_heads=num_kv_heads,
-        )
-        n_cpu = _snap_gqa_qkv_output_channels(
-            f_cpu_store,
-            num_q_heads=num_q_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-        )
-        assert n_cpu == n_cpu_groups * qkv_group_size
-        if n_cpu == 0:
-            return None
-        cpu_indices = _gqa_qkv_group_indices(
-            num_q_heads=num_q_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            n_cpu_groups=n_cpu_groups,
-        )
-        return cls(
-            role=QKV_ROLE,
-            linear=linear,
-            qualified_name=qualified_name,
-            in_dim=in_dim,
-            out_dim=out_dim,
-            n_cpu=n_cpu,
-            cpu_indices=cpu_indices,
-            gpu_indices=_complement(cpu_indices, out_dim),
-            dtype=linear.weight.dtype,
-            q_size=q_part,
-            kv_size=k_part,
-            head_dim=head_dim,
-            qkv_cpu_layout="gqa_group",
-            qkv_counts=(
-                n_cpu_groups * q_group_size,
-                n_cpu_groups * head_dim,
-                n_cpu_groups * head_dim,
-            ),
-            num_q_heads=num_q_heads,
-            num_kv_heads=num_kv_heads,
-            gqa_n_cpu_groups=n_cpu_groups,
         )
 
     @classmethod
@@ -467,60 +353,6 @@ class CotsLinearHandle:
             qkvo_head_dim=qkvo_head_dim,
         )
 
-    @classmethod
-    def for_wo_gqa_input(
-        cls,
-        linear: nn.Module,
-        qualified_name: str,
-        *,
-        num_q_heads: int,
-        num_kv_heads: int,
-        head_dim: int,
-        f_cpu_store: float,
-    ) -> CotsLinearHandle | None:
-        """WO TP-style input split over whole GQA Q-head groups."""
-
-        out_dim, in_dim = tuple(linear.weight.shape)
-        if num_q_heads * head_dim != in_dim:
-            raise ValueError(
-                f"WO GQA input split at {qualified_name}: "
-                f"num_q_heads * head_dim = {num_q_heads * head_dim} "
-                f"does not match WO input dim {in_dim}"
-            )
-        n_cpu_groups = gqa_num_cpu_groups(
-            f_cpu_store,
-            num_kv_heads=num_kv_heads,
-        )
-        n_cpu = _snap_gqa_wo_input_channels(
-            f_cpu_store,
-            num_q_heads=num_q_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-        )
-        if n_cpu == 0:
-            return None
-        cpu_indices = _gqa_wo_input_indices(
-            num_q_heads=num_q_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            n_cpu_groups=n_cpu_groups,
-        )
-        return cls(
-            role=WO_INPUT_ROLE,
-            linear=linear,
-            qualified_name=qualified_name,
-            in_dim=in_dim,
-            out_dim=out_dim,
-            n_cpu=n_cpu,
-            cpu_indices=cpu_indices,
-            gpu_indices=_complement(cpu_indices, in_dim),
-            dtype=linear.weight.dtype,
-            head_dim=head_dim,
-            num_q_heads=num_q_heads,
-            num_kv_heads=num_kv_heads,
-            gqa_n_cpu_groups=n_cpu_groups,
-        )
-
     # ------------------------------------------------------------------
     # Installation: replace param.data, allocate w_cpu, wrap weight_loader.
     # ------------------------------------------------------------------
@@ -566,7 +398,7 @@ class CotsLinearHandle:
 
     def _build_weight_loader(self) -> Callable:
         """Return the role-specific weight_loader closure."""
-        if self.role in (MLP_DOWN_ROLE, WO_INPUT_ROLE):
+        if self.role == MLP_DOWN_ROLE:
             return self._row_weight_loader
         if self.role == MLP_GATE_UP_ROLE:
             return self._merged_col_weight_loader
@@ -596,8 +428,6 @@ class CotsLinearHandle:
 
         self.n_prefetch_by_bucket.clear()
         self.n_cpu_compute_by_bucket.clear()
-        self.prefetch_input_start_by_bucket.clear()
-        self.cpu_compute_input_start_by_bucket.clear()
         self.prefetch_indices_cuda_by_bucket.clear()
         self.cpu_compute_indices_cuda_by_bucket.clear()
 
@@ -606,16 +436,6 @@ class CotsLinearHandle:
             n_pref = self.n_cpu - n_cpu
             self.n_prefetch_by_bucket[bucket] = n_pref
             self.n_cpu_compute_by_bucket[bucket] = n_cpu
-            self.prefetch_input_start_by_bucket[bucket] = (
-                int(pref_idx[0].item())
-                if self.split_axis == INPUT_SPLIT_AXIS and n_pref > 0
-                else 0
-            )
-            self.cpu_compute_input_start_by_bucket[bucket] = (
-                int(cpu_idx[0].item())
-                if self.split_axis == INPUT_SPLIT_AXIS and n_cpu > 0
-                else 0
-            )
             self.prefetch_indices_cuda_by_bucket[bucket] = pref_idx.to(device)
             self.cpu_compute_indices_cuda_by_bucket[bucket] = cpu_idx.to(device)
 
@@ -636,9 +456,8 @@ class CotsLinearHandle:
         module quantum and assigns the remaining CPU-stored rows to prefetch.
 
         Layout invariants:
-          qkv: default mode uses `[Q_tail | K_cpu | V_cpu]`; head_split uses
-            group-major `[Q_group | K_group | V_group]` rows. In head_split,
-            prefetch takes whole leading GQA groups.
+          qkv: `cpu_indices` order is `[Q_tail | K_cpu | V_cpu]`. Prefetch
+            takes the first `n_pref` indices.
           mlp_gate_up: `cpu_indices` is
             `[gate_last_n_cpu_per_half | up_last_n_cpu_per_half]`.
             Prefetch takes the FIRST `n_pref_per_half` of each half — keeps
@@ -646,8 +465,6 @@ class CotsLinearHandle:
           mlp_down: `cpu_indices` is the LAST `n_cpu` input cols. Prefetch
             takes the first `n_pref` of those.
           wo: dense output-tail split. Prefetch takes the first `n_pref` rows.
-          wo_input: head_split input rows. Prefetch takes whole leading
-            GQA Q groups.
 
         For qkv, n_cpu_compute is snapped via the same `2 * head_dim` QKVO
         grid as storage. MLP gate/up and down use the shared 64-channel MLP
@@ -657,15 +474,7 @@ class CotsLinearHandle:
         """
         cap = self.n_cpu
 
-        if self.role == QKV_ROLE and self.qkv_cpu_layout == "gqa_group":
-            assert self.num_kv_heads is not None
-            requested_groups = gqa_num_cpu_groups(
-                f_cpu_compute,
-                num_kv_heads=self.num_kv_heads,
-            )
-            n_cpu_groups = min(requested_groups, self.gqa_n_cpu_groups)
-            n_cpu_compute = n_cpu_groups * self.gqa_qkv_group_size
-        elif self.role == QKV_ROLE:
+        if self.role == QKV_ROLE:
             assert self.q_size is not None and self.kv_size is not None
             assert self.head_dim is not None
             requested = int(f_cpu_compute * self.out_dim)
@@ -693,14 +502,6 @@ class CotsLinearHandle:
                 ),
                 cap,
             )
-        elif self.role == WO_INPUT_ROLE:
-            assert self.num_kv_heads is not None
-            requested_groups = gqa_num_cpu_groups(
-                f_cpu_compute,
-                num_kv_heads=self.num_kv_heads,
-            )
-            n_cpu_groups = min(requested_groups, self.gqa_n_cpu_groups)
-            n_cpu_compute = n_cpu_groups * self.gqa_q_group_size
         elif self.role == MLP_DOWN_ROLE:
             n_cpu_compute = min(
                 _snap_mlp_channels(f_cpu_compute * self.in_dim, self.in_dim),
@@ -728,9 +529,7 @@ class CotsLinearHandle:
             )
             return n_cpu_compute, pref_idx, cpu_idx
 
-        # qkv / wo / wo_input / mlp_down: prefetch is a contiguous prefix of
-        # cpu_indices. In head_split modes the row order is group-major, so the
-        # prefix/tail split preserves whole GQA groups.
+        # qkv / wo / mlp_down: prefetch is a contiguous prefix of cpu_indices.
         n_prefetch = self.n_cpu - n_cpu_compute
         return (
             n_cpu_compute,
@@ -741,9 +540,9 @@ class CotsLinearHandle:
     # --- Loader closures (per role, accessing self by closure) ---
 
     def _row_weight_loader(self, param, loaded_weight):
-        """Input-split RowParallelLinear: single call, full
-        ``(out_dim, in_dim)`` loaded_weight. GPU keeps FIRST keep_gpu input
-        cols; CPU gets LAST n_cpu — stored in TRANSPOSED orientation
+        """RowParallelLinear (down_proj): single call, full
+        (out_dim, in_dim) loaded_weight. GPU keeps FIRST keep_gpu input cols;
+        CPU gets LAST n_cpu — stored in TRANSPOSED orientation
         `(n_cpu, out_dim)` per Stage 7-C unified storage (see install()
         docstring). One-shot transpose at load time so every per-forward
         slice (prefetch row-narrow + CPU-compute row-narrow) is
@@ -809,9 +608,6 @@ class CotsLinearHandle:
         """QKVParallelLinear (qkv_proj): per-shard call ('q'/'k'/'v')."""
         assert self.w_cpu is not None
         assert self.q_size is not None and self.kv_size is not None
-        if self.qkv_cpu_layout == "gqa_group":
-            self._qkv_gqa_group_weight_loader(param, loaded_weight, loaded_shard_id)
-            return
         q_size, kv_size = self.q_size, self.kv_size
         n_q_tail, n_k, n_v = self.n_q_tail, self.n_k, self.n_v
         keep_gpu_q = q_size - n_q_tail
@@ -855,71 +651,6 @@ class CotsLinearHandle:
             if n_v > 0:
                 self.w_cpu[cpu_v_offset : cpu_v_offset + n_v, :].copy_(
                     loaded_weight[keep_gpu_v:, :], non_blocking=False
-                )
-        else:
-            raise ValueError(
-                f"cots qkv loader: expected loaded_shard_id in {{'q','k','v'}}, "
-                f"got {loaded_shard_id!r}"
-            )
-
-    def _qkv_gqa_group_weight_loader(self, param, loaded_weight, loaded_shard_id=None):
-        """QKV loader for head_split's group-major CPU row layout."""
-
-        assert self.w_cpu is not None
-        assert self.q_size is not None and self.kv_size is not None
-        assert self.head_dim is not None
-        assert self.num_kv_heads is not None
-        q_size, kv_size = self.q_size, self.kv_size
-        head_dim = self.head_dim
-        q_group = self.gqa_q_group_size
-        qkv_group = self.gqa_qkv_group_size
-        n_groups = self.gqa_n_cpu_groups
-        cpu_group_ids = range(self.num_kv_heads - n_groups, self.num_kv_heads)
-        keep_gpu_q = q_size - n_groups * q_group
-        keep_gpu_k = kv_size - n_groups * head_dim
-        keep_gpu_v = kv_size - n_groups * head_dim
-
-        if loaded_shard_id == "q":
-            assert loaded_weight.shape == (q_size, self.in_dim), (
-                f"qkv 'q' loader at {self.qualified_name}: expected "
-                f"({q_size}, {self.in_dim}), got {tuple(loaded_weight.shape)}"
-            )
-            param.data[:keep_gpu_q, :].copy_(
-                loaded_weight[:keep_gpu_q, :], non_blocking=False
-            )
-            for local_idx, group in enumerate(cpu_group_ids):
-                dst = local_idx * qkv_group
-                src = group * q_group
-                self.w_cpu[dst : dst + q_group, :].copy_(
-                    loaded_weight[src : src + q_group, :],
-                    non_blocking=False,
-                )
-        elif loaded_shard_id == "k":
-            assert loaded_weight.shape == (kv_size, self.in_dim)
-            if keep_gpu_k > 0:
-                param.data[keep_gpu_q : keep_gpu_q + keep_gpu_k, :].copy_(
-                    loaded_weight[:keep_gpu_k, :], non_blocking=False
-                )
-            for local_idx, group in enumerate(cpu_group_ids):
-                dst = local_idx * qkv_group + q_group
-                src = group * head_dim
-                self.w_cpu[dst : dst + head_dim, :].copy_(
-                    loaded_weight[src : src + head_dim, :],
-                    non_blocking=False,
-                )
-        elif loaded_shard_id == "v":
-            assert loaded_weight.shape == (kv_size, self.in_dim)
-            v_gpu_start = keep_gpu_q + keep_gpu_k
-            if keep_gpu_v > 0:
-                param.data[v_gpu_start : v_gpu_start + keep_gpu_v, :].copy_(
-                    loaded_weight[:keep_gpu_v, :], non_blocking=False
-                )
-            for local_idx, group in enumerate(cpu_group_ids):
-                dst = local_idx * qkv_group + q_group + head_dim
-                src = group * head_dim
-                self.w_cpu[dst : dst + head_dim, :].copy_(
-                    loaded_weight[src : src + head_dim, :],
-                    non_blocking=False,
                 )
         else:
             raise ValueError(

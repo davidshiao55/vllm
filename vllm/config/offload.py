@@ -152,23 +152,6 @@ class CotsOffloadConfig:
     """Phase 2 CPU suffix KV pool size in bytes. This is planner-owned
     capacity, distinct from vLLM's native prefix-cache KV offload feature."""
 
-    f_cpu_kv_store: float = Field(default=0.0, ge=0.0, le=1.0)
-    """Experimental TP-style KV head-split storage fraction.
-
-    When ``kv_mode='head_split'``, this fraction is snapped down to whole GQA
-    KV-head groups and the last groups are owned by the CPU path. This is a
-    separate redesign knob from the Phase 2 prefix/suffix CPU pool; it does not
-    use ``kv_split_blocks`` or ``kv_cpu_pool_bytes``."""
-
-    kv_mode: Literal["prefix_suffix", "head_split"] = "prefix_suffix"
-    """Experimental COTS KV topology selector.
-
-    * `"prefix_suffix"` keeps the Phase 2 position-split implementation:
-      GPU prefix KV, CPU suffix KV, and online-softmax merge.
-    * `"head_split"` enables the TP-style GQA-group redesign path. CPU KV
-      ownership is controlled by ``f_cpu_kv_store`` and snaps to whole GQA
-      groups."""
-
     kv_h2d_mode: Literal["uva"] = "uva"
     """Phase 2 CPU->GPU artifact path. MVP supports only UVA so small CPU
     attention outputs/LSE and CPU-produced prefix K/V do not use the explicit
@@ -294,21 +277,7 @@ class CotsOffloadConfig:
     @property
     def hybrid_kv_enabled(self) -> bool:
         """Whether the Phase 2 hybrid CPU-suffix KV path is configured."""
-        return (
-            self.kv_mode == "prefix_suffix"
-            and self.kv_split_blocks > 0
-            and self.kv_cpu_pool_bytes > 0
-        )
-
-    @property
-    def head_split_kv_enabled(self) -> bool:
-        """Whether the experimental TP-style KV head split is configured."""
-        return self.kv_mode == "head_split" and self.f_cpu_kv_store > 0
-
-    @property
-    def cots_kv_enabled(self) -> bool:
-        """Whether any COTS KV offload path is configured."""
-        return self.hybrid_kv_enabled or self.head_split_kv_enabled
+        return self.kv_split_blocks > 0 and self.kv_cpu_pool_bytes > 0
 
     @model_validator(mode="after")
     def validate_cots_config(self) -> "CotsOffloadConfig":
@@ -353,19 +322,6 @@ class CotsOffloadConfig:
 
         if self.dispatch_table is not None:
             validate_table("cots.dispatch_table", self.dispatch_table)
-
-        if self.kv_mode == "prefix_suffix" and self.f_cpu_kv_store > 0:
-            raise ValueError(
-                "cots.f_cpu_kv_store applies only when cots.kv_mode='head_split'."
-            )
-        if self.kv_mode == "head_split" and (
-            self.kv_split_blocks > 0 or self.kv_cpu_pool_bytes > 0
-        ):
-            raise ValueError(
-                "cots.kv_split_blocks/cots.kv_cpu_pool_bytes apply only to "
-                "cots.kv_mode='prefix_suffix'. Use cots.f_cpu_kv_store for "
-                "head_split KV."
-            )
 
         return self
 
@@ -417,7 +373,7 @@ class OffloadConfig:
         # Warn if both backends have non-default values
         uva_active = self.uva.cpu_offload_gb > 0
         prefetch_active = self.prefetch.offload_group_size > 0
-        cots_active = self.cots.f_cpu_store > 0 or self.cots.cots_kv_enabled
+        cots_active = self.cots.f_cpu_store > 0 or self.cots.hybrid_kv_enabled
         if self.offload_backend == "uva" and prefetch_active:
             warnings.warn(
                 "Prefetch offload fields are set but offload_backend='uva'. "

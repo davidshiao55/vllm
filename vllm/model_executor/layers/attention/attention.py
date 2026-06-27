@@ -539,16 +539,7 @@ class Attention(nn.Module, AttentionLayerBase):
         block_size = vllm_config.cache_config.block_size
         # Should not be called for enc-dec or encoder-only attention.
         assert self.attn_type == AttentionType.DECODER
-        cots_config = vllm_config.offload_config.cots
-        cots_head_split_enabled = (
-            vllm_config.offload_config.offload_backend == "cots"
-            and cots_config.head_split_kv_enabled
-        )
         if self.sliding_window is not None:
-            if cots_head_split_enabled:
-                raise ValueError(
-                    "COTS head-split KV does not support sliding-window attention"
-                )
             assert not vllm_config.model_config.use_mla, (
                 "MLA is not supported for slidingwindow"
             )
@@ -560,28 +551,9 @@ class Attention(nn.Module, AttentionLayerBase):
                 sliding_window=self.sliding_window,
             )
         else:
-            num_kv_heads = self.num_kv_heads
-            if cots_head_split_enabled:
-                from cots.snap import gqa_num_cpu_groups
-
-                cpu_kv_heads = gqa_num_cpu_groups(
-                    cots_config.f_cpu_kv_store,
-                    num_kv_heads=self.num_kv_heads,
-                )
-                if cpu_kv_heads <= 0:
-                    raise ValueError(
-                        "cots.f_cpu_kv_store snaps to zero CPU GQA groups. "
-                        "Increase the fraction or disable head-split KV."
-                    )
-                if cpu_kv_heads >= self.num_kv_heads:
-                    raise ValueError(
-                        "COTS head-split KV requires at least one "
-                        "GPU-owned GQA group. Use f_cpu_kv_store < 1.0."
-                    )
-                num_kv_heads = self.num_kv_heads - cpu_kv_heads
             return FullAttentionSpec(
                 block_size=block_size,
-                num_kv_heads=num_kv_heads,
+                num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,
                 head_size_v=self.head_size_v,
                 dtype=self.kv_cache_torch_dtype,
@@ -718,64 +690,24 @@ def unified_kv_cache_update(
         layer_name
     )
     hybrid_metadata = getattr(attn_metadata, "cots_hybrid_decode", None)
-    head_split_metadata = getattr(attn_metadata, "cots_head_split", None)
     if hybrid_metadata is not None and query is not None:
         from vllm.v1.attention.backends.cots_hybrid_attention import (
             cots_hybrid_stage_query,
         )
 
         cots_hybrid_stage_query(query, hybrid_metadata, key=key, value=value)
-    if hybrid_metadata is not None and head_split_metadata is not None:
-        raise RuntimeError("COTS hybrid KV and head-split KV cannot both be active")
 
     if layer_slot_mapping is not None:
         assert hasattr(attn_layer.impl, "do_kv_cache_update"), (
             f"{attn_layer.impl.__class__.__name__} does not support kv cache update"
         )
-        if head_split_metadata is not None:
-            from vllm.v1.attention.backends.cots_head_split_attention import (
-                cots_head_split_gpu_kv_cache_update,
-                cots_head_split_kv_cache_update,
-            )
-
-            if query is not None:
-                from vllm.model_executor.offloader import get_offloader
-
-                lookup_sidecar = getattr(
-                    get_offloader(), "lookup_head_split_qkv_sidecar", None
-                )
-                if lookup_sidecar is not None:
-                    sidecar = lookup_sidecar(query)
-                    if sidecar is not None:
-                        if not getattr(sidecar, "rope_applied", False):
-                            raise RuntimeError(
-                                "COTS head-split routed QKV reached attention "
-                                "before CPU RoPE was applied"
-                            )
-                        head_split_metadata.routed_query_cpu = sidecar.query
-                        head_split_metadata.routed_key_cpu = sidecar.key
-                        head_split_metadata.routed_value_cpu = sidecar.value
-                        head_split_metadata.routed_qkv_sidecar = sidecar
-
-            cots_head_split_gpu_kv_cache_update(
-                attn_layer,
-                key,
-                value,
-                kv_cache,
-                layer_slot_mapping,
-                head_split_metadata,
-            )
-            cots_head_split_kv_cache_update(
-                key, value, layer_slot_mapping, head_split_metadata
-            )
-        else:
-            attn_layer.impl.do_kv_cache_update(
-                attn_layer,
-                key,
-                value,
-                kv_cache,
-                layer_slot_mapping,
-            )
+        attn_layer.impl.do_kv_cache_update(
+            attn_layer,
+            key,
+            value,
+            kv_cache,
+            layer_slot_mapping,
+        )
         if hybrid_metadata is not None:
             from vllm.v1.attention.backends.cots_hybrid_attention import (
                 cots_hybrid_kv_cache_update,

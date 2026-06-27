@@ -5,7 +5,7 @@
 """Base classes for model parameter offloading."""
 
 from abc import ABC, abstractmethod
-from collections.abc import Generator, Mapping, Sequence
+from collections.abc import Generator, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -44,7 +44,6 @@ class ForwardDispatchInfo:
     batch_descriptor: "BatchDescriptor"
     num_tokens_unpadded: int
     trace_context: Mapping[str, Any] | None = None
-    positions_cpu: Sequence[int] | None = None
 
 
 logger = init_logger(__name__)

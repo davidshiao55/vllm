@@ -44,12 +44,7 @@ namespace cots {
 //     before TaskQueue::enqueue). All other fields are constant after
 //     populate_slab() and remain valid across CUDA graph re-replays.
 struct alignas(64) TaskSlab {
-  enum OpKind : int32_t {
-    kQkv = 0,
-    kMlpBlock = 1,
-    kDryrunNoop = 2,
-    kWoInput = 3
-  };
+  enum OpKind : int32_t { kQkv = 0, kMlpBlock = 1, kDryrunNoop = 2 };
 
   // Self-pointer pattern preserved from kt-kernel (the host callback writes
   // it before calling into the dispatcher, which lets the static dispatcher
@@ -113,7 +108,6 @@ struct alignas(64) TaskSlab {
 
   void* x_pinned_ptr = nullptr;
   int32_t in_dim = 0;
-  int32_t x_col_offset = 0;
   void* y_pinned_ptr = nullptr;
   int32_t cpu_out_dim = 0;
   // dtype is hard-coded BFloat16 by the .cpp view builders (the
@@ -186,13 +180,6 @@ class CotsWeightTaskRunner {
                          int32_t w_gate_rows, uintptr_t w_up_ptr,
                          int32_t w_up_rows, uintptr_t w_down_ptr,
                          int32_t w_down_rows, int32_t w_down_cols);
-
-  void populate_slab_wo_input(int64_t task_id, int32_t n_threads,
-                              int32_t bucket_capacity_tokens,
-                              uintptr_t x_pinned_ptr, int32_t in_dim,
-                              int32_t x_col_offset, uintptr_t y_pinned_ptr,
-                              int32_t cpu_out_dim, uintptr_t w_cpu_ptr,
-                              int32_t w_cpu_rows, int32_t w_cpu_cols);
 
   // Populate a slab as a dryrun-noop. §1c.20: dryrun must still
   // carry x_pinned_ptr + in_dim (so submit_on_stream's D2H copy

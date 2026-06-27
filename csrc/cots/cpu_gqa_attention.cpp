@@ -5,8 +5,8 @@
 //
 // This is intentionally thesis-owned and narrow: BF16 paged attention for GQA
 // models with head_dim=128 and at most 8 query heads per KV head. It contains
-// the Phase 2 suffix-attention entry points plus the TP-style decode/prefill
-// CPU attention kernels used by the KV redesign path.
+// the Phase 2 suffix-attention entry points plus standalone decode/prefill CPU
+// attention kernels used by the measurement harnesses.
 
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
@@ -424,8 +424,8 @@ void gqa_suffix_attention_one_group(
   }
 }
 
-// Existing hybrid-KV suffix path. Keep this algorithm stable while the
-// TP-style decode/prefill path below is evaluated.
+// Existing hybrid-KV suffix path. Keep this algorithm stable while alternate
+// decode/prefill probes are evaluated.
 template <int64_t HeadsPerKV>
 void run_gqa_suffix_attention_groups(
     const uint16_t* q_ptr, uint16_t* k_ptr, uint16_t* v_ptr,
@@ -446,7 +446,8 @@ void run_gqa_suffix_attention_groups(
                    });
 }
 
-// TP-style head-split path used by the decode/prefill entry points.
+// Dynamic two-pass paged attention used by benchmark-only decode/prefill entry
+// points.
 template <int64_t HeadsPerKV>
 void gqa_paged_attention_twopass_dynamic_group(
     const uint16_t* query, const uint16_t* key_cache,
