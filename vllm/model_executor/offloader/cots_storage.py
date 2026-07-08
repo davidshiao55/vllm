@@ -11,16 +11,12 @@ import torch
 import torch.nn as nn
 from cots.snap import (
     DEFAULT_QKVO_HEAD_DIM,
-    WO_QKVO_GRANULARITY_MULTIPLIER,
 )
 from cots.snap import (
     snap_mlp_channels as _snap_mlp_channels,
 )
 from cots.snap import (
-    snap_qkv_output_channels as _snap_qkv_output_channels,
-)
-from cots.snap import (
-    snap_qkvo_dense_output_channels as _snap_qkvo_dense_output_channels,
+    snap_qkvo_output_channels as _snap_qkvo_output_channels,
 )
 
 from vllm.model_executor.offloader.cots_utils import (
@@ -225,16 +221,14 @@ class CotsLinearHandle:
         qualified_name: str,
         f_cpu_store: float,
         qkvo_head_dim: int,
-        qkvo_multiplier: int,
         q_size: int | None = None,
         kv_size: int | None = None,
     ) -> CotsLinearHandle | None:
         out_dim, in_dim = tuple(linear.weight.shape)
-        n_cpu = _snap_qkvo_dense_output_channels(
+        n_cpu = _snap_qkvo_output_channels(
             f_cpu_store * out_dim,
-            out_dim,
+            out_dim=out_dim,
             head_dim=qkvo_head_dim,
-            qkvo_multiplier=qkvo_multiplier,
         )
         if n_cpu == 0:
             return None
@@ -281,7 +275,6 @@ class CotsLinearHandle:
             qualified_name=qualified_name,
             f_cpu_store=f_cpu_store,
             qkvo_head_dim=head_dim,
-            qkvo_multiplier=1,
             q_size=q_part,
             kv_size=k_part,
         )
@@ -371,7 +364,6 @@ class CotsLinearHandle:
             qualified_name=qualified_name,
             f_cpu_store=f_cpu_store,
             qkvo_head_dim=qkvo_head_dim,
-            qkvo_multiplier=WO_QKVO_GRANULARITY_MULTIPLIER,
         )
 
     # ------------------------------------------------------------------
@@ -487,20 +479,19 @@ class CotsLinearHandle:
             takes the first `n_pref` of those.
           wo: dense output-tail split. Prefetch takes the first `n_pref` rows.
 
-        QKV snaps on the `2 * head_dim` QKVO grid. MLP gate/up and down use
-        the shared 64-channel MLP snap grid; WO uses the coarse dense output
-        granularity. All roles clamp CPU compute to the CPU-stored cap.
+        QKV and WO snap on the shared `2 * head_dim` QKVO grid. MLP gate/up and
+        down use the shared 64-channel MLP snap grid. All roles clamp CPU
+        compute to the CPU-stored cap.
         Therefore below-boundary runtime remainder goes to prefetch, not CPU
         compute.
         """
         cap = self.n_cpu
 
-        if self.role == QKV_ROLE:
-            assert self.head_dim is not None
-            n_cpu_compute = _snap_qkv_output_channels(
+        if self.role in (QKV_ROLE, WO_ROLE):
+            n_cpu_compute = _snap_qkvo_output_channels(
                 f_cpu_compute * self.out_dim,
                 out_dim=self.out_dim,
-                head_dim=self.head_dim,
+                head_dim=self.qkvo_head_dim,
             )
             n_cpu_compute = min(n_cpu_compute, cap)
         elif self.role == MLP_GATE_UP_ROLE:
@@ -510,16 +501,6 @@ class CotsLinearHandle:
                 self.n_cpu_per_half,
             )
             n_cpu_compute = 2 * n_cpu_compute_per_half
-        elif self.role == WO_ROLE:
-            n_cpu_compute = min(
-                _snap_qkvo_dense_output_channels(
-                    f_cpu_compute * self.out_dim,
-                    self.out_dim,
-                    head_dim=self.qkvo_head_dim,
-                    qkvo_multiplier=WO_QKVO_GRANULARITY_MULTIPLIER,
-                ),
-                cap,
-            )
         elif self.role == MLP_DOWN_ROLE:
             n_cpu_compute = min(
                 _snap_mlp_channels(f_cpu_compute * self.in_dim, self.in_dim),

@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
+from cots.snap import COTS_SNAP_MODEL, qkvo_output_granularity
 
 # Register prefetch custom ops; COTS reuses wait_prefetch/start_prefetch.
 import vllm.model_executor.offloader.prefetch_ops  # noqa: F401
@@ -40,7 +41,6 @@ from vllm.model_executor.offloader.cots_storage import (
     MLP_DOWN_ROLE,
     MLP_GATE_UP_ROLE,
     QKV_ROLE,
-    WO_QKVO_GRANULARITY_MULTIPLIER,
     WO_ROLE,
     CotsLinearHandle,
     CotsPrefetchBufferPool,
@@ -53,6 +53,8 @@ if TYPE_CHECKING:
     from vllm.forward_context import BatchDescriptor
 
 logger = init_logger(__name__)
+
+COTS_ROUTE_SIGNATURE_BASE = 20_000
 
 LINEAR_OP_KIND_BY_ROLE = {
     QKV_ROLE: "qkv",
@@ -614,7 +616,7 @@ class CotsOffloader(BaseOffloader):
             )
             signature = signature_for_geometry.get(geometry)
             if signature is None:
-                signature = len(signature_for_geometry) + 1
+                signature = COTS_ROUTE_SIGNATURE_BASE + len(signature_for_geometry) + 1
                 signature_for_geometry[geometry] = signature
             route_signature_by_bucket[int(bucket)] = int(signature)
         self._route_signature_by_bucket = route_signature_by_bucket
@@ -622,7 +624,11 @@ class CotsOffloader(BaseOffloader):
     def _route_signature_for_bucket(self, bucket: int) -> int:
         if not self._route_signature_by_bucket and self._handles:
             self._build_route_signatures()
-        return int(self._route_signature_by_bucket.get(int(bucket), int(bucket)))
+        return int(
+            self._route_signature_by_bucket.get(
+                int(bucket), COTS_ROUTE_SIGNATURE_BASE + int(bucket)
+            )
+        )
 
     def _build_native_slab_specs(self) -> list[NativeWeightSlabSpec]:
         """Build the per-(layer, bucket, op_kind) slab specs that
@@ -745,8 +751,8 @@ class CotsOffloader(BaseOffloader):
         storage_key = f"{float(self.f_cpu_store):.12g}"
         payload: dict[str, object] = {
             "schema_version": 1,
-            "snap_model": "cots_snap_v1",
-            "wo_qkvo_granularity_multiplier": WO_QKVO_GRANULARITY_MULTIPLIER,
+            "snap_model": COTS_SNAP_MODEL,
+            "qkvo_granularity_channels": self._qkvo_granularity_channels(),
             "storage_by_store_fraction": {
                 storage_key: {
                     "cpu_weight_bytes": int(cpu_weight_bytes),
@@ -805,6 +811,12 @@ class CotsOffloader(BaseOffloader):
             }
         payload["dispatch_by_bucket"] = dispatch_by_bucket
         return payload
+
+    def _qkvo_granularity_channels(self) -> int:
+        for handle in self._handles:
+            if handle.role in (QKV_ROLE, WO_ROLE):
+                return qkvo_output_granularity(handle.qkvo_head_dim)
+        return qkvo_output_granularity(DEFAULT_QKVO_HEAD_DIM)
 
     def _hook_layer_forward(self, index: int, layer: nn.Module) -> None:
         """Wrap the decoder layer's `forward` with pre-compute scheduling.
@@ -1353,9 +1365,10 @@ class CotsOffloader(BaseOffloader):
         else:
             prefetch_bytes = 0
 
+        qkvo_granularity_channels = self._qkvo_granularity_channels()
         logger.info(
             "[CotsOffloader] ready: runner=%s, sync=%s, modules=%s, "
-            "wo_qkvo_granularity_multiplier=%d, "
+            "qkvo_granularity_channels=%d, "
             "linears=%d, mlp_blocks=%d, wo_ops=%d, weights_saved=%.4f GB, "
             "buffers=%.4f GB "
             "pinned_in + %.4f GB pinned_out + %.4f GB gpu_uva, "
@@ -1363,7 +1376,7 @@ class CotsOffloader(BaseOffloader):
             "native",
             weight_capture_sync_mode,
             sorted(self.weight_modules),
-            WO_QKVO_GRANULARITY_MULTIPLIER,
+            qkvo_granularity_channels,
             len(self._handles),
             len(self._fused_ops),
             len(self._wo_ops),
