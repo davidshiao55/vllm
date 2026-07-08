@@ -252,10 +252,9 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
             cpu_offload_params=uva.cpu_offload_params,
         )
     elif backend == "cots":
-        # Phase 2-only hybrid KV uses offload_backend="cots" to select the
-        # hybrid KV runtime, but with zero weight placement there is no Phase 1
-        # weight work to install or dispatch. Keep that path as a true no-op so
-        # every forward does not pay CotsOffloader bucket bookkeeping.
+        # With zero weight placement there is no COTS weight work to install or
+        # dispatch. Keep that path as a true no-op so every forward does not pay
+        # CotsOffloader bucket bookkeeping.
         if cots.f_cpu_store == 0.0 and cots.f_prefetch == 0.0:
             return NoopOffloader()
 
