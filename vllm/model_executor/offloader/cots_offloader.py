@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 # Register prefetch custom ops; COTS reuses wait_prefetch/start_prefetch.
 import vllm.model_executor.offloader.prefetch_ops  # noqa: F401
@@ -32,9 +31,6 @@ from vllm.model_executor.offloader.cots_operators import (
 from vllm.model_executor.offloader.cots_runners import (
     NativeCotsWeightRunner,
     NativeWeightSlabSpec,
-    PyCotsWeightCallback,
-    PythonCotsWeightRunner,
-    _make_runner,
     _NativeWeightSlabSpecLinear,
     _NativeWeightSlabSpecMlp,
 )
@@ -102,12 +98,6 @@ class CotsOffloader(BaseOffloader):
                 f"f_prefetch ({self.f_prefetch}) must be <= "
                 f"f_cpu_store ({self.f_cpu_store})"
             )
-        # Only the Python runner uses process-wide PyTorch thread count. The
-        # native runner carries per-bucket thread policy on each C++ slab, and
-        # `f_cpu_store=0` should remain a no-side-effect control.
-        if self.f_cpu_store > 0.0 and config.cpu_runner == "python":
-            torch.set_num_threads(int(config.cpu_num_threads))
-
         # Populated in wrap_modules. _handles is the master list of all
         # offloaded linears (in insertion order); _fused_ops tracks installed
         # MLP-block ops (one per recognized parent), and _wo_ops tracks
@@ -152,9 +142,9 @@ class CotsOffloader(BaseOffloader):
 
         # One offloader-owned runner is shared across all operator call sites.
         # The no-offload path leaves it unset to avoid starting a worker thread.
-        self._runner: PythonCotsWeightRunner | NativeCotsWeightRunner | None = None
+        self._runner: NativeCotsWeightRunner | None = None
         if self.f_cpu_store > 0.0:
-            self._runner = _make_runner(config)
+            self._runner = NativeCotsWeightRunner(dry_run=bool(config.dry_run))
 
         # Active bucket is set out-of-graph by `on_dispatch` before operators
         # run. This stays valid even when prefetch is disabled.
@@ -533,94 +523,6 @@ class CotsOffloader(BaseOffloader):
 
     # --- Runner install (closures / slab specs) -----
 
-    @staticmethod
-    def _make_output_split_python_callback(
-        w_cpu: torch.Tensor,
-    ) -> PyCotsWeightCallback:
-        """Build a closure that captures a per-(layer, bucket) output-split
-        weight slice. Module-level helper so closures don't accidentally
-        capture `self` (would leak the offloader through the registry)."""
-
-        def cb(
-            event: torch.cuda.Event,
-            x_pinned: torch.Tensor,
-            y_pinned: torch.Tensor,
-        ) -> None:
-            event.synchronize()
-            y_pinned.copy_(F.linear(x_pinned, w_cpu))
-
-        return cb
-
-    @staticmethod
-    def _make_mlp_python_callback(
-        w_gate: torch.Tensor, w_up: torch.Tensor, w_down: torch.Tensor
-    ) -> PyCotsWeightCallback:
-        """Closure for the fused MLP block (gate + up + silu*up + down).
-
-        `w_down` is the row-major `(K, N)` CPU-compute slice, so it is passed
-        directly to `torch.matmul`. Gate/up use the PyTorch-natural `(out, in)`
-        layout and stay on `F.linear`.
-        """
-
-        def cb(
-            event: torch.cuda.Event,
-            x_pinned: torch.Tensor,
-            y_pinned: torch.Tensor,
-        ) -> None:
-            event.synchronize()
-            gate_out = F.linear(x_pinned, w_gate)
-            up_out = F.linear(x_pinned, w_up)
-            z = F.silu(gate_out) * up_out
-            y_pinned.copy_(torch.matmul(z, w_down))
-
-        return cb
-
-    def _build_python_callbacks(
-        self,
-    ) -> dict[tuple[int, int, str], PyCotsWeightCallback]:
-        """Build the (layer_idx, bucket, op_kind) -> closure table that
-        PythonCotsWeightRunner consults at submit time. Skip slabs where there
-        is no CPU work (n_cpu_compute == 0).
-        """
-        callbacks: dict[tuple[int, int, str], PyCotsWeightCallback] = {}
-        for h in self._handles:
-            if h.role not in (QKV_ROLE, WO_ROLE):
-                continue
-            assert h.w_cpu is not None
-            op_kind = LINEAR_OP_KIND_BY_ROLE[h.role]
-            for bucket in self._dispatch_buckets:
-                n_pref = h.n_prefetch_by_bucket.get(bucket, 0)
-                n_cpu = h.n_cpu_compute_by_bucket.get(bucket, h.n_cpu)
-                if n_cpu == 0:
-                    continue
-                w_view = h.w_cpu.narrow(0, n_pref, n_cpu)
-                callbacks[(h.layer_idx, bucket, op_kind)] = (
-                    self._make_output_split_python_callback(w_view)
-                )
-        for fop in self._fused_ops:
-            gu_h = fop._gate_up
-            dn_h = fop._down
-            assert gu_h.w_cpu is not None
-            assert dn_h.w_cpu is not None
-            n_cpu_per_half_total = gu_h.n_cpu // 2
-            for bucket in self._dispatch_buckets:
-                gu_n_pref = gu_h.n_prefetch_by_bucket.get(bucket, 0)
-                dn_n_pref = dn_h.n_prefetch_by_bucket.get(bucket, 0)
-                dn_n_cpu = dn_h.n_cpu_compute_by_bucket.get(bucket, dn_h.n_cpu)
-                if dn_n_cpu == 0:
-                    continue
-                n_pref_per_half = gu_n_pref // 2
-                w_gate_view = gu_h.w_cpu[n_pref_per_half:n_cpu_per_half_total, :]
-                w_up_view = gu_h.w_cpu[
-                    n_cpu_per_half_total + n_pref_per_half : 2 * n_cpu_per_half_total,
-                    :,
-                ]
-                w_down_view = dn_h.w_cpu.narrow(0, dn_n_pref, dn_n_cpu)
-                callbacks[(gu_h.layer_idx, bucket, "mlp_block")] = (
-                    self._make_mlp_python_callback(w_gate_view, w_up_view, w_down_view)
-                )
-        return callbacks
-
     def _n_threads_for(self, bucket: int) -> int:
         """Resolve the CPU GEMM thread count for a given bucket.
 
@@ -807,32 +709,28 @@ class CotsOffloader(BaseOffloader):
         # Validate per-bucket thread policy keys before building specs so a
         # Planner-mistyped bucket fails loudly at install.
         self._validate_thread_policy()
-        if isinstance(self._runner, PythonCotsWeightRunner):
-            callbacks = self._build_python_callbacks()
-            self._runner.install(callbacks)
-        elif isinstance(self._runner, NativeCotsWeightRunner):
-            slab_specs = self._build_native_slab_specs()
-            # `max_num_tokens` gates the C++ worker's submit-side and
-            # run-side bounds checks against the pinned x/y buffers.
-            self._runner.install(
-                slab_specs=slab_specs,
-                max_num_tokens=int(self._max_num_tokens),
-            )
-            # Optional worker-thread CPU affinity. None / empty list means
-            # "no opinion" and leaves the kernel default unchanged.
-            cpu_affinity = getattr(self.config, "cpu_worker_affinity", None)
-            if cpu_affinity:
-                from vllm.model_executor.offloader import cots_ops
+        slab_specs = self._build_native_slab_specs()
+        # `max_num_tokens` gates the C++ worker's submit-side and
+        # run-side bounds checks against the pinned x/y buffers.
+        self._runner.install(
+            slab_specs=slab_specs,
+            max_num_tokens=int(self._max_num_tokens),
+        )
+        # Optional worker-thread CPU affinity. None / empty list means
+        # "no opinion" and leaves the kernel default unchanged.
+        cpu_affinity = getattr(self.config, "cpu_worker_affinity", None)
+        if cpu_affinity:
+            from vllm.model_executor.offloader import cots_ops
 
-                mask = 0
-                for cpu_id in cpu_affinity:
-                    if not (0 <= int(cpu_id) < 64):
-                        raise ValueError(
-                            f"cots: cpu_worker_affinity contains cpu_id "
-                            f"{cpu_id}; must be in [0, 64)"
-                        )
-                    mask |= 1 << int(cpu_id)
-                cots_ops.set_worker_affinity(self._runner._runner_id, mask)
+            mask = 0
+            for cpu_id in cpu_affinity:
+                if not (0 <= int(cpu_id) < 64):
+                    raise ValueError(
+                        f"cots: cpu_worker_affinity contains cpu_id "
+                        f"{cpu_id}; must be in [0, 64)"
+                    )
+                mask |= 1 << int(cpu_id)
+            cots_ops.set_worker_affinity(self._runner._runner_id, mask)
 
     def _cots_snap_payload(
         self,
@@ -1025,19 +923,16 @@ class CotsOffloader(BaseOffloader):
 
         Native COTS must see the explicit OOG dispatch boundary before
         any operator runs; falling back to `x.shape[0]` is the bug this
-        path exists to remove. The fallback remains only for Python-runner
-        direct tests and eager kill-switch use.
+        path exists to remove.
         """
         if self._current_bucket is not None:
             return int(self._current_bucket)
-        if isinstance(self._runner, NativeCotsWeightRunner):
-            raise RuntimeError(
-                "CotsOffloader operator ran before dispatch state was "
-                "published. GPUModelRunner._publish_forward_dispatch "
-                "must call CotsOffloader.on_dispatch before native COTS "
-                "operators execute or capture."
-            )
-        return self._dispatch_bucket_for(x_rows)
+        raise RuntimeError(
+            "CotsOffloader operator ran before dispatch state was "
+            "published. GPUModelRunner._publish_forward_dispatch "
+            "must call CotsOffloader.on_dispatch before COTS operators "
+            "execute or capture."
+        )
 
     def set_live_num_tokens(self, live_num_tokens: int) -> None:
         """Push the live unpadded token count to the C++ worker.
@@ -1046,15 +941,12 @@ class CotsOffloader(BaseOffloader):
         live-row cap lets the CPU worker skip padded rows inside the
         selected bucket.
 
-        No-op when not using the native runner (PythonCotsWeightRunner is
-        eager-only and reads the live count directly off
-        `slab.num_tokens.store` at submit time). Also no-op for
+        No-op when there is no active CPU work or when
         `live_num_tokens <= 0` (sentinel).
         """
         if not self._has_cpu_compute_work:
             return
-        if not isinstance(self._runner, NativeCotsWeightRunner):
-            return
+        assert self._runner is not None
         if int(live_num_tokens) <= 0:
             return
         from vllm.model_executor.offloader import cots_ops
@@ -1136,9 +1028,8 @@ class CotsOffloader(BaseOffloader):
             active_bucket=active_bucket,
         )
         self._prepare_before_forward_bucket(num_tokens_padded, active_bucket)
-        if self._has_cpu_compute_work and isinstance(
-            self._runner, NativeCotsWeightRunner
-        ):
+        if self._has_cpu_compute_work:
+            assert self._runner is not None
             self._runner.set_active_dispatch(active_bucket, num_tokens_unpadded)
         self.sync_prev_onload()
         # CPU work scales with the semantic batch size, not bucket
@@ -1166,11 +1057,8 @@ class CotsOffloader(BaseOffloader):
         if os.environ.get("VLLM_COTS_DUMP_COUNTERS_ON_SHUTDOWN", "0") == "1":
             from vllm.model_executor.offloader import cots_ops
 
-            if (
-                torch.cuda.is_available()
-                and torch.cuda.is_initialized()
-                and isinstance(self._runner, NativeCotsWeightRunner)
-            ):
+            if torch.cuda.is_available() and torch.cuda.is_initialized():
+                assert self._runner is not None
                 torch.cuda.current_stream().synchronize()
                 cots_ops.sync_blocking(self._runner._runner_id)
             counters = cots_ops.get_all_counters()
@@ -1327,35 +1215,17 @@ class CotsOffloader(BaseOffloader):
     # --- post_init: bookkeeping only ---
 
     def post_init(self) -> None:
-        """Verify enforce_eager (conditional on runner) and finalize
-        bookkeeping. The dispatch table and per-bucket geometry are
-        built in `wrap_modules` before the prefetch buffer pool is sized inside
-        the DeviceMemoryProfiler context."""
+        """Finalize native COTS weight bookkeeping.
+
+        The dispatch table and per-bucket geometry are built in
+        `wrap_modules` before the prefetch buffer pool is sized inside the
+        DeviceMemoryProfiler context.
+        """
         if not self._handles:
             return
         from vllm.config import get_current_vllm_config
 
         vllm_config = get_current_vllm_config()
-        # The `enforce_eager` requirement is conditional on runner type:
-        #   * cpu_runner='native': the C++ `cudaLaunchHostFunc`
-        #     substrate IS graph-capturable (CUDA Graph host-function
-        #     nodes, supported since CUDA 11.1).
-        #   * cpu_runner='python': the `ThreadPoolExecutor.submit` /
-        #     `future.result()` substrate is NOT graph-capturable —
-        #     capturing it would silently produce wrong results, not
-        #     just a slower one. Hard fail until the user either
-        #     enables enforce_eager or switches to the native runner.
-        if self._has_cpu_compute_work and not vllm_config.model_config.enforce_eager:
-            cpu_runner = getattr(self.config, "cpu_runner", "python")
-            if cpu_runner != "native":
-                raise RuntimeError(
-                    "CotsOffloader: cpu_runner='python' requires "
-                    "enforce_eager=True — Python runner uses "
-                    "ThreadPoolExecutor + future.result() which is NOT "
-                    "graph-capturable. Either set enforce_eager=True or "
-                    "switch to cpu_runner='native'."
-                )
-
         # Native weight offload is incompatible with vLLM microbatching/
         # ubatching (DBO or ubatch_size > 1). The live-token cap
         # (`GPUModelRunner._publish_forward_dispatch` →
@@ -1366,22 +1236,15 @@ class CotsOffloader(BaseOffloader):
         # over-compute (the worker would read past the per-ubatch
         # x_pinned slice into stale data). Hard-fail until per-ubatch live
         # counts are plumbed.
-        cpu_runner = getattr(self.config, "cpu_runner", "python")
-        if (
-            self._has_cpu_compute_work
-            and cpu_runner == "native"
-            and vllm_config.parallel_config.use_ubatching
-        ):
+        if self._has_cpu_compute_work and vllm_config.parallel_config.use_ubatching:
             raise RuntimeError(
-                "CotsOffloader: cpu_runner='native' is currently "
-                "incompatible with vLLM microbatching/ubatching "
+                "CotsOffloader is currently incompatible with vLLM "
+                "microbatching/ubatching "
                 "(`enable_dbo` or `ubatch_size > 1`). The live-token "
                 "cap sets one global live_num_tokens value per scheduler "
                 "batch; under ubatching a per-ubatch slice would "
-                "over-compute against the full-batch cap. "
-                "Either disable ubatching or use cpu_runner='python' "
-                "with enforce_eager=True. Tracking under "
-                "phase1c_findings.md."
+                "over-compute against the full-batch cap. Disable "
+                "ubatching until per-ubatch live counts are plumbed."
             )
 
         # Wait-kernel-sync safety gates for the Phase 1 weight runner.
@@ -1393,19 +1256,7 @@ class CotsOffloader(BaseOffloader):
         weight_capture_sync_mode = self.config.weight_capture_sync_mode
         wait_kernel_enabled = weight_capture_sync_mode == "wait_kernel"
         if self._has_cpu_compute_work and wait_kernel_enabled:
-            # Gate 1: native runner only. Python runner has no slabs /
-            # no host-mapped done_slot / no worker thread to publish.
-            if cpu_runner != "native":
-                raise RuntimeError(
-                    "CotsOffloader: weight_capture_sync_mode="
-                    f"{weight_capture_sync_mode!r} requires cpu_runner='native' "
-                    f"(got {cpu_runner!r}). The Python runner has no "
-                    "host-mapped done_slot mechanism; the wait kernel is "
-                    "meaningful only on the native weight substrate. Set "
-                    "weight_capture_sync_mode='host_callback' or switch to "
-                    "cpu_runner='native'."
-                )
-            # Gate 2: graph-capture mode required. Eager mode launches
+            # Gate 1: graph-capture mode required. Eager mode launches
             # and syncs each iteration, so the wait kernel adds
             # round-trip cost without removing any captured sync_cb
             # node — net negative.
@@ -1419,7 +1270,7 @@ class CotsOffloader(BaseOffloader):
                     "Set weight_capture_sync_mode='host_callback' or "
                     "enforce_eager=False."
                 )
-            # Gate 3: CUDA available (defensive — native runner already
+            # Gate 2: CUDA available (defensive — native runner already
             # requires CUDA, but a clearer error here pinpoints the
             # wait-kernel sync as the configuration that needs the GPU).
             if not torch.cuda.is_available():
@@ -1428,7 +1279,7 @@ class CotsOffloader(BaseOffloader):
                     f"{weight_capture_sync_mode!r} requires CUDA to be "
                     "available; the wait kernel runs on the GPU."
                 )
-            # Gate 4: _cots_C extension built (defensive — already
+            # Gate 3: _cots_C extension built (defensive — already
             # required by NativeCotsWeightRunner, but with the wait kernel
             # we want a tight blame line if the build was partial).
             try:
@@ -1463,11 +1314,8 @@ class CotsOffloader(BaseOffloader):
         # pool and allocates the req/done slot pair. After this returns, the
         # captured graph's sync host-callback nodes are replaced with wait
         # kernel launches at every cots_sync_then_uva call site.
-        if (
-            self._has_cpu_compute_work
-            and wait_kernel_enabled
-            and isinstance(self._runner, NativeCotsWeightRunner)
-        ):
+        if self._has_cpu_compute_work and wait_kernel_enabled:
+            assert self._runner is not None
             self._runner.install_wait_kernel_sync()
 
         # Layer 0 is filled lazily at the first forward boundary by
@@ -1512,7 +1360,7 @@ class CotsOffloader(BaseOffloader):
             "buffers=%.4f GB "
             "pinned_in + %.4f GB pinned_out + %.4f GB gpu_uva, "
             "prefetch_pool=%.4f GB, graph_buckets=%s, dispatch_buckets=%s",
-            cpu_runner,
+            "native",
             weight_capture_sync_mode,
             sorted(self.weight_modules),
             WO_QKVO_GRANULARITY_MULTIPLIER,

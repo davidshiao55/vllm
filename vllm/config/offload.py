@@ -164,10 +164,8 @@ class CotsOffloadConfig:
     such as `bucket * f_cpu_compute`. The Planner should model costs after
     this policy is applied rather than sweep thread count independently.
 
-    Only consulted by `cpu_runner='native'`; the Python runner uses the
-    process-wide `torch.set_num_threads(cpu_num_threads)` set once at
-    offloader init. Per-bucket policy on the Python path would race
-    other threads in the process holding torch ops."""
+    The native C++ worker applies this per slab, so thread policy stays local
+    to COTS weight work instead of mutating process-wide PyTorch state."""
 
     cpu_worker_affinity: list[int] | None = Field(default=None)
     """Optional CPU affinity mask for the native
@@ -181,27 +179,7 @@ class CotsOffloadConfig:
     dispatch / kernel tend to land. Hardware-specific; left as None by
     default so we don't bake i9-14900KF assumptions into the config.
 
-    Only consulted by `cpu_runner='native'`."""
-
-    cpu_runner: Literal["native", "python"] = "native"
-    """COTS CPU runner selector.
-
-    * `"native"` (default): CPU work runs on a C++ `TaskQueue`
-      worker; submit/sync go through `cudaLaunchHostFunc` host
-      callbacks. Supports both eager mode and graph capture
-      (`enforce_eager=False`). With `auto_graph_split=True`, graph
-      mode defaults to the measured fast split path; legacy full
-      capture remains available for A/B diagnostics via
-      `--no-cots-auto-graph-split`.
-    * `"python"` (kill-switch): keeps the Phase 1a/1b
-      `ThreadPoolExecutor` substrate for A/B diagnostics. NOT
-      graph-capturable; `cpu_runner='python'` requires
-      `enforce_eager=True` and is rejected at engine launch
-      otherwise.
-
-    See `docs/implementation_roadmap.md` Phase 1c and
-    `docs/phase1c_findings.md` for the capture-gap
-    measurements that motivate the split-graph default."""
+    Consulted by the native COTS worker."""
 
     dry_run: bool = Field(default=False)
     """Diagnostic: install COTS wrappers and preserve bucket/slot/graph
@@ -240,8 +218,6 @@ class CotsOffloadConfig:
       capture path on the focused Qwen2.5-7B grid.
     Hard-fail safety gates (in `CotsOffloader.post_init`) for
     `wait_kernel` mode:
-    * Requires `cpu_runner='native'` — Python runner has no
-      slabs / worker thread / host-mapped `done_slot`.
     * Requires `enforce_eager=False` — kernel only makes sense
       as a captured node.
     * Requires CUDA + `_cots_C` extension built.

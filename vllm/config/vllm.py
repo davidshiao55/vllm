@@ -1313,9 +1313,7 @@ class VllmConfig:
 
     def _apply_cots_graph_defaults(self) -> list[str] | None:
         cots_config = self.offload_config.cots
-        has_native_weight_graph = (
-            cots_config.f_cpu_store > 0 and cots_config.cpu_runner == "native"
-        )
+        has_native_weight_graph = cots_config.f_cpu_store > 0
         if (
             self.offload_config.offload_backend != "cots"
             or not has_native_weight_graph

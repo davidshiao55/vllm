@@ -12,7 +12,6 @@ import torch.nn.functional as F
 
 from vllm.model_executor.offloader.cots_runners import (
     NativeCotsWeightRunner,
-    PythonCotsWeightRunner,
 )
 from vllm.model_executor.offloader.cots_storage import (
     MLP_DOWN_ROLE,
@@ -65,7 +64,7 @@ class CotsOutputSplitLinearOp:
     def __init__(
         self,
         handle: CotsLinearHandle,
-        runner: PythonCotsWeightRunner | NativeCotsWeightRunner,
+        runner: NativeCotsWeightRunner,
         offloader: CotsOffloader,
         original_quant_method,
         *,
@@ -145,31 +144,11 @@ class CotsOutputSplitLinearOp:
         if n_cpu > 0 and not dry_run:
             assert self._runner is not None
             assert offloader._y_gpu is not None
-            desc = (h.layer_idx, b, self._op_kind)
-            # §1c.20: BRANCH before constructing CPU pinned views.
-            # The native captured path has a different compiler
-            # contract — Inductor materializes any CPU view it sees,
-            # so we must NOT compute x_in / y_out at all when running
-            # under the native runner. Only y_dst (a GPU view) is
-            # built unconditionally; native reads its pinned input
-            # via `cudaMemcpyAsync` from x_gpu.data_ptr() inside the
-            # C++ side and reaches the pinned output via
-            # `y_pinned_view(task_id, bucket)` on the slab
-            # pointer. Python (eager kill-switch) keeps the original
-            # x_in/y_out flow because it isn't traced by Inductor.
+            # §1c.20: never construct CPU pinned views here. Inductor
+            # materializes any CPU view it sees, so the native runner reaches
+            # pinned input/output through slab pointers populated at install.
             y_dst = offloader._y_gpu[: num_tokens * n_cpu].view(num_tokens, n_cpu)
-            if isinstance(self._runner, NativeCotsWeightRunner):
-                self._runner.submit_with_d2h(x, h.layer_idx, self._op_kind)
-            else:
-                assert offloader._x_pinned is not None
-                assert offloader._y_pinned is not None
-                x_in = offloader._x_pinned[: num_tokens * h.in_dim].view(
-                    num_tokens, h.in_dim
-                )
-                y_out = offloader._y_pinned[: num_tokens * n_cpu].view(
-                    num_tokens, n_cpu
-                )
-                self._runner.submit_with_d2h(x, x_in, y_out, desc)
+            self._runner.submit_with_d2h(x, h.layer_idx, self._op_kind)
 
         # GPU permanent slice. Skipped at f_cpu_store=1.0: F.linear on
         # weight (0, in_dim) returns (B, 0) which crashes downstream
@@ -200,15 +179,12 @@ class CotsOutputSplitLinearOp:
             gpu_b = out_pref if out_pref is not None else offloader._dummy_gpu_anchor_b
             # §1c.20: y_pinned is intentionally not a wait_and_uva
             # parameter — native uses the slab pointer via
-            # y_pinned_view; python stashes it on submit. The
+            # y_pinned_view. The
             # captured-graph custom op sees only CUDA tensors +
             # scalars.
-            if isinstance(self._runner, NativeCotsWeightRunner):
-                self._runner.wait_and_uva(
-                    y_dst, gpu_a, gpu_b, x, h.layer_idx, self._op_kind
-                )
-            else:
-                self._runner.wait_and_uva(y_dst, gpu_a, gpu_b, x, desc)
+            self._runner.wait_and_uva(
+                y_dst, gpu_a, gpu_b, x, h.layer_idx, self._op_kind
+            )
 
         if out_perm is None and out_pref is None and y_dst is None:
             # Dry-run/full-offload corner: all active offloaded work is
@@ -230,7 +206,7 @@ class CotsQKVOp(CotsOutputSplitLinearOp):
     def __init__(
         self,
         handle: CotsLinearHandle,
-        runner: PythonCotsWeightRunner | NativeCotsWeightRunner,
+        runner: NativeCotsWeightRunner,
         offloader: CotsOffloader,
         original_quant_method,
     ):
@@ -255,7 +231,7 @@ class CotsWOOp(CotsOutputSplitLinearOp):
     def __init__(
         self,
         handle: CotsLinearHandle,
-        runner: PythonCotsWeightRunner | NativeCotsWeightRunner,
+        runner: NativeCotsWeightRunner,
         offloader: CotsOffloader,
         original_quant_method,
     ):
@@ -286,7 +262,7 @@ class CotsSwiGLUMLPOp:
         gate_up_handle: CotsLinearHandle,
         down_handle: CotsLinearHandle,
         act_fn: nn.Module,
-        runner: PythonCotsWeightRunner | NativeCotsWeightRunner,
+        runner: NativeCotsWeightRunner,
         offloader: CotsOffloader,
         qualified_name: str,
     ):
@@ -357,32 +333,19 @@ class CotsSwiGLUMLPOp:
         # (pure-prefetch case). Without this fast-path the runner / D2H /
         # UVA overhead leaks into the prefetch-only regime. Phase 1c
         # Stage 3: weight slicing (n_pref_per_half / n_cpu_per_half_total)
-        # is now done at install time inside the runner. Native sees
-        # only stable call-site identity; Python runner still uses the
-        # full descriptor to select its eager callback.
+        # is now done at install time inside the runner, while the operator
+        # passes only stable call-site identity.
         y2_gpu: torch.Tensor | None = None
         if dn_n_cpu > 0 and not dry_run:
             assert self._runner is not None
             assert offloader._y_gpu is not None
-            desc = (gu_h.layer_idx, b, "mlp_block")
-            # §1c.20: branch BEFORE constructing the CPU pinned views
-            # — Inductor materializes any CPU view it sees in the
-            # captured graph (see CotsOutputSplitLinearOp.apply for the rationale).
+            # §1c.20: do not construct CPU pinned views in the operator.
+            # Inductor materializes any CPU view it sees in the captured graph;
+            # native COTS reaches pinned buffers through install-time slabs.
             y2_gpu = offloader._y_gpu[: num_tokens * self._out_dim].view(
                 num_tokens, self._out_dim
             )
-            if isinstance(self._runner, NativeCotsWeightRunner):
-                self._runner.submit_with_d2h(x, gu_h.layer_idx, "mlp_block")
-            else:
-                assert offloader._x_pinned is not None
-                assert offloader._y_pinned is not None
-                x_pinned = offloader._x_pinned[: num_tokens * self._in_dim].view(
-                    num_tokens, self._in_dim
-                )
-                y2_pinned = offloader._y_pinned[: num_tokens * self._out_dim].view(
-                    num_tokens, self._out_dim
-                )
-                self._runner.submit_with_d2h(x, x_pinned, y2_pinned, desc)
+            self._runner.submit_with_d2h(x, gu_h.layer_idx, "mlp_block")
 
         # GPU permanent MLP block. Skipped at f_cpu_store=1.0: gate_up's
         # (0, in_dim) weight makes act_fn run on (B, 0) which crashes the
@@ -431,15 +394,11 @@ class CotsSwiGLUMLPOp:
             # `y_gpu` mutate already covers.
             gpu_a = out_gpu if out_gpu is not None else offloader._dummy_gpu_anchor_a
             gpu_b = offloader._dummy_gpu_anchor_b
-            # §1c.20: y_pinned (y2_pinned) is intentionally not
-            # passed; native uses y_pinned_view via the slab pointer
-            # and python stashes y_pinned at submit time.
-            if isinstance(self._runner, NativeCotsWeightRunner):
-                self._runner.wait_and_uva(
-                    y2_gpu, gpu_a, gpu_b, x, gu_h.layer_idx, "mlp_block"
-                )
-            else:
-                self._runner.wait_and_uva(y2_gpu, gpu_a, gpu_b, x, desc)
+            # §1c.20: y_pinned (y2_pinned) is intentionally not passed;
+            # native uses y_pinned_view via the slab pointer.
+            self._runner.wait_and_uva(
+                y2_gpu, gpu_a, gpu_b, x, gu_h.layer_idx, "mlp_block"
+            )
             # When CPU is the sole contributor, clone — y2_gpu is a shared
             # activation buffer and would be clobbered by the next layer.
             #

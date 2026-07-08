@@ -651,7 +651,6 @@ def wrap_with_cudagraph_if_needed(
     native_cots_weight_graph = (
         vllm_config.offload_config.offload_backend == "cots"
         and cots_config.f_cpu_store > 0
-        and cots_config.cpu_runner == "native"
     )
     splitting_ops = {str(op) for op in compilation_config.splitting_ops or []}
     cots_prefetch_split = {

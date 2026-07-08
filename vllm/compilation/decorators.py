@@ -58,7 +58,6 @@ def _uses_native_cots_weight_graph(vllm_config: VllmConfig) -> bool:
     return (
         vllm_config.offload_config.offload_backend == "cots"
         and cots_config.f_cpu_store > 0
-        and cots_config.cpu_runner == "native"
         and compilation_config.mode == CompilationMode.VLLM_COMPILE
         and compilation_config.cudagraph_mode != CUDAGraphMode.NONE
     )

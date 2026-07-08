@@ -292,8 +292,7 @@ class CotsWeightTaskRunner {
 
   // Worker exception surfacing. Each Python-side `submit*` / `sync*` call
   // checks has_error_ and re-raises last_error_msg_ as a Python
-  // RuntimeError. This mirrors the Python runner's future.result()
-  // re-raise semantics.
+  // RuntimeError.
   //
   // The guard is invoked at the START of every entry point (submit*, sync*,
   // populate_slab*) so a previously-failed task

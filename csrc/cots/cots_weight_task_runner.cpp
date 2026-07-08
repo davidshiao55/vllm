@@ -156,7 +156,8 @@ void CotsWeightTaskRunner::check_error() {
   last_error_msg_.clear();
   has_error_.store(false, std::memory_order_release);
   // Throwing std::runtime_error: pybind11 maps it to Python RuntimeError
-  // automatically. Mirrors the Python runner's `future.result()` re-raise.
+  // automatically. The next Python entry point re-raises the stored worker
+  // error instead of letting a failed task hang the engine.
   throw std::runtime_error(msg);
 }
 
@@ -745,9 +746,8 @@ void CotsWeightTaskRunner::RunSlabOnWorker(TaskSlab* slab, uint32_t seq) {
     // Bucket-aware thread policy: only call set_num_threads when it would
     // change. Stage 4 populates slab->n_threads from the per-bucket map;
     // Stage 1 leaves n_threads = 1, which means we call set_num_threads(1)
-    // on the very first task and then stay at 1. (No regression vs the
-    // Phase 1a Python runner default, which used scalar `cpu_num_threads`
-    // via `torch.set_num_threads` once at offloader init.)
+    // on the very first task and then stay at 1. This preserves the Phase 1a
+    // scalar `cpu_num_threads` default while allowing per-bucket overrides.
     if (slab->n_threads > 0 && slab->n_threads != worker_current_n_threads_) {
       at::set_num_threads(slab->n_threads);
       worker_current_n_threads_ = slab->n_threads;
@@ -849,7 +849,7 @@ void CotsWeightTaskRunner::RunSlabOnWorker(TaskSlab* slab, uint32_t seq) {
     switch (slab->op_kind) {
       case TaskSlab::kDryrunNoop: {
         // Stage 2 substrate gate: install all wrappers but skip real
-        // CPU work. Mirrors `_cpu_dryrun_noop` (cots.py:1161).
+        // CPU work.
         break;
       }
       case TaskSlab::kQkv: {

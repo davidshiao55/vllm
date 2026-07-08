@@ -754,9 +754,9 @@ class CotsPrefetchBufferPool:
 # Execution layer: WeightPrefetchStreamer
 #
 # Layer-ahead H2D streamer. Owns the copy stream, per-layer copy-done events,
-# and the slot-rotation policy. Sibling of PythonCotsWeightRunner in the execution
-# layer. `CotsOffloader`'s four `BaseOffloader` lifecycle methods delegate
-# to this class. No model knowledge — operates on opaque handles.
+# and the slot-rotation policy. `CotsOffloader`'s four `BaseOffloader`
+# lifecycle methods delegate to this class. No model knowledge — operates on
+# opaque handles.
 # Phase 1c does not touch this class; cudaLaunchHostFunc is the runner's
 # concern.
 # ---------------------------------------------------------------------------

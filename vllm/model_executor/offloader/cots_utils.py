@@ -4,43 +4,10 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
-
 import torch
 from cots.snap import qkv_kv_biased_counts as _shared_qkv_kv_biased_counts
 
 from vllm.triton_utils import HAS_TRITON, tl, triton
-
-# Module-level state: shared single-worker executor for the Python kill-switch.
-# Operator instances reach the offloader's shared buffers via an explicit
-# `offloader` reference passed at install time — no module-global lookup —
-# so multiple offloader instances can coexist (e.g., generator + verifier
-# engines in one process).
-# ---------------------------------------------------------------------------
-_GLOBAL_EXECUTOR: ThreadPoolExecutor | None = None
-
-
-def _set_os_thread_name(name: str) -> None:
-    """Set the Linux pthread name (visible in Nsight Systems / `top -H`)."""
-    try:
-        import ctypes
-
-        libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        libc.prctl(15, name.encode("utf-8")[:15], 0, 0, 0)  # PR_SET_NAME=15
-    except Exception:
-        pass  # best-effort
-
-
-def _get_executor() -> ThreadPoolExecutor:
-    global _GLOBAL_EXECUTOR
-    if _GLOBAL_EXECUTOR is None:
-        _GLOBAL_EXECUTOR = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="cots-cpu",
-            initializer=lambda: _set_os_thread_name("cots-cpu"),
-        )
-    return _GLOBAL_EXECUTOR
-
 
 # ---------------------------------------------------------------------------
 # Triton UVA copy kernel — SM-issued read of pinned host memory + GPU write.
@@ -81,8 +48,8 @@ def _has_pinned_host_storage(t: torch.Tensor) -> bool:
     captured path — that fix is the schema change (§1c.20: drop
     `y_pinned` from `cots_submit_gemm.mutates_args`, anchor
     `cots_sync_then_uva` on `x_gpu` instead). This helper is the
-    safety belt for direct callers (`PythonCotsWeightRunner.wait_and_uva`)
-    that still legitimately pass pinned tensors and views thereof.
+    safety belt for direct callers that still legitimately pass pinned
+    tensors and views thereof.
     """
     if t.device.type != "cpu":
         return False
@@ -108,10 +75,9 @@ def _uva_copy_trusted_host_into_gpu(
     `at::from_blob` doesn't set it for foreign blobs.
 
     Inlined rather than calling `uva_copy_into_gpu(...)` so that the
-    public helper's strict pinned check stays intact for direct
-    callers (`PythonCotsWeightRunner.wait_and_uva` and friends), and so
-    `is_pinned()`/storage-level checks aren't pointless work on the
-    captured-graph hot path.
+    public helper's strict pinned check stays intact for direct tests and
+    utilities, and so `is_pinned()`/storage-level checks aren't pointless
+    work on the captured-graph hot path.
     """
     if not dst_gpu.is_cuda:
         raise RuntimeError("dst must be on CUDA")

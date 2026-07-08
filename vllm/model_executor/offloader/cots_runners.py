@@ -4,20 +4,7 @@
 
 from __future__ import annotations
 
-import contextlib
-from collections.abc import Callable
-from concurrent.futures import Future
-from typing import TYPE_CHECKING
-
 import torch
-
-from vllm.model_executor.offloader.cots_utils import (
-    _get_executor,
-    uva_copy_into_gpu,
-)
-
-if TYPE_CHECKING:
-    from vllm.config import CotsOffloadConfig
 
 
 class NativeWeightSlabSpec:
@@ -167,126 +154,6 @@ class _NativeWeightSlabSpecMlp(NativeWeightSlabSpec):
         )
 
 
-PyCotsWeightCallback = Callable[[torch.cuda.Event, torch.Tensor, torch.Tensor], None]
-
-
-class PythonCotsWeightRunner:
-    """Eager Python CPU task runner — the kill-switch path under
-    `CotsOffloadConfig.cpu_runner = "python"`. Same execution semantics
-    as the original prototype: single-worker `ThreadPoolExecutor` plus
-    `future.result()`.
-
-    The per-(layer, bucket, op_kind) weight views are bound at install
-    time into closures stored in `_callbacks`; the operator just hands
-    over an op_descriptor and the runner looks up the right closure.
-
-    Eager-only: `ThreadPoolExecutor.submit` is not graph-capturable, so
-    selecting this runner with `enforce_eager=False` is a hard error
-    at engine launch.
-    """
-
-    kind = "python"
-
-    def __init__(self, dry_run: bool = False) -> None:
-        self._future: Future | None = None
-        # Stash y_pinned at submit time so wait_and_uva matches the native
-        # facade, where y_pinned is reached through the slab pointer.
-        self._pending_y_pinned: torch.Tensor | None = None
-        self._dry_run = dry_run
-        self._callbacks: dict[tuple[int, int, str], PyCotsWeightCallback] = {}
-        self._installed = False
-
-    def install(
-        self,
-        callbacks: dict[tuple[int, int, str], PyCotsWeightCallback],
-    ) -> None:
-        """Register the per-(layer, bucket, op_kind) work closures.
-
-        The offloader builds these at `post_init` from the dispatch table
-        + handle weight views; one closure per slab-equivalent. Under
-        `dry_run=True` the offloader installs noop closures (only the
-        D2H event sync runs, no real CPU GEMM) — the runner's
-        submit/wait shape is identical either way so timing-sensitive
-        diagnostics can A/B by toggling `dry_run`.
-
-        Operators are required to resolve `op_descriptor[1]` to a non-None int
-        before calling `submit_with_d2h`, matching the native runner contract.
-        """
-        if self._installed:
-            raise RuntimeError(
-                "PythonCotsWeightRunner.install() called twice on the same instance"
-            )
-        self._callbacks = dict(callbacks)
-        self._installed = True
-
-    def submit_with_d2h(
-        self,
-        x_gpu: torch.Tensor,
-        x_pinned: torch.Tensor,
-        y_pinned: torch.Tensor,
-        op_descriptor: tuple[int, int, str],
-    ) -> None:
-        """Copy `x_gpu` into `x_pinned` and submit the CPU work closure.
-
-        This runner is eager-only, so it can keep `x_pinned` and `y_pinned` as
-        Python parameters. The native runner uses slab pointers to avoid tracing
-        CPU views into captured graphs.
-        """
-        layer_idx, bucket, op_kind = op_descriptor
-        assert isinstance(bucket, int), (
-            "PythonCotsWeightRunner.submit_with_d2h: op_descriptor[1] must be "
-            "a resolved int bucket."
-        )
-        x_pinned.copy_(x_gpu, non_blocking=True)
-        event = torch.cuda.Event()
-        event.record()
-        if self._dry_run:
-            cb: PyCotsWeightCallback = _cpu_dryrun_noop
-        else:
-            cb = self._callbacks[(layer_idx, bucket, op_kind)]
-        # Stash y_pinned so wait_and_uva matches the native runner signature.
-        self._pending_y_pinned = y_pinned
-        self._future = _get_executor().submit(cb, event, x_pinned, y_pinned)
-
-    def wait_and_uva(
-        self,
-        y_gpu: torch.Tensor,
-        gpu_anchor_a: torch.Tensor,
-        gpu_anchor_b: torch.Tensor,
-        submit_anchor: torch.Tensor,
-        op_descriptor: tuple[int, int, str],
-    ) -> None:
-        """Drain the worker and copy the pinned result into the GPU
-        buffer via the SM-issued UVA kernel. `gpu_anchor_a` /
-        `gpu_anchor_b` / `submit_anchor` / `op_descriptor` are accepted
-        for API symmetry with NativeCotsWeightRunner
-        — they're the barrier-installing anchors that pin the
-        `cots_sync_then_uva` custom op AFTER each independent GPU GEMM
-        under graph capture. Under PythonCotsWeightRunner we're eager-only
-        (no graph capture), so the anchors are unused; but accepting
-        them lets operators call both runners with one signature.
-        """
-        del gpu_anchor_a, gpu_anchor_b, submit_anchor, op_descriptor
-        assert self._future is not None, "submit_with_d2h() not called"
-        assert self._pending_y_pinned is not None, (
-            "submit_with_d2h() did not stash y_pinned"
-        )
-        y_pinned = self._pending_y_pinned
-        try:
-            self._future.result()  # re-raises worker exceptions
-        finally:
-            self._future = None
-            self._pending_y_pinned = None
-        uva_copy_into_gpu(y_pinned, y_gpu)
-
-    def close(self) -> None:
-        """Drain any pending task. Idempotent; safe to call from teardown."""
-        if self._future is not None:
-            with contextlib.suppress(Exception):
-                self._future.result()
-            self._future = None
-
-
 class NativeCotsWeightRunner:
     """Production COTS weight runner. Wraps the C++ `CotsWeightTaskRunner` via the
     `vllm._cots_C` extension; dispatches CPU work through
@@ -333,8 +200,8 @@ class NativeCotsWeightRunner:
     def __init__(self, dry_run: bool = False) -> None:
         # Lazy import: _cots_C is built only on CUDA. Users on CPU-only
         # / ROCm builds shouldn't hit ImportError just by importing this
-        # module — the runner type is constructed only when the offload
-        # config selects `cpu_runner='native'`. Any reference we hold
+        # module — the runner type is constructed only when COTS weight
+        # offload is active. Any reference we hold
         # to the pybind handle is on the cots_ops registry, NOT on this
         # runner's `__dict__`: if the handle were stored on `self`, Dynamo's
         # guard serialization would try to pickle a `CotsWeightTaskRunner`,
@@ -344,8 +211,8 @@ class NativeCotsWeightRunner:
         except ImportError as e:
             raise RuntimeError(
                 "NativeCotsWeightRunner requires the `vllm._cots_C` extension, "
-                "which builds only on CUDA targets. Either select "
-                "`cpu_runner='python'` or rebuild vLLM with CUDA support."
+                "which builds only on CUDA targets. Rebuild vLLM with CUDA "
+                "support before enabling COTS weight offload."
             ) from e
         from vllm.model_executor.offloader import cots_ops
 
@@ -567,36 +434,10 @@ class NativeCotsWeightRunner:
             pass
 
 
-def _make_runner(
-    config: CotsOffloadConfig,
-) -> PythonCotsWeightRunner | NativeCotsWeightRunner:
-    """Construct the offloader's single runner per `config.cpu_runner`."""
-    cpu_runner = config.cpu_runner
-    dry_run = bool(config.dry_run)
-    if cpu_runner == "python":
-        return PythonCotsWeightRunner(dry_run=dry_run)
-    if cpu_runner == "native":
-        return NativeCotsWeightRunner(dry_run=dry_run)
-    raise ValueError(
-        f"Unknown cpu_runner={cpu_runner!r}; expected 'native' or 'python'"
-    )
-
-
-def _cpu_dryrun_noop(
-    d2h_event: torch.cuda.Event,
-    *_args,
-    **_kwargs,
-) -> None:
-    """Diagnostic: sync the D2H event but skip the GEMM. Token output is
-    garbage; only host bookkeeping cost is measured. See `phase1a_findings.md
-    §1.14`."""
-    d2h_event.synchronize()
-
-
 # ---------------------------------------------------------------------------
 # Operator layer
 #
 # Operators encapsulate the forward semantics for each block of the model
-# we offload. They consume `CotsLinearHandle`s for storage and a
-# PythonCotsWeightRunner for execution.
+# we offload. They consume `CotsLinearHandle`s for storage and the native
+# COTS weight runner for execution.
 # ---------------------------------------------------------------------------
