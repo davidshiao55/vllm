@@ -1165,7 +1165,6 @@ class GPUModelRunner(
                 pooling_params=pooling_params,
                 generator=generator,
                 block_ids=new_req_data.block_ids,
-                cpu_block_ids=new_req_data.cpu_block_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
@@ -1220,11 +1219,6 @@ class GPUModelRunner(
             req_state = self.requests[req_id]
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_block_ids = req_data.new_block_ids[i]
-            new_cpu_block_ids = (
-                req_data.new_cpu_block_ids[i]
-                if i < len(req_data.new_cpu_block_ids)
-                else None
-            )
             resumed_from_preemption = req_id in req_data.resumed_req_ids
             num_output_tokens = req_data.num_output_tokens[i]
             req_index = self.input_batch.req_id_to_index.get(req_id)
@@ -1313,20 +1307,12 @@ class GPUModelRunner(
                     # Append the new blocks to the existing block IDs.
                     for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
                         block_ids.extend(new_ids)
-                if new_cpu_block_ids is not None:
-                    if req_state.cpu_block_ids is None:
-                        req_state.cpu_block_ids = tuple([] for _ in new_cpu_block_ids)
-                    for block_ids, new_ids in zip(
-                        req_state.cpu_block_ids, new_cpu_block_ids
-                    ):
-                        block_ids.extend(new_ids)
             else:
                 assert req_index is None
                 assert new_block_ids is not None
                 # The request is resumed from preemption.
                 # Replace the existing block IDs with the new ones.
                 req_state.block_ids = new_block_ids
-                req_state.cpu_block_ids = new_cpu_block_ids
 
             if req_index is None:
                 # The request is not in the persistent batch.
