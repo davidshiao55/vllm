@@ -11,7 +11,6 @@ from vllm.model_executor.offloader.cots_operators import (
     CotsSwiGLUMLPOp,
     CotsWOOp,
     _RaiseOnDirectCall,
-    _scatter_col_outputs_three_way,
 )
 from vllm.model_executor.offloader.cots_runners import (
     NativeCotsWeightRunner,
@@ -58,7 +57,6 @@ __all__ = [
     "_RaiseOnDirectCall",
     "_NativeWeightSlabSpecLinear",
     "_NativeWeightSlabSpecMlp",
-    "_scatter_col_outputs_three_way",
     "_complement",
     "_has_pinned_host_storage",
     "_uva_copy_trusted_host_into_gpu",

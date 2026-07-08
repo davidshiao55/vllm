@@ -387,10 +387,9 @@ class PiecewiseBackend:
     def _static_range_entry(self) -> RangeEntry:
         """Return a deterministic compiled entry for shape-independent pieces.
 
-        Some route-specialized graphs have no symbolic batch-size placeholder
-        in a piecewise subgraph. In that case every compiled range is equivalent
-        for dispatch purposes, so runtime shape lookup is neither possible nor
-        needed.
+        Some piecewise subgraphs have no symbolic batch-size placeholder. In
+        that case every compiled range is equivalent for dispatch purposes, so
+        runtime shape lookup is neither possible nor needed.
         """
         for compile_range in self.compile_ranges:
             entry = self.range_entries.get(compile_range)

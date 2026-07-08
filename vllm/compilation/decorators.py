@@ -48,21 +48,6 @@ IGNORE_COMPILE_KEY = "_ignore_compile_vllm"
 _T = TypeVar("_T", bound=nn.Module)
 
 
-def _uses_native_cots_weight_graph(vllm_config: VllmConfig) -> bool:
-    # Native COTS weight routes can change the custom-op surface
-    # (pure prefetch vs CPU submit/sync). AOT artifacts are not keyed by
-    # runtime BatchDescriptor, so CUDA graph capture must go through
-    # TorchCompileWithNoGuardsWrapper's descriptor-specialized variants.
-    compilation_config = vllm_config.compilation_config
-    cots_config = vllm_config.offload_config.cots
-    return (
-        vllm_config.offload_config.offload_backend == "cots"
-        and cots_config.f_cpu_store > 0
-        and compilation_config.mode == CompilationMode.VLLM_COMPILE
-        and compilation_config.cudagraph_mode != CUDAGraphMode.NONE
-    )
-
-
 def should_torch_compile_mm_encoder(vllm_config: VllmConfig) -> bool:
     """Callable to be passed to `@support_torch_compile`'s `enable_if` argument."""
     return vllm_config.compilation_config.compile_mm_encoder
@@ -483,10 +468,7 @@ def _support_torch_compile(
         ds_type = self.compilation_config.dynamic_shapes_config.type
         cache_dir = None
         aot_compilation_path = None
-        disable_aot_for_cots_weight_graph = _uses_native_cots_weight_graph(
-            self.vllm_config
-        )
-        if envs.VLLM_USE_AOT_COMPILE and not disable_aot_for_cots_weight_graph:
+        if envs.VLLM_USE_AOT_COMPILE:
             """
             When using torch.compile in AOT mode, we store the cache artifacts
             under VLLM_CACHE_ROOT/torch_compile_cache/torch_aot_compile/{hash}
@@ -530,7 +512,6 @@ def _support_torch_compile(
         if self.compiled:
             assert (
                 not envs.VLLM_USE_AOT_COMPILE
-                or disable_aot_for_cots_weight_graph
                 or self.vllm_config.compilation_config.backend == "eager"
             )
             return TorchCompileWithNoGuardsWrapper.__call__(self, *args, **kwargs)  # type: ignore[arg-type]
@@ -607,13 +588,6 @@ def _support_torch_compile(
             use_aot_compile = envs.VLLM_USE_AOT_COMPILE
             if self.vllm_config.compilation_config.backend == "eager":
                 logger.warning("Detected eager backend, disabling AOT compile.")
-                use_aot_compile = False
-            if use_aot_compile and disable_aot_for_cots_weight_graph:
-                logger.warning_once(
-                    "Disabling AOT compile for native COTS weight graph because "
-                    "COTS graph capture needs route-specialized compile variants.",
-                    scope="local",
-                )
                 use_aot_compile = False
             if use_aot_compile:
                 # store the path for saving after warmup
@@ -695,7 +669,6 @@ def maybe_use_cudagraph_partition_wrapper(
     graph wrapper class to maintain more control over static graph
     capture and replay.
     """
-    from vllm.config import CUDAGraphMode
 
     compilation_config = vllm_config.compilation_config
     if (

@@ -696,6 +696,29 @@ class CotsOffloader(BaseOffloader):
                 mask |= 1 << int(cpu_id)
             cots_ops.set_worker_affinity(self._runner._runner_id, mask)
 
+    def _register_runner_routes(self) -> None:
+        """Publish existing handle objects for opaque COTS operator routing."""
+        if self._runner is None or not self._handles:
+            return
+        from vllm.model_executor.offloader import cots_ops
+
+        for h in self._handles:
+            if h.role not in (QKV_ROLE, WO_ROLE):
+                continue
+            cots_ops.register_weight_route(
+                self._runner._runner_id,
+                layer_idx=h.layer_idx,
+                op_kind=LINEAR_OP_KIND_BY_ROLE[h.role],
+                route=h,
+            )
+        for fop in self._fused_ops:
+            cots_ops.register_weight_route(
+                self._runner._runner_id,
+                layer_idx=fop._gate_up.layer_idx,
+                op_kind="mlp_block",
+                route=fop,
+            )
+
     def _cots_snap_payload(
         self,
         *,
@@ -860,22 +883,6 @@ class CotsOffloader(BaseOffloader):
             num_tokens, self._dispatch_bucket_for(num_tokens)
         )
 
-    def _operator_bucket(self, x_rows: int) -> int:
-        """Return the operator routing bucket for the active forward.
-
-        Native COTS must see the explicit OOG dispatch boundary before
-        any operator runs; falling back to `x.shape[0]` is the bug this
-        path exists to remove.
-        """
-        if self._current_bucket is not None:
-            return int(self._current_bucket)
-        raise RuntimeError(
-            "CotsOffloader operator ran before dispatch state was "
-            "published. GPUModelRunner._publish_forward_dispatch "
-            "must call CotsOffloader.on_dispatch before COTS operators "
-            "execute or capture."
-        )
-
     def set_live_num_tokens(self, live_num_tokens: int) -> None:
         """Push the live unpadded token count to the C++ worker.
 
@@ -941,10 +948,9 @@ class CotsOffloader(BaseOffloader):
             slot repair (issues H2D on copy_stream). H2D is OOG so it
             isn't captured; each replay gets fresh repair.
         2. `set_active_dispatch(bucket, live)` — publishes the
-            authoritative vLLM dispatch bucket to native custom ops.
-            They resolve `(layer_idx, bucket, op_kind) -> task_id`
-            during eager execution / CUDA Graph capture; task_id is
-            not a compile-visible scalar anymore.
+            authoritative vLLM dispatch bucket to COTS custom ops.
+            CPU ops use it to resolve `(layer_idx, bucket, op_kind) -> task_id`;
+            prefetch/scatter ops use it to resolve existing handle route tables.
         3. `sync_prev_onload()` — drains copy_stream into compute
             stream so the forward sees the filled slot.
         4. `set_live_num_tokens(num_tokens_unpadded)` — live-row cap
@@ -961,7 +967,7 @@ class CotsOffloader(BaseOffloader):
             active_bucket=active_bucket,
         )
         self._prepare_before_forward_bucket(num_tokens_padded, active_bucket)
-        if self._has_cpu_compute_work:
+        if self._runner is not None:
             assert self._runner is not None
             self._runner.set_active_dispatch(active_bucket, num_tokens_unpadded)
         self.sync_prev_onload()
@@ -1194,6 +1200,7 @@ class CotsOffloader(BaseOffloader):
 
         # Install the runner's per-(layer, bucket, op_kind) work table after
         # the underlying CPU and pinned storages are stable.
+        self._register_runner_routes()
         self._install_runner()
 
         # Layer 0 is filled lazily at the first forward boundary by

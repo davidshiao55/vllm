@@ -290,7 +290,7 @@ def test_cots_uses_vllm_default_graph_policy():
     assert "vllm::cots_sync_then_uva" not in config.compilation_config.splitting_ops
 
 
-def test_cots_full_graph_cpu_compute_uses_route_specialized_graphs():
+def test_cots_full_graph_cpu_compute_has_no_cots_aot_policy():
     config = VllmConfig(
         offload_config=OffloadConfig(
             offload_backend="cots",
@@ -302,10 +302,10 @@ def test_cots_full_graph_cpu_compute_uses_route_specialized_graphs():
         ),
     )
 
-    from vllm.compilation.decorators import _uses_native_cots_weight_graph
+    import vllm.compilation.decorators as decorators
 
     assert config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
-    assert _uses_native_cots_weight_graph(config)
+    assert not hasattr(decorators, "_uses_native_cots_weight_graph")
 
 
 def test_cots_pure_prefetch_keeps_vllm_default_graph_policy():

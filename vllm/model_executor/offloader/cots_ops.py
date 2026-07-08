@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom ops for the COTS native weight task runner.
 
-Mirrors `prefetch_ops.py`'s pattern: registers two ops via
-`direct_register_custom_op` (which lands them under `torch.ops.vllm.*`),
-each with a `mutates_args` list that declares barrier-installing
+Mirrors `prefetch_ops.py`'s pattern: registers COTS ops via
+`direct_register_custom_op` (which lands them under `torch.ops.vllm.*`).
+The CPU submit/sync ops use `mutates_args` to declare barrier-installing
 dependencies so torch.compile / CUDA graph capture preserve the overlap
 ordering between submit, GPU GEMMs, sync, and UVA copy.
 
@@ -68,6 +68,7 @@ if TYPE_CHECKING:
 _COTS_WEIGHT_RUNNERS: dict[int, Any] = {}
 _COTS_WEIGHT_ACTIVE_DISPATCH: dict[int, tuple[int, int]] = {}
 _COTS_WEIGHT_TASK_ID_FOR: dict[int, dict[tuple[int, int, str], int]] = {}
+_COTS_WEIGHT_ROUTE_FOR: dict[int, dict[tuple[int, str], Any]] = {}
 _NEXT_WEIGHT_RUNNER_ID = itertools.count(1)
 _COTS_PY_COUNTERS: dict[str, int] = {}
 _COTS_PY_COUNTER_LOCK = threading.Lock()
@@ -102,6 +103,7 @@ def unregister_weight_runner(runner_id: int) -> None:
     _COTS_WEIGHT_RUNNERS.pop(runner_id, None)
     _COTS_WEIGHT_ACTIVE_DISPATCH.pop(runner_id, None)
     _COTS_WEIGHT_TASK_ID_FOR.pop(runner_id, None)
+    _COTS_WEIGHT_ROUTE_FOR.pop(runner_id, None)
 
 
 def register_weight_task_id_map(
@@ -110,6 +112,26 @@ def register_weight_task_id_map(
 ) -> None:
     """Publish the install-time slab map used by custom op dispatch."""
     _COTS_WEIGHT_TASK_ID_FOR[int(runner_id)] = dict(task_id_for)
+
+
+def register_weight_route(
+    runner_id: int,
+    *,
+    layer_idx: int,
+    op_kind: str,
+    route: Any,
+) -> None:
+    """Publish the existing COTS handle/fused-op route for custom ops.
+
+    The route object is intentionally the existing Python object owned by the
+    offloader. It keeps per-bucket fields such as n_prefetch_by_bucket,
+    n_cpu_compute_by_bucket, and scatter indices behind an opaque operator
+    boundary without duplicating the routing table in C++.
+    """
+
+    _COTS_WEIGHT_ROUTE_FOR.setdefault(int(runner_id), {})[
+        (int(layer_idx), str(op_kind))
+    ] = route
 
 
 def set_active_weight_dispatch_state(
@@ -136,13 +158,7 @@ def set_active_weight_dispatch_state(
     _COTS_WEIGHT_ACTIVE_DISPATCH[int(runner_id)] = (bucket, live_num_tokens)
 
 
-def _resolve_task_for_dispatch(
-    runner_id: int,
-    layer_idx: int,
-    op_kind_code: int,
-    op_name: str,
-) -> tuple[int, int, int]:
-    """Resolve active dispatch state to a concrete C++ slab task."""
+def _active_dispatch_state(runner_id: int, op_name: str) -> tuple[int, int]:
     runner_id = int(runner_id)
     state = _COTS_WEIGHT_ACTIVE_DISPATCH.get(runner_id)
     if state is None:
@@ -152,12 +168,63 @@ def _resolve_task_for_dispatch(
             "before native custom ops execute or capture."
         )
     bucket, live_num_tokens = state
+    return int(bucket), int(live_num_tokens)
+
+
+def _op_kind_from_code(op_kind_code: int, op_name: str, runner_id: int) -> str:
     try:
-        op_kind = _OP_KIND_BY_CODE[int(op_kind_code)]
+        return _OP_KIND_BY_CODE[int(op_kind_code)]
     except KeyError as e:
         raise RuntimeError(
             f"{op_name}: unknown op_kind_code={op_kind_code} for runner_id={runner_id}"
         ) from e
+
+
+def _lookup_route(
+    runner_id: int,
+    layer_idx: int,
+    op_kind_code: int,
+    op_name: str,
+) -> tuple[Any | None, str]:
+    runner_id = int(runner_id)
+    op_kind = _op_kind_from_code(op_kind_code, op_name, runner_id)
+    route_for = _COTS_WEIGHT_ROUTE_FOR.get(runner_id)
+    if route_for is None:
+        return None, op_kind
+    return route_for.get((int(layer_idx), op_kind)), op_kind
+
+
+def _route_cpu_rows(route: Any, op_kind: str, bucket: int) -> int:
+    if op_kind == "mlp_block":
+        down = route._down
+        return int(down.n_cpu_compute_by_bucket.get(bucket, down.n_cpu))
+    return int(route.n_cpu_compute_by_bucket.get(bucket, route.n_cpu))
+
+
+def _route_has_zero_cpu_work(
+    runner_id: int,
+    layer_idx: int,
+    op_kind_code: int,
+    op_name: str,
+) -> bool:
+    route, op_kind = _lookup_route(runner_id, layer_idx, op_kind_code, op_name)
+    if route is None:
+        # Older direct tests may install only task ids. Preserve that path.
+        return False
+    bucket, _ = _active_dispatch_state(runner_id, op_name)
+    return _route_cpu_rows(route, op_kind, bucket) <= 0
+
+
+def _resolve_task_for_dispatch(
+    runner_id: int,
+    layer_idx: int,
+    op_kind_code: int,
+    op_name: str,
+) -> tuple[int, int, int]:
+    """Resolve active dispatch state to a concrete C++ slab task."""
+    runner_id = int(runner_id)
+    bucket, live_num_tokens = _active_dispatch_state(runner_id, op_name)
+    op_kind = _op_kind_from_code(op_kind_code, op_name, runner_id)
     task_id_for = _COTS_WEIGHT_TASK_ID_FOR.get(runner_id)
     if task_id_for is None:
         raise RuntimeError(
@@ -374,6 +441,8 @@ def _cots_submit_gemm_impl(
             f"cots_submit_gemm: x_gpu must be 2D (num_tokens, in_dim); "
             f"got shape {tuple(x_gpu.shape)}"
         )
+    if _route_has_zero_cpu_work(runner_id, layer_idx, op_kind_code, "cots_submit_gemm"):
+        return
     task_id, bucket, _live_num_tokens = _resolve_task_for_dispatch(
         runner_id, layer_idx, op_kind_code, "cots_submit_gemm"
     )
@@ -453,11 +522,15 @@ def _cots_sync_then_uva_impl(
     slab pointer came from `_y_pinned`, allocated `pin_memory=True` and
     validated there.
     """
+    if _route_has_zero_cpu_work(
+        runner_id, layer_idx, op_kind_code, "cots_sync_then_uva"
+    ):
+        return
     task_id, bucket, _live_num_tokens = _resolve_task_for_dispatch(
         runner_id, layer_idx, op_kind_code, "cots_sync_then_uva"
     )
     num_transfer_rows = _bounded_transfer_rows(
-        bucket, int(y_gpu.shape[0]), "cots_sync_then_uva"
+        bucket, int(submit_anchor.shape[0]), "cots_sync_then_uva"
     )
     runner = lookup_weight_runner(runner_id, "cots_sync_then_uva")
     stream = torch.cuda.current_stream().cuda_stream
@@ -482,7 +555,13 @@ def _cots_sync_then_uva_impl(
         if _COTS_NVTX_ENABLED:
             torch.cuda.nvtx.range_push("cots:py_uva_copy")
         try:
-            _uva_copy_trusted_host_into_gpu(y_pinned, y_gpu)
+            if y_gpu.dim() == 1:
+                dst_gpu = y_gpu.narrow(0, 0, y_pinned.numel())
+                src_pinned = y_pinned.reshape(-1)
+            else:
+                dst_gpu = y_gpu
+                src_pinned = y_pinned
+            _uva_copy_trusted_host_into_gpu(src_pinned, dst_gpu)
         finally:
             if _COTS_NVTX_ENABLED:
                 torch.cuda.nvtx.range_pop()
@@ -503,11 +582,251 @@ def _cots_sync_then_uva_fake(
     return
 
 
+def _require_route(
+    runner_id: int,
+    layer_idx: int,
+    op_kind_code: int,
+    op_name: str,
+) -> tuple[Any, str, int]:
+    route, op_kind = _lookup_route(runner_id, layer_idx, op_kind_code, op_name)
+    if route is None:
+        raise RuntimeError(
+            f"{op_name}: runner_id={int(runner_id)} has no registered route for "
+            f"layer_idx={int(layer_idx)}, op_kind={op_kind!r}"
+        )
+    bucket, _ = _active_dispatch_state(runner_id, op_name)
+    return route, op_kind, bucket
+
+
+def _check_prefetch_slot_ready(handle: Any, required_rows: int, op_name: str) -> None:
+    required_rows = int(required_rows)
+    if required_rows <= 0:
+        return
+    if not handle.w_prefetch_slots:
+        raise RuntimeError(
+            f"{op_name}: active bucket needs {required_rows} prefetched rows for "
+            f"{handle.qualified_name}, but no prefetch slots are installed"
+        )
+    owner = handle.prefetch_owner_in_slot[handle.slot_idx]
+    have = int(handle.prefetch_available_rows_in_slot[handle.slot_idx])
+    if owner is not handle:
+        raise RuntimeError(
+            f"{op_name}: slot owner mismatch on {handle.qualified_name} "
+            f"slot {handle.slot_idx}"
+        )
+    if have < required_rows:
+        raise RuntimeError(
+            f"{op_name}: prefetch slot underfilled on {handle.qualified_name}: "
+            f"have {have}, need {required_rows}"
+        )
+
+
+def _cots_prefetch_linear_impl(
+    x_gpu: torch.Tensor,
+    runner_id: int,
+    layer_idx: int,
+    op_kind_code: int,
+    max_n_prefetch: int,
+    enabled: bool,
+) -> torch.Tensor:
+    if not enabled:
+        return x_gpu.new_empty((x_gpu.shape[0], int(max_n_prefetch)))
+    handle, op_kind, bucket = _require_route(
+        runner_id, layer_idx, op_kind_code, "cots_prefetch_linear"
+    )
+    if op_kind == "mlp_block":
+        raise RuntimeError("cots_prefetch_linear does not handle mlp_block routes")
+    n_pref = int(handle.n_prefetch_by_bucket.get(bucket, 0))
+    max_n_prefetch = int(max_n_prefetch)
+    out = x_gpu.new_empty((x_gpu.shape[0], max_n_prefetch))
+    if n_pref <= 0:
+        return out
+    _check_prefetch_slot_ready(handle, n_pref, "cots_prefetch_linear")
+    slot_view = handle.w_prefetch_slots[handle.slot_idx].narrow(0, 0, n_pref)
+    active = torch.nn.functional.linear(x_gpu, slot_view, None)
+    if n_pref == max_n_prefetch:
+        return active
+    out.narrow(1, 0, n_pref).copy_(active)
+    return out
+
+
+def _cots_prefetch_linear_fake(
+    x_gpu: torch.Tensor,
+    runner_id: int,
+    layer_idx: int,
+    op_kind_code: int,
+    max_n_prefetch: int,
+    enabled: bool,
+) -> torch.Tensor:
+    del runner_id, layer_idx, op_kind_code, enabled
+    return x_gpu.new_empty((x_gpu.shape[0], int(max_n_prefetch)))
+
+
+def _cots_scatter_col_outputs_impl(
+    out_perm: torch.Tensor,
+    out_pref: torch.Tensor,
+    out_cpu_flat: torch.Tensor,
+    runner_id: int,
+    layer_idx: int,
+    op_kind_code: int,
+    out_dim: int,
+    enable_prefetch: bool,
+    enable_cpu: bool,
+) -> torch.Tensor:
+    route, op_kind = _lookup_route(
+        runner_id, layer_idx, op_kind_code, "cots_scatter_col_outputs"
+    )
+    if route is None:
+        raise RuntimeError(
+            f"cots_scatter_col_outputs: runner_id={int(runner_id)} has no "
+            f"registered route for layer_idx={int(layer_idx)}, op_kind={op_kind!r}"
+        )
+    handle = route
+    if op_kind == "mlp_block":
+        raise RuntimeError("cots_scatter_col_outputs does not handle mlp_block routes")
+    bucket = None
+    if enable_prefetch or enable_cpu:
+        bucket, _ = _active_dispatch_state(runner_id, "cots_scatter_col_outputs")
+    assert handle.gpu_indices_cuda is not None
+    out = torch.empty(
+        (out_perm.shape[0], int(out_dim)),
+        dtype=out_perm.dtype,
+        device=out_perm.device,
+    )
+    if out_perm.shape[1] > 0:
+        out.index_copy_(1, handle.gpu_indices_cuda, out_perm)
+    if enable_prefetch:
+        assert bucket is not None
+        n_pref = int(handle.n_prefetch_by_bucket.get(bucket, 0))
+        if n_pref > 0:
+            pref_idx = handle.prefetch_indices_cuda_by_bucket[bucket]
+            pref_src = out_pref.narrow(1, 0, n_pref)
+            out.index_copy_(1, pref_idx, pref_src)
+    if enable_cpu:
+        assert bucket is not None
+        n_cpu = int(handle.n_cpu_compute_by_bucket.get(bucket, handle.n_cpu))
+        if n_cpu > 0:
+            cpu_idx = handle.cpu_compute_indices_cuda_by_bucket[bucket]
+            rows = int(out_perm.shape[0])
+            cpu_src = out_cpu_flat.narrow(0, 0, rows * n_cpu).view(rows, n_cpu)
+            out.index_copy_(1, cpu_idx, cpu_src)
+    return out
+
+
+def _cots_scatter_col_outputs_fake(
+    out_perm: torch.Tensor,
+    out_pref: torch.Tensor,
+    out_cpu_flat: torch.Tensor,
+    runner_id: int,
+    layer_idx: int,
+    op_kind_code: int,
+    out_dim: int,
+    enable_prefetch: bool,
+    enable_cpu: bool,
+) -> torch.Tensor:
+    del out_pref, out_cpu_flat, runner_id, layer_idx, op_kind_code
+    del enable_prefetch, enable_cpu
+    return out_perm.new_empty((out_perm.shape[0], int(out_dim)))
+
+
+def _cots_mlp_prefetch_add_impl(
+    x_gpu: torch.Tensor,
+    out_base: torch.Tensor,
+    runner_id: int,
+    layer_idx: int,
+    op_kind_code: int,
+    has_base_gpu: bool,
+    enabled: bool,
+) -> torch.Tensor:
+    if not enabled:
+        return out_base
+    fused_op, op_kind, bucket = _require_route(
+        runner_id, layer_idx, op_kind_code, "cots_mlp_prefetch_add"
+    )
+    if op_kind != "mlp_block":
+        raise RuntimeError("cots_mlp_prefetch_add requires an mlp_block route")
+    gu_h = fused_op._gate_up
+    dn_h = fused_op._down
+    gu_n_pref = int(gu_h.n_prefetch_by_bucket.get(bucket, 0))
+    dn_n_pref = int(dn_h.n_prefetch_by_bucket.get(bucket, 0))
+    if gu_n_pref <= 0 or dn_n_pref <= 0:
+        return out_base
+    _check_prefetch_slot_ready(gu_h, gu_n_pref // 2, "cots_mlp_prefetch_add")
+    _check_prefetch_slot_ready(dn_h, dn_n_pref, "cots_mlp_prefetch_add")
+    gu_slot = gu_h.w_prefetch_slots[gu_h.slot_idx]
+    dn_slot = dn_h.w_prefetch_slots[dn_h.slot_idx]
+    pref_mlp1 = torch.nn.functional.linear(x_gpu, gu_slot.narrow(0, 0, gu_n_pref), None)
+    pref_silu = fused_op._act_fn(pref_mlp1)
+    partial = pref_silu.matmul(dn_slot.narrow(0, 0, dn_n_pref))
+    if has_base_gpu:
+        return out_base + partial
+    return partial
+
+
+def _cots_mlp_prefetch_add_fake(
+    x_gpu: torch.Tensor,
+    out_base: torch.Tensor,
+    runner_id: int,
+    layer_idx: int,
+    op_kind_code: int,
+    has_base_gpu: bool,
+    enabled: bool,
+) -> torch.Tensor:
+    del x_gpu, runner_id, layer_idx, op_kind_code, has_base_gpu, enabled
+    return torch.empty_like(out_base)
+
+
+def _cots_mlp_merge_cpu_impl(
+    out_gpu: torch.Tensor,
+    out_cpu_flat: torch.Tensor,
+    runner_id: int,
+    layer_idx: int,
+    op_kind_code: int,
+    has_base_gpu: bool,
+    enable_prefetch: bool,
+    enable_cpu: bool,
+) -> torch.Tensor:
+    if not enable_cpu:
+        return out_gpu
+    fused_op, op_kind, bucket = _require_route(
+        runner_id, layer_idx, op_kind_code, "cots_mlp_merge_cpu"
+    )
+    if op_kind != "mlp_block":
+        raise RuntimeError("cots_mlp_merge_cpu requires an mlp_block route")
+    dn_h = fused_op._down
+    n_cpu = int(dn_h.n_cpu_compute_by_bucket.get(bucket, dn_h.n_cpu))
+    if n_cpu <= 0:
+        return out_gpu
+    rows = int(out_gpu.shape[0])
+    out_dim = int(fused_op._out_dim)
+    cpu_src = out_cpu_flat.narrow(0, 0, rows * out_dim).view(rows, out_dim)
+    gu_n_pref = int(fused_op._gate_up.n_prefetch_by_bucket.get(bucket, 0))
+    has_prefetch_gpu = bool(enable_prefetch and gu_n_pref > 0)
+    if has_base_gpu or has_prefetch_gpu:
+        return out_gpu + cpu_src
+    return cpu_src.clone()
+
+
+def _cots_mlp_merge_cpu_fake(
+    out_gpu: torch.Tensor,
+    out_cpu_flat: torch.Tensor,
+    runner_id: int,
+    layer_idx: int,
+    op_kind_code: int,
+    has_base_gpu: bool,
+    enable_prefetch: bool,
+    enable_cpu: bool,
+) -> torch.Tensor:
+    del out_cpu_flat, runner_id, layer_idx, op_kind_code
+    del has_base_gpu, enable_prefetch, enable_cpu
+    return torch.empty_like(out_gpu)
+
+
 # --- registration ----------------------------------------------------------
 
 
 def register_cots_offloader_ops() -> None:
-    """Register the two custom ops. Idempotent at import time."""
+    """Register the COTS custom ops. Idempotent at import time."""
     direct_register_custom_op(
         op_name="cots_submit_gemm",
         op_func=_cots_submit_gemm_impl,
@@ -532,6 +851,26 @@ def register_cots_offloader_ops() -> None:
         # absent — never alias.
         mutates_args=["y_gpu", "gpu_anchor_a", "gpu_anchor_b"],
         fake_impl=_cots_sync_then_uva_fake,
+    )
+    direct_register_custom_op(
+        op_name="cots_prefetch_linear",
+        op_func=_cots_prefetch_linear_impl,
+        fake_impl=_cots_prefetch_linear_fake,
+    )
+    direct_register_custom_op(
+        op_name="cots_scatter_col_outputs",
+        op_func=_cots_scatter_col_outputs_impl,
+        fake_impl=_cots_scatter_col_outputs_fake,
+    )
+    direct_register_custom_op(
+        op_name="cots_mlp_prefetch_add",
+        op_func=_cots_mlp_prefetch_add_impl,
+        fake_impl=_cots_mlp_prefetch_add_fake,
+    )
+    direct_register_custom_op(
+        op_name="cots_mlp_merge_cpu",
+        op_func=_cots_mlp_merge_cpu_impl,
+        fake_impl=_cots_mlp_merge_cpu_fake,
     )
 
 

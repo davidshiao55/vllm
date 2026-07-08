@@ -21,7 +21,6 @@ logger = init_logger(__name__)
 
 R = TypeVar("R")
 P = ParamSpec("P")
-CotsCompileKey = Any
 
 
 @contextmanager
@@ -158,11 +157,6 @@ class TorchCompileWithNoGuardsWrapper:
         self._compile_options = options
         with aot_context:
             self._compiled_callable = self._make_compiled_callable(backend)
-        self._compiled_callable_by_cots_key: dict[CotsCompileKey, Any] = {}
-        self._first_call_by_cots_key: set[CotsCompileKey] = set()
-        self._logged_cots_keys: set[CotsCompileKey | None] = set()
-        self._compiled_bytecode_by_cots_key: dict[CotsCompileKey, CodeType] = {}
-        self._pending_cots_bytecode_key: CotsCompileKey | None = None
 
         if envs.VLLM_USE_BYTECODE_HOOK and mode != CompilationMode.STOCK_TORCH_COMPILE:
             torch._dynamo.convert_frame.register_bytecode_hook(self.bytecode_hook)
@@ -176,93 +170,6 @@ class TorchCompileWithNoGuardsWrapper:
             backend=backend,
             options=self._compile_options,
         )
-
-    def _cots_compile_key(self) -> CotsCompileKey | None:
-        if not self._uses_cots_compile_variants():
-            return None
-        try:
-            from vllm.forward_context import (
-                get_forward_context,
-                is_forward_context_available,
-            )
-        except ImportError:
-            return None
-        if not is_forward_context_available():
-            return None
-        forward_context = get_forward_context()
-        batch_descriptor = forward_context.batch_descriptor
-        if batch_descriptor is None:
-            return None
-        return batch_descriptor
-
-    def _uses_cots_compile_variants(self) -> bool:
-        offload_config = self.vllm_config.offload_config
-        if offload_config.offload_backend != "cots":
-            return False
-        return float(offload_config.cots.f_cpu_store) > 0.0
-
-    @staticmethod
-    def _format_cots_compile_key(key: CotsCompileKey | None) -> str:
-        if key is None:
-            return "None"
-        desc = key
-        return (
-            f"tokens={desc.num_tokens},reqs={desc.num_reqs},"
-            f"uniform={int(desc.uniform)},lora={int(desc.has_lora)},"
-            f"active_loras={desc.num_active_loras}"
-        )
-
-    def _cots_compile_prefix(self, key: CotsCompileKey) -> str:
-        desc = key
-        reqs = "any" if desc.num_reqs is None else str(desc.num_reqs)
-        return (
-            f"cots_t{desc.num_tokens}_r{reqs}"
-            f"_u{int(desc.uniform)}_l{int(desc.has_lora)}"
-            f"_a{desc.num_active_loras}"
-        )
-
-    def _log_cots_compile_key(self, key: CotsCompileKey | None) -> None:
-        if envs.VLLM_COTS_COUNTERS and key not in self._logged_cots_keys:
-            self._logged_cots_keys.add(key)
-            logger.info(
-                "COTS compile dispatch: module=%s key=%s",
-                self.__class__.__name__,
-                self._format_cots_compile_key(key),
-            )
-
-    def _compiled_callable_for_cots_key(self, key: CotsCompileKey) -> tuple[Any, bool]:
-        compiled_callable = self._compiled_callable_by_cots_key.get(key)
-        if compiled_callable is not None:
-            return (
-                compiled_callable,
-                key not in self._first_call_by_cots_key,
-            )
-
-        cots_prefix = self._cots_compile_prefix(key)
-        variant_prefix = (
-            f"{self._compile_prefix}_{cots_prefix}"
-            if self._compile_prefix
-            else cots_prefix
-        )
-        backend = self.vllm_config.compilation_config.init_backend(
-            self.vllm_config,
-            prefix=variant_prefix,
-            is_encoder=self._is_encoder,
-        )
-        if envs.VLLM_COTS_COUNTERS:
-            logger.info(
-                "COTS compile variant: module=%s key=%s prefix=%s",
-                self.__class__.__name__,
-                self._format_cots_compile_key(key),
-                variant_prefix,
-            )
-        compiled_callable = self._make_compiled_callable(backend)
-        self._compiled_callable_by_cots_key[key] = compiled_callable
-        # The base wrapper drops guards, so clear Dynamo's frame cache before
-        # the first call for a new COTS graph descriptor. Otherwise a previous
-        # branch-pruned graph can satisfy the no-guard cache entry.
-        torch._dynamo.eval_frame.remove_from_cache(self.original_code_object())
-        return compiled_callable, True
 
     def aot_compile(self, *args: Any, **kwargs: Any) -> Any:
         if not hasattr(self._compiled_callable, "aot_compile"):
@@ -281,26 +188,6 @@ class TorchCompileWithNoGuardsWrapper:
             ):
                 return self._compiled_callable(*args, **kwargs)
 
-            cots_key = self._cots_compile_key()
-            self._log_cots_compile_key(cots_key)
-            if cots_key is not None:
-                compiled_bytecode = self._compiled_bytecode_by_cots_key.get(cots_key)
-                if compiled_bytecode is None:
-                    compiled_callable, _ = self._compiled_callable_for_cots_key(
-                        cots_key
-                    )
-                    self._pending_cots_bytecode_key = cots_key
-                    try:
-                        return self._call_with_optional_nvtx_range(
-                            compiled_callable, *args, **kwargs
-                        )
-                    finally:
-                        self._pending_cots_bytecode_key = None
-                with self._dispatch_to_compiled_code(compiled_bytecode):
-                    return self._call_with_optional_nvtx_range(
-                        self.forward, *args, **kwargs
-                    )
-
             if not self._compiled_bytecode:
                 # Make sure a compilation is triggered by clearing dynamo
                 # cache.
@@ -314,17 +201,8 @@ class TorchCompileWithNoGuardsWrapper:
                         self.forward, *args, **kwargs
                     )
         else:
-            cots_key = self._cots_compile_key()
-            self._log_cots_compile_key(cots_key)
-            compiled_callable = self._compiled_callable
-            if cots_key is None:
-                first_compile = self.first_compile
-                self.first_compile = False
-            else:
-                compiled_callable, first_compile = self._compiled_callable_for_cots_key(
-                    cots_key
-                )
-                self._first_call_by_cots_key.add(cots_key)
+            first_compile = self.first_compile
+            self.first_compile = False
             ctx = (
                 nullcontext()
                 if first_compile or not self.evaluate_guards
@@ -332,7 +210,7 @@ class TorchCompileWithNoGuardsWrapper:
             )
             with _compilation_context(), ctx:
                 return self._call_with_optional_nvtx_range(
-                    compiled_callable, *args, **kwargs
+                    self._compiled_callable, *args, **kwargs
                 )
 
     @abstractmethod
@@ -399,11 +277,7 @@ class TorchCompileWithNoGuardsWrapper:
             raise RuntimeError(msg)
 
     def _store_compiled_bytecode(self, new_code: CodeType) -> None:
-        pending_key = self._pending_cots_bytecode_key
-        if pending_key is None:
-            self._compiled_bytecode = new_code
-        else:
-            self._compiled_bytecode_by_cots_key[pending_key] = new_code
+        self._compiled_bytecode = new_code
 
     @contextmanager
     def _dispatch_to_compiled_code(

@@ -403,7 +403,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                 # Keep the decorated descriptor available even when this helper
                 # captures FULL graphs by asking the model to run with runtime
                 # mode NONE inside the outer torch.cuda.graph. Native COTS uses
-                # it for route-specialized torch.compile variants.
+                # it to publish the active dispatch bucket out of graph.
                 batch_descriptor = _batch_descriptor_from_execution(desc)
                 with set_forward_context(
                     attn_metadata if cg_mode != CUDAGraphMode.PIECEWISE else None,
