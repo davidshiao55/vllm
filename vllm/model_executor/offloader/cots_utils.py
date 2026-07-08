@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import torch
-from cots.snap import qkv_kv_biased_counts as _shared_qkv_kv_biased_counts
 
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
@@ -158,63 +157,6 @@ def uva_copy_into_gpu(
     BLOCK = 1024
     grid = (triton.cdiv(n, BLOCK),)
     _uva_copy_kernel[grid](src_pinned, dst_gpu, n_elements=n, BLOCK=BLOCK)
-
-
-# ---------------------------------------------------------------------------
-# K/V-biased column picker for WQKV. Single source of truth for per-shard
-# CPU column counts. See `weight_offload_design.md §WQKV Column Choice`.
-# ---------------------------------------------------------------------------
-def _qkv_kv_biased_counts(
-    q_size: int,
-    kv_size: int,
-    n_cpu_cols: int,
-    *,
-    head_dim: int,
-) -> tuple[int, int, int]:
-    """Return (n_q_tail, n_k, n_v) — per-shard CPU column counts.
-
-    Production WQKV split is always K/V-biased and floors to head-aligned
-    `2 * head_dim` quanta, preserving exact full placement. K/V head groups
-    are assigned first; Q tail is used only after all K/V rows are selected.
-    """
-    return _shared_qkv_kv_biased_counts(
-        q_size,
-        kv_size,
-        n_cpu_cols,
-        head_dim=head_dim,
-    )
-
-
-def _qkv_kv_biased_indices(
-    q_size: int,
-    kv_size: int,
-    n_cpu_cols: int,
-    *,
-    head_dim: int,
-) -> torch.Tensor:
-    """CPU column indices in `[Q | K | V]` layout. Picks LAST cols of each
-    shard (matches TP loader's narrow-on-rank-0-keeps-FIRST-cols).
-
-    Returns indices in row order `[Q_tail (if any), K_cpu, V_cpu]` —
-    matching the row layout `_w_cpu` uses.
-    """
-    n_q_tail, n_k, n_v = _qkv_kv_biased_counts(
-        q_size, kv_size, n_cpu_cols, head_dim=head_dim
-    )
-    idx_q_tail = torch.arange(q_size - n_q_tail, q_size, dtype=torch.long, device="cpu")
-    idx_k = torch.arange(
-        q_size + kv_size - n_k,
-        q_size + kv_size,
-        dtype=torch.long,
-        device="cpu",
-    )
-    idx_v = torch.arange(
-        q_size + 2 * kv_size - n_v,
-        q_size + 2 * kv_size,
-        dtype=torch.long,
-        device="cpu",
-    )
-    return torch.cat([idx_q_tail, idx_k, idx_v])
 
 
 def _complement(idx: torch.Tensor, n: int) -> torch.Tensor:

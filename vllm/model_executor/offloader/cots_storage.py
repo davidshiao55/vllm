@@ -14,9 +14,6 @@ from cots.snap import (
     WO_QKVO_GRANULARITY_MULTIPLIER,
 )
 from cots.snap import (
-    qkv_kv_biased_counts as _qkv_kv_biased_counts,
-)
-from cots.snap import (
     snap_mlp_channels as _snap_mlp_channels,
 )
 from cots.snap import (
@@ -28,7 +25,6 @@ from cots.snap import (
 
 from vllm.model_executor.offloader.cots_utils import (
     _complement,
-    _qkv_kv_biased_indices,
 )
 from vllm.utils.platform_utils import is_pin_memory_available
 
@@ -51,11 +47,33 @@ ROLE_SPLIT_AXIS: dict[CotsLinearRole, SplitAxis] = {
 }
 
 
+def _qkv_dense_tail_counts(
+    q_size: int,
+    kv_size: int,
+    n_cpu_cols: int,
+) -> tuple[int, int, int]:
+    """Return Q/K/V shard row counts for a dense tail over `[Q | K | V]`."""
+
+    q_size = int(q_size)
+    kv_size = int(kv_size)
+    n_cpu_cols = int(n_cpu_cols)
+    total = q_size + 2 * kv_size
+    if not (0 <= n_cpu_cols <= total):
+        raise ValueError(f"n_cpu_cols={n_cpu_cols} out of range [0, {total}]")
+
+    n_v = min(n_cpu_cols, kv_size)
+    remaining = max(0, n_cpu_cols - n_v)
+    n_k = min(remaining, kv_size)
+    remaining -= n_k
+    n_q_tail = min(remaining, q_size)
+    return n_q_tail, n_k, n_v
+
+
 class CotsLinearHandle:
     """Per-Linear partition primitive: storage + load. No execution.
 
     Role decides module-specific splitting:
-      qkv         : WQKV output split with the head-aware K/V-biased picker.
+      qkv         : WQKV dense output-tail split on the QKVO grid.
       mlp_gate_up : MLP gate/up merged output split, two matched halves.
       mlp_down    : MLP down input split, matched to gate/up's intermediate rows.
       wo          : Dense output split, used by opt-in WO.
@@ -134,11 +152,10 @@ class CotsLinearHandle:
         if role == QKV_ROLE:
             assert q_size is not None and kv_size is not None
             assert head_dim is not None
-            self.n_q_tail, self.n_k, self.n_v = _qkv_kv_biased_counts(
+            self.n_q_tail, self.n_k, self.n_v = _qkv_dense_tail_counts(
                 q_size,
                 kv_size,
                 n_cpu,
-                head_dim=head_dim,
             )
             assert self.n_q_tail + self.n_k + self.n_v == n_cpu, (
                 f"QKV count mismatch at {qualified_name}: n_cpu={n_cpu} != "
@@ -200,6 +217,46 @@ class CotsLinearHandle:
     # ------------------------------------------------------------------
     # Construction helpers — compute indices, snap n_cpu, build handle.
     # ------------------------------------------------------------------
+    @staticmethod
+    def _dense_output_tail_handle(
+        *,
+        role: CotsLinearRole,
+        linear: nn.Module,
+        qualified_name: str,
+        f_cpu_store: float,
+        qkvo_head_dim: int,
+        qkvo_multiplier: int,
+        q_size: int | None = None,
+        kv_size: int | None = None,
+    ) -> CotsLinearHandle | None:
+        out_dim, in_dim = tuple(linear.weight.shape)
+        n_cpu = _snap_qkvo_dense_output_channels(
+            f_cpu_store * out_dim,
+            out_dim,
+            head_dim=qkvo_head_dim,
+            qkvo_multiplier=qkvo_multiplier,
+        )
+        if n_cpu == 0:
+            return None
+        cpu_indices = torch.arange(
+            out_dim - n_cpu, out_dim, dtype=torch.long, device="cpu"
+        )
+        return CotsLinearHandle(
+            role=role,
+            linear=linear,
+            qualified_name=qualified_name,
+            in_dim=in_dim,
+            out_dim=out_dim,
+            n_cpu=n_cpu,
+            cpu_indices=cpu_indices,
+            gpu_indices=_complement(cpu_indices, out_dim),
+            dtype=linear.weight.dtype,
+            q_size=q_size,
+            kv_size=kv_size,
+            head_dim=qkvo_head_dim if role == QKV_ROLE else None,
+            qkvo_head_dim=qkvo_head_dim,
+        )
+
     @classmethod
     def for_qkv(
         cls,
@@ -209,7 +266,6 @@ class CotsLinearHandle:
         head_dim: int,
         f_cpu_store: float,
     ) -> CotsLinearHandle | None:
-        out_dim, in_dim = tuple(linear.weight.shape)
         parts = linear.output_partition_sizes
         assert len(parts) == 3, f"QKV expected 3 partitions, got {parts}"
         q_part, k_part, v_part = parts
@@ -219,34 +275,15 @@ class CotsLinearHandle:
         assert k_part % head_dim == 0, (
             f"QKV: kv_size={k_part} not a multiple of head_dim={head_dim}"
         )
-        requested = int(f_cpu_store * out_dim)
-        n_cpu = _snap_qkv_output_channels(
-            requested,
-            q_size=q_part,
-            kv_size=k_part,
-            head_dim=head_dim,
-        )
-        if n_cpu == 0:
-            return None
-        cpu_indices = _qkv_kv_biased_indices(
-            q_part,
-            k_part,
-            n_cpu,
-            head_dim=head_dim,
-        )
-        return cls(
+        return cls._dense_output_tail_handle(
             role=QKV_ROLE,
             linear=linear,
             qualified_name=qualified_name,
-            in_dim=in_dim,
-            out_dim=out_dim,
-            n_cpu=n_cpu,
-            cpu_indices=cpu_indices,
-            gpu_indices=_complement(cpu_indices, out_dim),
-            dtype=linear.weight.dtype,
+            f_cpu_store=f_cpu_store,
+            qkvo_head_dim=head_dim,
+            qkvo_multiplier=1,
             q_size=q_part,
             kv_size=k_part,
-            head_dim=head_dim,
         )
 
     @classmethod
@@ -328,29 +365,13 @@ class CotsLinearHandle:
         layout and matched-index invariant. WO has no Q/K/V or gate/up
         structure, so its selected output channels are just a dense tail.
         """
-        out_dim, in_dim = tuple(linear.weight.shape)
-        n_cpu = _snap_qkvo_dense_output_channels(
-            f_cpu_store * out_dim,
-            out_dim,
-            head_dim=qkvo_head_dim,
-            qkvo_multiplier=WO_QKVO_GRANULARITY_MULTIPLIER,
-        )
-        if n_cpu == 0:
-            return None
-        cpu_indices = torch.arange(
-            out_dim - n_cpu, out_dim, dtype=torch.long, device="cpu"
-        )
-        return cls(
+        return cls._dense_output_tail_handle(
             role=WO_ROLE,
             linear=linear,
             qualified_name=qualified_name,
-            in_dim=in_dim,
-            out_dim=out_dim,
-            n_cpu=n_cpu,
-            cpu_indices=cpu_indices,
-            gpu_indices=_complement(cpu_indices, out_dim),
-            dtype=linear.weight.dtype,
+            f_cpu_store=f_cpu_store,
             qkvo_head_dim=qkvo_head_dim,
+            qkvo_multiplier=WO_QKVO_GRANULARITY_MULTIPLIER,
         )
 
     # ------------------------------------------------------------------
@@ -456,8 +477,8 @@ class CotsLinearHandle:
         module quantum and assigns the remaining CPU-stored rows to prefetch.
 
         Layout invariants:
-          qkv: `cpu_indices` order is `[Q_tail | K_cpu | V_cpu]`. Prefetch
-            takes the first `n_pref` indices.
+          qkv: `cpu_indices` is a dense output tail over `[Q | K | V]`.
+            Prefetch takes the first `n_pref` indices.
           mlp_gate_up: `cpu_indices` is
             `[gate_last_n_cpu_per_half | up_last_n_cpu_per_half]`.
             Prefetch takes the FIRST `n_pref_per_half` of each half — keeps
@@ -466,22 +487,19 @@ class CotsLinearHandle:
             takes the first `n_pref` of those.
           wo: dense output-tail split. Prefetch takes the first `n_pref` rows.
 
-        For qkv, n_cpu_compute is snapped via the same `2 * head_dim` QKVO
-        grid as storage. MLP gate/up and down use the shared 64-channel MLP
-        snap grid; WO uses the coarse dense output granularity. All roles
-        clamp CPU compute to the CPU-stored cap. Therefore below-boundary
-        runtime remainder goes to prefetch, not CPU compute.
+        QKV snaps on the `2 * head_dim` QKVO grid. MLP gate/up and down use
+        the shared 64-channel MLP snap grid; WO uses the coarse dense output
+        granularity. All roles clamp CPU compute to the CPU-stored cap.
+        Therefore below-boundary runtime remainder goes to prefetch, not CPU
+        compute.
         """
         cap = self.n_cpu
 
         if self.role == QKV_ROLE:
-            assert self.q_size is not None and self.kv_size is not None
             assert self.head_dim is not None
-            requested = int(f_cpu_compute * self.out_dim)
             n_cpu_compute = _snap_qkv_output_channels(
-                requested,
-                q_size=self.q_size,
-                kv_size=self.kv_size,
+                f_cpu_compute * self.out_dim,
+                out_dim=self.out_dim,
                 head_dim=self.head_dim,
             )
             n_cpu_compute = min(n_cpu_compute, cap)

@@ -33,8 +33,6 @@ from vllm.model_executor.offloader.cots_storage import (
 from vllm.model_executor.offloader.cots_utils import (
     _complement,
     _has_pinned_host_storage,
-    _qkv_kv_biased_counts,
-    _qkv_kv_biased_indices,
     _uva_copy_trusted_host_into_gpu,
     uva_copy_into_gpu,
 )
@@ -63,7 +61,5 @@ __all__ = [
     "_scatter_col_outputs_three_way",
     "_complement",
     "_has_pinned_host_storage",
-    "_qkv_kv_biased_counts",
-    "_qkv_kv_biased_indices",
     "_uva_copy_trusted_host_into_gpu",
 ]
