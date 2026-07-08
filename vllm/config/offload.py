@@ -188,43 +188,6 @@ class CotsOffloadConfig:
     omitted. Token output is garbage; tensor shapes remain valid. Permanent
     diagnostic for measuring the COTS control-plane floor."""
 
-    auto_graph_split: bool = Field(default=True)
-    """When COTS runs with CUDA graphs (`enforce_eager=False`), default to
-    the measured fast graph policy.
-
-    Phase 1 weight offload uses piecewise CUDA graphs, COTS weight
-    submit/sync split points, and `wait_kernel` weight sync. Disable this with
-    `--no-cots-auto-graph-split` to reproduce full-capture or host-callback
-    weight-capture experiments explicitly."""
-
-    weight_capture_sync_mode: Literal["host_callback", "wait_kernel"] = "host_callback"
-    """Phase 1 weight-offload sync mechanism for the captured-replay path.
-
-    * `"host_callback"` (field default / eager fallback): the
-      captured graph node is `cudaLaunchHostFunc(SyncCallback)`
-      which blocks the CUDA driver thread on
-      `TaskQueue::sync(0)`. This is the host-callback measured-baseline
-      mechanism. With `auto_graph_split=True`, native COTS weight graph
-      mode upgrades this to `"wait_kernel"` unless explicitly
-      opting out of the auto graph policy.
-    * `"wait_kernel"`: the captured node
-      is a custom GPU wait kernel that spins on a host-mapped
-      pinned `done_slot` written by the CPU worker. Replaces the
-      captured `cudaLaunchHostFunc(sync_cb)` only. Submit side
-      (dispatch_cb host_fn) is unchanged in both modes so CPU
-      GEMM still overlaps with GPU GEMM. By itself on the legacy
-      full-capture path, this did not beat native eager; paired
-      with the COTS split-graph default it is the fastest measured
-      capture path on the focused Qwen2.5-7B grid.
-    Hard-fail safety gates (in `CotsOffloader.post_init`) for
-    `wait_kernel` mode:
-    * Requires `enforce_eager=False` — kernel only makes sense
-      as a captured node.
-    * Requires CUDA + `_cots_C` extension built.
-
-    Full-capture weight modes remain available by disabling `auto_graph_split`.
-    """
-
     @field_validator("weight_modules", mode="before")
     @classmethod
     def normalize_weight_modules_field(cls, value: object) -> set[str]:

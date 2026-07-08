@@ -5311,6 +5311,7 @@ class GPUModelRunner(
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
+        compile_batch_descriptor: BatchDescriptor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -5338,6 +5339,9 @@ class GPUModelRunner(
             profile_seq_lens: If provided, use this value for seq_lens instead
                 of max_query_len. Used to profile attention workspace that
                 scales with context length.
+            compile_batch_descriptor: Optional graph descriptor to publish
+                during eager graph warmup so descriptor-specialized compile
+                variants are materialized before CUDA stream capture starts.
         """
         mm_config = self.vllm_config.model_config.multimodal_config
         if mm_config and mm_config.mm_encoder_only:
@@ -5433,6 +5437,10 @@ class GPUModelRunner(
                 f"Cudagraph runtime mode mismatch in dummy_run. "
                 f"Expected {_cudagraph_mode}, but got {cudagraph_runtime_mode}."
             )
+
+        if compile_batch_descriptor is not None:
+            assert compile_batch_descriptor.num_tokens == batch_desc.num_tokens
+            batch_desc = compile_batch_descriptor
 
         num_tokens_padded = batch_desc.num_tokens
         num_reqs_padded = (
@@ -6179,6 +6187,15 @@ class GPUModelRunner(
         if num_warmups is None:
             num_warmups = self.compilation_config.cudagraph_num_of_warmups
         force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL
+        offload_config = self.vllm_config.offload_config
+        compile_batch_descriptor = (
+            desc
+            if (
+                offload_config.offload_backend == "cots"
+                and float(offload_config.cots.f_cpu_store) > 0.0
+            )
+            else None
+        )
         for _ in range(num_warmups):
             self._dummy_run(
                 desc.num_tokens,
@@ -6189,6 +6206,7 @@ class GPUModelRunner(
                 skip_eplb=True,
                 remove_lora=False,
                 num_active_loras=desc.num_active_loras,
+                compile_batch_descriptor=compile_batch_descriptor,
             )
         self._dummy_run(
             desc.num_tokens,

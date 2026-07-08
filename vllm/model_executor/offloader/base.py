@@ -35,10 +35,6 @@ class ForwardDispatchInfo:
     - `num_tokens_unpadded` is the live row count. Graph/slab sizes
       remain bucket-capacity sized; offloaders may use this value to
       avoid doing CPU work for padded rows.
-    - `batch_descriptor.cots_dispatch_bucket`, when present, is the
-      authoritative planner route bucket associated with the graph/compile
-      variant. Offloaders should use it for route selection instead of treating
-      `batch_descriptor.num_tokens` as a dispatch bucket.
     """
 
     batch_descriptor: "BatchDescriptor"
@@ -123,17 +119,6 @@ class BaseOffloader(ABC):
         self.prepare_before_forward(info.batch_descriptor.num_tokens)
         self.sync_prev_onload()
         self.set_live_num_tokens(info.num_tokens_unpadded)
-
-    def decorate_batch_descriptor(self, batch_descriptor: "BatchDescriptor"):
-        """Add offloader-specific graph/compile route identity.
-
-        CUDAGraph dispatchers call this when they construct a runtime/capture
-        `BatchDescriptor`. Most offloaders leave it unchanged. COTS uses it to
-        attach the planner dispatch bucket and compile-visible route signature
-        so CUDA graph and torch.compile variants are selected by the same
-        structural route that the runtime will execute.
-        """
-        return batch_descriptor
 
     def post_cudagraph_capture(self) -> None:  # noqa: B027
         """One-shot hook fired by `cudagraph_utils.CudaGraphManager.capture`

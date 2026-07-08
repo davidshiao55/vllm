@@ -1095,11 +1095,9 @@ class VllmConfig:
             if self.model_config is None or self.model_config.is_moe
             else 1
         )
-        extra_splitting_ops = self._apply_cots_graph_defaults()
         self.compilation_config.set_splitting_ops_for_v1(
             all2all_backend=self.parallel_config.all2all_backend,
             data_parallel_size=effective_dp_size,
-            extra_splitting_ops=extra_splitting_ops,
         )
 
         if self.compilation_config.pass_config.enable_sp:
@@ -1310,57 +1308,6 @@ class VllmConfig:
             for size in possible_sizes
             if size % self.parallel_config.tensor_parallel_size == 0
         ]
-
-    def _apply_cots_graph_defaults(self) -> list[str] | None:
-        cots_config = self.offload_config.cots
-        has_native_weight_graph = cots_config.f_cpu_store > 0
-        if (
-            self.offload_config.offload_backend != "cots"
-            or not has_native_weight_graph
-            or not cots_config.auto_graph_split
-            or self.compilation_config.mode != CompilationMode.VLLM_COMPILE
-            or self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
-            or (self.model_config is not None and self.model_config.enforce_eager)
-        ):
-            return None
-
-        if self.compilation_config.splitting_ops is not None:
-            return None
-
-        if self.compilation_config.use_inductor_graph_partition:
-            logger.info_once(
-                "COTS auto graph split is enabled, but "
-                "use_inductor_graph_partition=True; leaving graph partition "
-                "configuration unchanged."
-            )
-            return None
-
-        if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
-            logger.info_once(
-                "COTS graph mode is defaulting to PIECEWISE CUDA graphs. "
-                "Phase 1 weight offload needs COTS weight submit/sync work "
-                "at graph boundaries. "
-                "Use --no-cots-auto-graph-split to keep the configured "
-                "cudagraph_mode."
-            )
-            self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
-
-        if (
-            has_native_weight_graph
-            and cots_config.weight_capture_sync_mode == "host_callback"
-        ):
-            logger.info_once(
-                "COTS graph mode is defaulting weight_capture_sync_mode to "
-                "wait_kernel for the Phase 1 weight runner. Use "
-                "--no-cots-auto-graph-split to keep the legacy host_callback "
-                "weight capture path."
-            )
-            self.offload_config = replace(
-                self.offload_config,
-                cots=replace(cots_config, weight_capture_sync_mode="wait_kernel"),
-            )
-
-        return CompilationConfig.cots_splitting_ops()
 
     def _set_max_num_scheduled_tokens(self):
         """

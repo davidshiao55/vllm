@@ -480,10 +480,6 @@ class EngineArgs:
     )
     cots_cpu_worker_affinity: list[int] | None = CotsOffloadConfig.cpu_worker_affinity
     cots_dry_run: bool = CotsOffloadConfig.dry_run
-    cots_auto_graph_split: bool = CotsOffloadConfig.auto_graph_split
-    cots_weight_capture_sync_mode: Literal["host_callback", "wait_kernel"] = (
-        CotsOffloadConfig.weight_capture_sync_mode
-    )
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
     max_num_batched_tokens: int | None = None
@@ -1102,14 +1098,6 @@ class EngineArgs:
             **cots_kwargs["cpu_worker_affinity"],
         )
         offload_group.add_argument("--cots-dry-run", **cots_kwargs["dry_run"])
-        offload_group.add_argument(
-            "--cots-auto-graph-split",
-            **cots_kwargs["auto_graph_split"],
-        )
-        offload_group.add_argument(
-            "--cots-weight-capture-sync-mode",
-            **cots_kwargs["weight_capture_sync_mode"],
-        )
 
         # Multimodal related configs
         multimodal_kwargs = get_kwargs(MultiModalConfig)
@@ -2019,8 +2007,6 @@ class EngineArgs:
             cpu_num_threads_by_bucket=self.cots_cpu_num_threads_by_bucket,
             cpu_worker_affinity=self.cots_cpu_worker_affinity,
             dry_run=self.cots_dry_run,
-            auto_graph_split=self.cots_auto_graph_split,
-            weight_capture_sync_mode=self.cots_weight_capture_sync_mode,
         )
         offload_config = config_replace(
             OffloadConfig(),

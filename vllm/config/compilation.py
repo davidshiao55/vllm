@@ -717,18 +717,6 @@ class CompilationConfig:
         "vllm::rocm_aiter_sparse_attn_indexer",
     ]
 
-    # COTS graph-boundary ops; used by the thesis COTS fast split default.
-    _cots_ops: ClassVar[list[str]] = [
-        "vllm::wait_prefetch",
-        "vllm::start_prefetch",
-        "vllm::cots_submit_gemm",
-        "vllm::cots_sync_then_uva",
-    ]
-
-    @classmethod
-    def cots_splitting_ops(cls) -> list[str]:
-        return list(cls._cots_ops)
-
     def compute_hash(self) -> str:
         """
         Provide a hash that uniquely identifies all the configs

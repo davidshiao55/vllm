@@ -7,7 +7,6 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Callable, Generator, Sequence
-from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -50,11 +49,8 @@ from vllm.utils.platform_utils import is_pin_memory_available
 
 if TYPE_CHECKING:
     from vllm.config import CotsOffloadConfig
-    from vllm.forward_context import BatchDescriptor
 
 logger = init_logger(__name__)
-
-COTS_ROUTE_SIGNATURE_BASE = 20_000
 
 LINEAR_OP_KIND_BY_ROLE = {
     QKV_ROLE: "qkv",
@@ -131,7 +127,6 @@ class CotsOffloader(BaseOffloader):
         # must exist even in eager mode, where CUDA graph buckets are empty.
         self._graph_capture_buckets: tuple[int, ...] = ()
         self._dispatch_buckets: tuple[int, ...] = ()
-        self._route_signature_by_bucket: dict[int, int] = {}
         self._max_num_tokens: int = 0
         self._eager_fallback_entry: tuple[float, float] = (0.0, 0.0)
         self._has_cpu_compute_work: bool = False
@@ -217,7 +212,6 @@ class CotsOffloader(BaseOffloader):
         for h in self._handles:
             h.apply_prefetch_split_per_bucket(self._dispatch_table)
         self._has_cpu_compute_work = self._compute_has_cpu_compute_work()
-        self._build_route_signatures()
 
         # Allocate shared CPU-compute buffers only when some bucket actually
         # leaves rows on the CPU-compute path. Pure-prefetch configurations
@@ -565,11 +559,11 @@ class CotsOffloader(BaseOffloader):
     def _native_routing_uniform_across_buckets(self) -> bool:
         """Whether compile-visible operator geometry is bucket-invariant.
 
-        The dispatch bucket still selects native task ids at runtime, while the
-        route signature selects the compiled graph variant for Python-visible
-        geometry (`n_prefetch`, `n_cpu_compute`, scatter indices, GPU branch
-        shape). This helper remains useful as a diagnostic and for tests that
-        distinguish uniform and nonuniform routing.
+        The dispatch bucket selects native task ids at runtime, while the
+        Python-visible operator geometry (`n_prefetch`, `n_cpu_compute`,
+        scatter indices, GPU branch shape) may still differ by bucket. This
+        helper remains useful as a diagnostic and for tests that distinguish
+        uniform and nonuniform routing.
         """
         if not self._dispatch_buckets:
             return True
@@ -593,42 +587,6 @@ class CotsOffloader(BaseOffloader):
                 if int(h.n_cpu_compute_by_bucket.get(bucket, h.n_cpu)) > 0:
                     return True
         return False
-
-    def _build_route_signatures(self) -> None:
-        """Assign stable ids to compile-visible COTS route geometries.
-
-        The dispatch bucket selects the Planner row and native slabs. The
-        route signature captures only Python-visible geometry that can change
-        the traced graph: CPU/prefetch slice sizes and therefore branch/scatter
-        structure. Buckets with identical geometry share a signature so
-        torch.compile does not build redundant variants.
-        """
-        signature_for_geometry: dict[tuple[tuple[str, int, int], ...], int] = {}
-        route_signature_by_bucket: dict[int, int] = {}
-        for bucket in self._dispatch_buckets:
-            geometry = tuple(
-                (
-                    h.role,
-                    int(h.n_prefetch_by_bucket.get(bucket, 0)),
-                    int(h.n_cpu_compute_by_bucket.get(bucket, h.n_cpu)),
-                )
-                for h in self._handles
-            )
-            signature = signature_for_geometry.get(geometry)
-            if signature is None:
-                signature = COTS_ROUTE_SIGNATURE_BASE + len(signature_for_geometry) + 1
-                signature_for_geometry[geometry] = signature
-            route_signature_by_bucket[int(bucket)] = int(signature)
-        self._route_signature_by_bucket = route_signature_by_bucket
-
-    def _route_signature_for_bucket(self, bucket: int) -> int:
-        if not self._route_signature_by_bucket and self._handles:
-            self._build_route_signatures()
-        return int(
-            self._route_signature_by_bucket.get(
-                int(bucket), COTS_ROUTE_SIGNATURE_BASE + int(bucket)
-            )
-        )
 
     def _build_native_slab_specs(self) -> list[NativeWeightSlabSpec]:
         """Build the per-(layer, bucket, op_kind) slab specs that
@@ -870,35 +828,7 @@ class CotsOffloader(BaseOffloader):
         return self._dispatch_buckets[-1]
 
     def _dispatch_bucket_from_descriptor(self, batch_descriptor) -> int:
-        bucket = getattr(batch_descriptor, "cots_dispatch_bucket", None)
-        if bucket is None:
-            return self._dispatch_bucket_for(int(batch_descriptor.num_tokens))
-        bucket = int(bucket)
-        if bucket not in self._dispatch_buckets:
-            raise RuntimeError(
-                "CotsOffloader: BatchDescriptor carries unknown "
-                f"cots_dispatch_bucket={bucket}; known dispatch buckets are "
-                f"{self._dispatch_buckets}."
-            )
-        return bucket
-
-    def decorate_batch_descriptor(
-        self, batch_descriptor: BatchDescriptor
-    ) -> BatchDescriptor:
-        if not self._dispatch_buckets:
-            self._resolve_bucket_sets()
-        bucket = self._dispatch_bucket_for(int(batch_descriptor.num_tokens))
-        signature = self._route_signature_for_bucket(bucket)
-        if (
-            batch_descriptor.cots_dispatch_bucket == bucket
-            and batch_descriptor.cots_route_signature == signature
-        ):
-            return batch_descriptor
-        return replace(
-            batch_descriptor,
-            cots_dispatch_bucket=bucket,
-            cots_route_signature=signature,
-        )
+        return self._dispatch_bucket_for(int(batch_descriptor.num_tokens))
 
     def _prepare_before_forward_bucket(self, num_tokens: int, bucket: int) -> None:
         self._current_bucket = int(bucket)
@@ -982,7 +912,6 @@ class CotsOffloader(BaseOffloader):
         f_cpu_compute, f_prefetch_compute = self._dispatch_table.get(
             active_bucket, (0.0, 0.0)
         )
-        descriptor_bucket = getattr(info.batch_descriptor, "cots_dispatch_bucket", None)
         payload = {
             **dict(info.trace_context),
             "event": "cots_dispatch_trace",
@@ -990,15 +919,7 @@ class CotsOffloader(BaseOffloader):
             "num_tokens_padded": int(num_tokens_padded),
             "num_tokens_unpadded": int(num_tokens_unpadded),
             "cots_dispatch_bucket": int(active_bucket),
-            "dispatch_bucket_source": (
-                "descriptor" if descriptor_bucket is not None else "num_tokens"
-            ),
-            "descriptor_dispatch_bucket": (
-                None if descriptor_bucket is None else int(descriptor_bucket)
-            ),
-            "cots_route_signature": getattr(
-                info.batch_descriptor, "cots_route_signature", None
-            ),
+            "dispatch_bucket_source": "num_tokens",
             "f_cpu_store": float(self.f_cpu_store),
             "f_cpu_compute": float(f_cpu_compute),
             "f_prefetch_compute": float(f_prefetch_compute),
@@ -1259,52 +1180,6 @@ class CotsOffloader(BaseOffloader):
                 "ubatching until per-ubatch live counts are plumbed."
             )
 
-        # Wait-kernel-sync safety gates for the Phase 1 weight runner.
-        # Hard-fail at post_init when the captured weight-sync mode is set
-        # to wait-kernel but a precondition is missing. We check
-        # BEFORE _install_runner so misconfigurations surface before
-        # any C++ slab allocation. The host_callback path is unchanged
-        # by these gates and remains available for diagnostics.
-        weight_capture_sync_mode = self.config.weight_capture_sync_mode
-        wait_kernel_enabled = weight_capture_sync_mode == "wait_kernel"
-        if self._has_cpu_compute_work and wait_kernel_enabled:
-            # Gate 1: graph-capture mode required. Eager mode launches
-            # and syncs each iteration, so the wait kernel adds
-            # round-trip cost without removing any captured sync_cb
-            # node — net negative.
-            if vllm_config.model_config.enforce_eager:
-                raise RuntimeError(
-                    "CotsOffloader: weight_capture_sync_mode="
-                    f"{weight_capture_sync_mode!r} requires enforce_eager=False "
-                    "(graph-capture mode). The wait kernel replaces the "
-                    "captured weight sync_cb host_fn node; under "
-                    "enforce_eager=True there is no captured node to replace. "
-                    "Set weight_capture_sync_mode='host_callback' or "
-                    "enforce_eager=False."
-                )
-            # Gate 2: CUDA available (defensive — native runner already
-            # requires CUDA, but a clearer error here pinpoints the
-            # wait-kernel sync as the configuration that needs the GPU).
-            if not torch.cuda.is_available():
-                raise RuntimeError(
-                    "CotsOffloader: weight_capture_sync_mode="
-                    f"{weight_capture_sync_mode!r} requires CUDA to be "
-                    "available; the wait kernel runs on the GPU."
-                )
-            # Gate 3: _cots_C extension built (defensive — already
-            # required by NativeCotsWeightRunner, but with the wait kernel
-            # we want a tight blame line if the build was partial).
-            try:
-                from vllm import _cots_C  # noqa: F401
-            except ImportError as e:
-                raise RuntimeError(
-                    "CotsOffloader: weight_capture_sync_mode="
-                    f"{weight_capture_sync_mode!r} requires the `vllm._cots_C` "
-                    "extension. Rebuild vLLM with CUDA support "
-                    "(/TTC/scripts/rebuild-vllm.sh). Underlying "
-                    f"ImportError: {e}"
-                ) from e
-
         self._eager_fallback_entry = self._dispatch_table[self._dispatch_buckets[-1]]
 
         dispatch_policy = {
@@ -1320,15 +1195,6 @@ class CotsOffloader(BaseOffloader):
         # Install the runner's per-(layer, bucket, op_kind) work table after
         # the underlying CPU and pinned storages are stable.
         self._install_runner()
-
-        # Install wait-kernel sync host-mapped pinned slots once
-        # the slab pool exists. The installer walks every slab in the
-        # pool and allocates the req/done slot pair. After this returns, the
-        # captured graph's sync host-callback nodes are replaced with wait
-        # kernel launches at every cots_sync_then_uva call site.
-        if self._has_cpu_compute_work and wait_kernel_enabled:
-            assert self._runner is not None
-            self._runner.install_wait_kernel_sync()
 
         # Layer 0 is filled lazily at the first forward boundary by
         # `prepare_before_forward`. This keeps col prefetch slots
@@ -1374,7 +1240,7 @@ class CotsOffloader(BaseOffloader):
             "pinned_in + %.4f GB pinned_out + %.4f GB gpu_uva, "
             "prefetch_pool=%.4f GB, graph_buckets=%s, dispatch_buckets=%s",
             "native",
-            weight_capture_sync_mode,
+            "host_callback",
             sorted(self.weight_modules),
             qkvo_granularity_channels,
             len(self._handles),

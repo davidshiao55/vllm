@@ -51,8 +51,8 @@ _T = TypeVar("_T", bound=nn.Module)
 def _uses_native_cots_weight_graph(vllm_config: VllmConfig) -> bool:
     # Native COTS weight routes can change the custom-op surface
     # (pure prefetch vs CPU submit/sync). AOT artifacts are not keyed by
-    # BatchDescriptor.cots_route_signature, so CUDA graph capture must go
-    # through TorchCompileWithNoGuardsWrapper's route-specialized variants.
+    # runtime BatchDescriptor, so CUDA graph capture must go through
+    # TorchCompileWithNoGuardsWrapper's descriptor-specialized variants.
     compilation_config = vllm_config.compilation_config
     cots_config = vllm_config.offload_config.cots
     return (

@@ -280,8 +280,9 @@ class NativeCotsWeightRunner:
     def install_wait_kernel_sync(self) -> None:
         """Install host-mapped pinned req/done slots for every slab.
 
-        Must be called after `install()` and only when the offloader's feature
-        flag `weight_capture_sync_mode="wait_kernel"`.
+        Must be called after `install()`. This is retained for low-level
+        wait-kernel diagnostics; the production offloader uses host-callback
+        sync.
 
         After this returns, every slab's `wait_kernel_sync_installed=True`, the
         captured `dispatch_cb` writes `req_slot=seq` per dispatch,
