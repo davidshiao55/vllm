@@ -27,7 +27,7 @@ ordering between submit, GPU GEMMs, sync, and UVA copy.
       The impl reaches the slab's pinned output via
       `CotsWeightTaskRunner.y_pinned_view(task_id, bucket)`.
 
-These ops accept ONLY CUDA tensors and scalar ids — no CPU tensor
+Both ops accept ONLY CUDA tensors and scalar ids — no CPU tensor
 arguments. Inductor's functionalization on captured graphs
 materializes any CPU view it sees (in the worst case via a GPU
 intermediate + blocking GPU→CPU copy that CUDA Graph capture
@@ -610,31 +610,15 @@ def _check_prefetch_slot_ready(handle: Any, required_rows: int, op_name: str) ->
     owner = handle.prefetch_owner_in_slot[handle.slot_idx]
     have = int(handle.prefetch_available_rows_in_slot[handle.slot_idx])
     if owner is not handle:
-        owner_desc = (
-            "None"
-            if owner is None
-            else (
-                f"{getattr(owner, 'qualified_name', '<unknown>')} "
-                f"layer={getattr(owner, 'layer_idx', '?')} "
-                f"role={getattr(owner, 'role', '?')}"
-            )
-        )
         raise RuntimeError(
             f"{op_name}: slot owner mismatch on {handle.qualified_name} "
-            f"layer={getattr(handle, 'layer_idx', '?')} "
-            f"role={getattr(handle, 'role', '?')} slot {handle.slot_idx} "
-            f"(owner={owner_desc})"
+            f"slot {handle.slot_idx}"
         )
     if have < required_rows:
         raise RuntimeError(
             f"{op_name}: prefetch slot underfilled on {handle.qualified_name}: "
             f"have {have}, need {required_rows}"
         )
-
-
-def _mark_prefetch_slot_consumed(handle: Any, required_rows: int) -> None:
-    if int(required_rows) > 0 and handle.prefetch_consumed_in_slot:
-        handle.prefetch_consumed_in_slot[handle.slot_idx] = True
 
 
 def _cots_prefetch_linear_impl(
@@ -660,7 +644,6 @@ def _cots_prefetch_linear_impl(
     _check_prefetch_slot_ready(handle, n_pref, "cots_prefetch_linear")
     slot_view = handle.w_prefetch_slots[handle.slot_idx].narrow(0, 0, n_pref)
     active = torch.nn.functional.linear(x_gpu, slot_view, None)
-    _mark_prefetch_slot_consumed(handle, n_pref)
     if n_pref == max_n_prefetch:
         return active
     out.narrow(1, 0, n_pref).copy_(active)
@@ -775,8 +758,6 @@ def _cots_mlp_prefetch_add_impl(
     pref_mlp1 = torch.nn.functional.linear(x_gpu, gu_slot.narrow(0, 0, gu_n_pref), None)
     pref_silu = fused_op._act_fn(pref_mlp1)
     partial = pref_silu.matmul(dn_slot.narrow(0, 0, dn_n_pref))
-    _mark_prefetch_slot_consumed(gu_h, gu_n_pref // 2)
-    _mark_prefetch_slot_consumed(dn_h, dn_n_pref)
     if has_base_gpu:
         return out_base + partial
     return partial
