@@ -205,6 +205,10 @@ class CotsLinearHandle:
         #   prefix rows for qkv/wo/mlp_down. 0 = empty.
         self.prefetch_owner_in_slot: list[CotsLinearHandle | None] = []
         self.prefetch_available_rows_in_slot: list[int] = []
+        # Compile-visible mutation tokens for the same physical prefetch slots.
+        # They make hidden slot read/write aliases visible to torch.compile while
+        # leaving the actual weight data owned by the buffer pool.
+        self.prefetch_slot_guards: list[torch.Tensor] = []
         # Stage 7-C: row-handle `w_cpu` is stored in transposed
         # `(n_cpu, out_dim)` layout (see install()); its first
         # `n_pref` rows are the contiguous prefetch source. No
@@ -709,6 +713,7 @@ class CotsPrefetchBufferPool:
                 h.w_prefetch_slots = []
                 h.prefetch_owner_in_slot = []
                 h.prefetch_available_rows_in_slot = []
+                h.prefetch_slot_guards = []
                 continue
             if h.split_axis == INPUT_SPLIT_AXIS:
                 # Input-split slot is (max_n_prefetch, out_dim) — matches the
@@ -743,10 +748,14 @@ class CotsPrefetchBufferPool:
             # one handle are visible to all sharers of the physical slot.
             shared_owners: list[CotsLinearHandle | None] = [None] * self.K
             shared_avail: list[int] = [0] * self.K
+            shared_guards = [
+                torch.empty((), dtype=torch.int32, device=device) for _ in range(self.K)
+            ]
             for h in group_handles:
                 h.w_prefetch_slots = shared_slots
                 h.prefetch_owner_in_slot = shared_owners
                 h.prefetch_available_rows_in_slot = shared_avail
+                h.prefetch_slot_guards = shared_guards
 
 
 # ---------------------------------------------------------------------------

@@ -13,7 +13,9 @@ import torch
 import torch.nn as nn
 from cots.snap import COTS_SNAP_MODEL, qkvo_output_granularity
 
-# Register prefetch custom ops; COTS reuses wait_prefetch/start_prefetch.
+# Register prefetch custom ops. COTS uses generic wait_prefetch plus
+# COTS-specific guarded start/consumer ops for hidden prefetch-slot aliases.
+import vllm.model_executor.offloader.cots_ops  # noqa: F401
 import vllm.model_executor.offloader.prefetch_ops  # noqa: F401
 from vllm.config.cots import (
     cots_weight_module_for_name,
@@ -156,6 +158,9 @@ class CotsOffloader(BaseOffloader):
         # (phase1a_findings.md §1.5).
         self._dummy_gpu_anchor_a: torch.Tensor | None = None
         self._dummy_gpu_anchor_b: torch.Tensor | None = None
+        # Distinct fallback guards for COTS prefetch custom-op schemas. Real
+        # prefetch handles pass per-slot guards; these fill unused guard slots.
+        self._dummy_prefetch_slot_guards: tuple[torch.Tensor, ...] = ()
 
     # ------------------------------------------------------------------
     # Lifecycle: wrap_modules → (weight loading) → post_init.
@@ -212,6 +217,8 @@ class CotsOffloader(BaseOffloader):
         for h in self._handles:
             h.apply_prefetch_split_per_bucket(self._dispatch_table)
         self._has_cpu_compute_work = self._compute_has_cpu_compute_work()
+        if self._handles:
+            self._allocate_prefetch_slot_guard_dummies()
 
         # Allocate shared CPU-compute buffers only when some bucket actually
         # leaves rows on the CPU-compute path. Pure-prefetch configurations
@@ -819,6 +826,9 @@ class CotsOffloader(BaseOffloader):
             and next_idx != index
             and any(h.max_n_prefetch > 0 for h in self._layer_handles[next_idx])
         )
+        next_prefetch_guards = (
+            self._prefetch_slot_guards_for_layer(next_idx) if next_has_prefetch else ()
+        )
 
         def forward(*args, **kwargs):
             layer.forward = original_forward
@@ -826,12 +836,38 @@ class CotsOffloader(BaseOffloader):
             if layer_has_prefetch:
                 torch.ops.vllm.wait_prefetch(anchor, index)
             if next_has_prefetch:
-                torch.ops.vllm.start_prefetch(anchor, next_idx)
+                torch.ops.vllm.cots_start_prefetch(
+                    anchor, *next_prefetch_guards, next_idx
+                )
             output = original_forward(*args, **kwargs)
             layer.forward = forward
             return output
 
         layer.forward = forward
+
+    def _prefetch_slot_guards_for_layer(
+        self, layer_idx: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        guards: list[torch.Tensor] = []
+        seen: set[int] = set()
+        for h in self._layer_handles[layer_idx]:
+            if h.max_n_prefetch <= 0 or not h.prefetch_slot_guards:
+                continue
+            guard = h.prefetch_slot_guards[h.slot_idx]
+            key = id(guard)
+            if key in seen:
+                continue
+            guards.append(guard)
+            seen.add(key)
+        if len(guards) > 4:
+            raise RuntimeError(
+                "COTS guarded prefetch supports at most four distinct slot "
+                f"guards per layer, got {len(guards)} for layer {layer_idx}"
+            )
+        if len(self._dummy_prefetch_slot_guards) < 4:
+            raise RuntimeError("COTS prefetch guard dummies were not allocated")
+        guards.extend(self._dummy_prefetch_slot_guards[len(guards) : 4])
+        return guards[0], guards[1], guards[2], guards[3]
 
     def _dispatch_bucket_for(self, num_tokens: int) -> int:
         """Round-up lookup on `_dispatch_buckets`.
@@ -1117,6 +1153,14 @@ class CotsOffloader(BaseOffloader):
             )
 
     # --- Activation buffer allocation ---
+
+    def _allocate_prefetch_slot_guard_dummies(self) -> None:
+        if self._dummy_prefetch_slot_guards:
+            return
+        device = torch.device("cuda")
+        self._dummy_prefetch_slot_guards = tuple(
+            torch.empty((), dtype=torch.int32, device=device) for _ in range(4)
+        )
 
     def _allocate_activation_buffers(self) -> None:
         """Allocate `_x_pinned`, `_y_pinned`, `_y_gpu` sized to the worst-case
