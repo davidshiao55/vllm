@@ -120,15 +120,6 @@ class BaseOffloader(ABC):
         self.sync_prev_onload()
         self.set_live_num_tokens(info.num_tokens_unpadded)
 
-    def post_cudagraph_capture(self) -> None:  # noqa: B027
-        """One-shot hook fired by `cudagraph_utils.CudaGraphManager.capture`
-        AFTER all bucket graphs are captured but BEFORE any measured
-        replay. Default is no-op; offloaders may override to reset
-        instrumentation counters so per-generate diagnostics
-        isolate replay-time activity (see `phase1c_findings.md §1c.22`).
-        """
-        pass
-
     def shutdown(self) -> None:  # noqa: B027
         """Called from worker shutdown so offloaders can drain native
         resources deterministically. Default is no-op."""

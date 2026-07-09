@@ -713,10 +713,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     == "1",
     "VLLM_COTS_DISPATCH_TRACE": lambda: os.getenv("VLLM_COTS_DISPATCH_TRACE", "0")
     == "1",
-    "VLLM_COTS_RESET_COUNTERS_AFTER_CUDAGRAPH_CAPTURE": lambda: os.getenv(
-        "VLLM_COTS_RESET_COUNTERS_AFTER_CUDAGRAPH_CAPTURE", "0"
-    )
-    == "1",
     # If set, vllm will use flashinfer sampler
     "VLLM_USE_FLASHINFER_SAMPLER": lambda: bool(
         int(os.environ["VLLM_USE_FLASHINFER_SAMPLER"])

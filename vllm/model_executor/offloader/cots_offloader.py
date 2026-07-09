@@ -1012,19 +1012,6 @@ class CotsOffloader(BaseOffloader):
         # state above.
         self.set_live_num_tokens(num_tokens_unpadded)
 
-    def post_cudagraph_capture(self) -> None:
-        """Optionally reset COTS counters after bucket graphs are captured."""
-
-        if (
-            os.environ.get("VLLM_COTS_RESET_COUNTERS_AFTER_CUDAGRAPH_CAPTURE", "0")
-            != "1"
-        ):
-            return
-        from vllm.model_executor.offloader import cots_ops
-
-        cots_ops.reset_all_counters()
-        logger.info("COTS reset_all_counters() fired post-cudagraph-capture")
-
     def shutdown(self) -> None:
         """Drain and release the shared CPU runner at worker shutdown."""
         if self._runner is None:
