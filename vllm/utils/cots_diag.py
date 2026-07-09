@@ -6,8 +6,7 @@ Split diagnostic gates:
 
 * `VLLM_COTS_NVTX=1` enables NVTX `range_push`/`range_pop` pairs.
 * `VLLM_COTS_COUNTERS=1` enables cheap C++/Python counters.
-* `VLLM_COTS_WAIT_KERNEL_DIAG=1` enables the diagnostic wait kernel.
-* `VLLM_COTS_DIAG=1` is the umbrella shortcut for all three.
+* `VLLM_COTS_DIAG=1` is the umbrella shortcut for both.
 
 Centralized so each call site reads the env once at module import,
 not on every entry, and so the gate-check pattern is consistent
@@ -32,8 +31,7 @@ def _flag(name: str) -> bool:
 LEGACY_ENABLED = _flag("VLLM_COTS_DIAG")
 NVTX_ENABLED = LEGACY_ENABLED or _flag("VLLM_COTS_NVTX")
 COUNTERS_ENABLED = LEGACY_ENABLED or _flag("VLLM_COTS_COUNTERS")
-WAIT_KERNEL_DIAG_ENABLED = LEGACY_ENABLED or _flag("VLLM_COTS_WAIT_KERNEL_DIAG")
-ENABLED = NVTX_ENABLED or COUNTERS_ENABLED or WAIT_KERNEL_DIAG_ENABLED
+ENABLED = NVTX_ENABLED or COUNTERS_ENABLED
 
 
 @contextlib.contextmanager

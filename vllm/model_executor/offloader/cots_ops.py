@@ -318,20 +318,6 @@ def populate_slab_via_spec(
     spec.populate(runner, task_id, dry_run=dry_run)
 
 
-def install_wait_kernel_sync_for_all_tasks(
-    runner_id: int,
-    n_slabs: int,
-) -> None:
-    """Install wait-kernel sync slots for every slab in the pool.
-
-    This is a low-level diagnostic hook. The production offloader uses
-    host-callback sync and does not install wait-kernel slots.
-    """
-    runner = lookup_weight_runner(runner_id, "install_wait_kernel_sync_for_all_tasks")
-    for tid in range(int(n_slabs)):
-        runner.install_wait_kernel_sync_for_task(int(tid))
-
-
 def set_worker_affinity(runner_id: int, mask: int) -> None:
     """Pin the worker thread to a CPU set (uint64 bitmask). One-shot
     call from `CotsOffloader.post_init` after install."""
@@ -543,11 +529,7 @@ def _cots_sync_then_uva_impl(
     if _COTS_NVTX_ENABLED:
         torch.cuda.nvtx.range_push("cots:py_sync_then_uva")
     try:
-        # C++ side branches per-slab on `wait_kernel_sync_installed`.
-        # Production slabs use the host-callback SyncCallback node. Low-level
-        # diagnostic tests can install wait-kernel slots so this call waits on
-        # the worker-published `done_slot=seq` from a tiny GPU kernel.
-        runner.sync_or_wait_on_stream(task_id, stream)
+        runner.sync_on_stream(stream)
         # Build the CPU view over the slab pointer locally — never escapes
         # back to Python in a way Inductor would see.
         y_pinned = runner.y_pinned_view(task_id, num_transfer_rows)

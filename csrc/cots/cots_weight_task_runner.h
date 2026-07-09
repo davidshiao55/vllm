@@ -68,24 +68,6 @@ struct alignas(64) TaskSlab {
   // mode never writes this).
   std::atomic<int64_t> enqueue_time_ns{0};
 
-  // §1c.29 wait-kernel sync (sync host_fn replacement). One req/done slot pair
-  // per slab, allocated lazily by `install_wait_kernel_sync_for_task` only when
-  // the wait-kernel sync flag is on. host_*_ptr is the CPU-visible
-  // address (worker reads/writes); dev_*_ptr is the GPU-visible
-  // address (cots_wait_done_kernel reads via host-mapped pinned).
-  // `next_seq` is incremented per dispatch_cb fire from the
-  // driver thread; `uint32_t` is documented as "wraps at 2^32"
-  // — at 56 ops × billions of replays this is a non-issue for
-  // any realistic workload, but a future robust version could
-  // promote to uint64_t. wait_kernel_sync_installed is set by
-  // install_wait_kernel_sync_for_task and gates the dispatch/wait paths.
-  void* host_req_slot{nullptr};
-  void* dev_req_slot{nullptr};
-  void* host_done_slot{nullptr};
-  void* dev_done_slot{nullptr};
-  std::atomic<uint32_t> next_seq{0};
-  std::atomic<bool> wait_kernel_sync_installed{false};
-
   // §1c.22 review-fix: immutable bucket capacity, populated once at
   // install time from the (layer, bucket, op_kind) descriptor and
   // never written again. Replay-time byte accounting MUST read this
@@ -216,19 +198,6 @@ class CotsWeightTaskRunner {
   // thread on `task_queue_->sync(0)`.
   void sync_on_stream(uintptr_t cuda_stream);
 
-  // §1c.29 commit 2 — unified sync/wait dispatch. Per-slab choice
-  // based on `slab.wait_kernel_sync_installed`: when wait-kernel sync is
-  // installed for this task (offloader called
-  // `install_wait_kernel_sync_for_task` in post_init under
-  // `weight_capture_sync_mode="wait_kernel"`), the captured graph node is the
-  // wait-kernel sync reading the worker-published `done_slot=seq`. Otherwise
-  // the captured node is the legacy `cudaLaunchHostFunc(SyncCallback)` blocking
-  // the driver thread on `TaskQueue::sync(0)`. The Python side
-  // (`cots_sync_then_uva`) ALWAYS calls this entry; the A/B is
-  // controlled exclusively by whether the offloader installed wait-kernel sync
-  // for this task at startup.
-  void sync_or_wait_on_stream(int64_t task_id, uintptr_t cuda_stream);
-
   // Python-side helper (not in the captured-graph hot path).
   // Block calling thread until TaskQueue drains. Same as sync_on_stream but
   // without the cudaLaunchHostFunc indirection.
@@ -247,40 +216,6 @@ class CotsWeightTaskRunner {
   int32_t last_observed_num_threads() const {
     return last_observed_num_threads_.load(std::memory_order_acquire);
   }
-
-  // §1c.29 wait-kernel sync — install per-slab host-mapped pinned req/done
-  // slots. Idempotent; calling twice for the same task_id raises.
-  // Hard-fails on cudaHostAlloc(cudaHostAllocMapped) or
-  // cudaHostGetDevicePointer error (per §1c.29 safety gate (c)/(d)
-  // — silent fallback under graph capture would put different
-  // slabs on different mechanisms, refuse to install). After
-  // success, `slab.wait_kernel_sync_installed = true`.
-  void install_wait_kernel_sync_for_task(int64_t task_id);
-
-  // Launch the captured-graph wait kernel for `task_id` on
-  // `cuda_stream`. Selects production vs diag kernel based on
-  // VLLM_COTS_DIAG. Hard-fails if wait-kernel sync was not installed for this
-  // task. This entry point CALLS check_error() first; it's the
-  // public/test-helper variant. Production captured ops should
-  // use `sync_or_wait_on_stream` (which routes through the
-  // no-check launcher to avoid wedging the stream when a prior
-  // worker task has set has_error_; see §1c.29 commit 2
-  // review-fix).
-  void wait_kernel_sync_on_stream(int64_t task_id, uintptr_t cuda_stream);
-
-  // §1c.29 test helpers. Direct slot access from CPU — used by
-  // the unit smoke (test_cots_wait_done_kernel_smoke.py) to drive the
-  // wait kernel in isolation. NOT used on the captured-graph
-  // hot path.
-  // Test helper: query whether `install_wait_kernel_sync_for_task` was called
-  // for `task_id`. Used by safety-gate tests to assert the
-  // post_init wiring matches the config flag.
-  bool wait_kernel_sync_installed_for_task(int64_t task_id) const;
-
-  uint32_t wait_kernel_get_req_slot(int64_t task_id) const;
-  uint32_t wait_kernel_get_done_slot(int64_t task_id) const;
-  void wait_kernel_set_req_slot(int64_t task_id, uint32_t value);
-  void wait_kernel_set_done_slot(int64_t task_id, uint32_t value);
 
   // §1c.22 review-fix test helpers: read the immutable
   // `bucket_capacity_tokens` and the mutable `num_tokens` for a
@@ -407,25 +342,8 @@ class CotsWeightTaskRunner {
   static void DispatchCallback(void* user_data);
   static void SyncCallback(void* user_data);
 
-  // §1c.29 commit 2 review-fix — internal launcher that does NOT
-  // call check_error(). Used by `sync_or_wait_on_stream` so a
-  // prior worker error cannot prevent the captured wait kernel
-  // from being recorded/launched (which would leave the stream
-  // wedged with no done_slot consumer). Errors are still surfaced
-  // by check_error() at the next Python-side entry point that is
-  // safe to short-circuit (submit_on_stream, sync_blocking, etc.).
-  void wait_kernel_sync_on_stream_no_check(int64_t task_id,
-                                           uintptr_t cuda_stream);
-
-  // Worker-thread task body; runs whatever op_kind says. The `seq`
-  // parameter (0 == no wait-kernel sync, > 0 == wait-kernel sync enabled for
-  // this dispatch) controls whether the worker publishes `done_slot = seq`
-  // after the task completes — see §1c.29 commit 2. The publish is in a
-  // finally-style block so a worker exception still releases the
-  // captured wait kernel (otherwise `cots_wait_done_kernel` would spin
-  // forever on `done < req` and the GPU stream would deadlock,
-  // hiding the error from Python).
-  void RunSlabOnWorker(TaskSlab* slab, uint32_t seq);
+  // Worker-thread task body; runs whatever op_kind says.
+  void RunSlabOnWorker(TaskSlab* slab);
 
   std::unique_ptr<TaskQueue> task_queue_;
 
@@ -580,26 +498,6 @@ class CotsWeightTaskRunner {
   // submit/replay was clamped (informational, not an error).
   std::atomic<int64_t> worker_clamp_override_count_{0};
 
-  // §1c.29 wait-kernel sync diag counters. Allocated once at first
-  // install_wait_kernel_sync_for_task call (lazily — most instances don't
-  // use wait-kernel sync) as host-mapped pinned int64_t cells so the GPU
-  // cots_wait_done_kernel_diag can atomicAdd directly. host_ptr is
-  // CPU-readable for get_counters/reset_counters; dev_ptr is
-  // GPU-visible for the kernel. Counters meaning:
-  //   immediate_resume: wait fires that found done >= req on
-  //     the first read (GPU window covered CPU work).
-  //   lagging_wait: wait fires that had to spin at all.
-  //   spin_iters_total: sum of spin iterations across all
-  //     lagging waits.
-  // Together they tell us how often the prototype's wait
-  // actually serializes vs returns immediately — the §1c.29
-  // canary for keeping SM occupancy small.
-  int64_t* wait_kernel_immediate_resume_host_{nullptr};
-  int64_t* wait_kernel_immediate_resume_dev_{nullptr};
-  int64_t* wait_kernel_lagging_wait_host_{nullptr};
-  int64_t* wait_kernel_lagging_wait_dev_{nullptr};
-  int64_t* wait_kernel_spin_iters_host_{nullptr};
-  int64_t* wait_kernel_spin_iters_dev_{nullptr};
 };
 
 }  // namespace cots

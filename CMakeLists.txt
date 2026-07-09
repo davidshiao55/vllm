@@ -1005,17 +1005,16 @@ endif()
 #
 # _cots_C extension (COTS native weight task runner)
 #
-# CUDA-targeted extension: host-side task runners plus the tiny wait kernel.
+# CUDA-targeted extension: host-side task runners and CPU weight kernels.
 # Exposes stateful pybind11 classes, so we intentionally do NOT use USE_SABI 3
 # — the existing stable-ABI extensions in this repo register torch ops via
 # REGISTER_EXTENSION (csrc/core/registration.h) rather than pybind classes
 # with state. Standard Python ABI is the safe path.
 #
-# CUDA-only: host dispatch uses `cudaLaunchHostFunc` and wait-kernel
-# sync uses a small CUDA kernel. ROCm/HIP have different host-callback
-# and stream-wait APIs and are out of current thesis scope. Gate the whole
-# extension on VLLM_GPU_LANG == "CUDA" so ROCm builds skip it cleanly. See
-# docs/implementation_roadmap.md Phase 1c.
+# CUDA-only: host dispatch and sync use `cudaLaunchHostFunc`. ROCm/HIP have
+# different host-callback APIs and are out of current thesis scope. Gate the
+# whole extension on VLLM_GPU_LANG == "CUDA" so ROCm builds skip it cleanly.
+# See docs/implementation_roadmap.md Phase 1c.
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
   set(VLLM_COTS_EXT_SRC
@@ -1036,22 +1035,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     # for QKV/gate/up after Stage 7-C storage unification.
     "csrc/cots/bf16_gemm_natural.cpp"
     # CPU MLP block fast path: gate/up/SwiGLU into BF16 scratch, then down.
-    "csrc/cots/bf16_mlp_gate_up_silu.cpp"
-    # §1c.29 wait kernel — compiled as CUDA so nvcc handles
-    # the __global__ kernel and PTX inline asm. The other
-    # sources stay C++ host code; nvcc compiles them
-    # transparently when LANGUAGE=CUDA.
-    "csrc/cots/cots_wait_done_kernel.cu")
-
-  # §1c.29: per-source gencode flags for the wait-kernel .cu file. The
-  # PTX `nanosleep` instruction requires sm_70+; without the
-  # gencode flags nvcc defaults to sm_50 (cmake's default) and
-  # fails. Mirrors the pattern used by other CUDA targets in
-  # this CMakeLists (e.g., set_gencode_flags_for_srcs is the
-  # repo-blessed way to apply CUDA_ARCHS per-source).
-  set_gencode_flags_for_srcs(
-    SRCS "csrc/cots/cots_wait_done_kernel.cu"
-    CUDA_ARCHS "${CUDA_ARCHS}")
+    "csrc/cots/bf16_mlp_gate_up_silu.cpp")
 
   include(CheckCXXCompilerFlag)
   check_cxx_compiler_flag("-mavx2" VLLM_COTS_COMPILER_HAS_MAVX2)

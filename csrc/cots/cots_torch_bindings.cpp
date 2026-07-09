@@ -47,37 +47,9 @@ PYBIND11_MODULE(_cots_C, m) {
            py::arg("cuda_stream"))
       .def("sync_on_stream", &CotsWeightTaskRunner::sync_on_stream,
            py::arg("cuda_stream"))
-      // §1c.29 commit 2 — unified entry. Always called by
-      // `cots_sync_then_uva`'s impl; per-slab branch into
-      // sync_on_stream or wait_kernel_sync_on_stream lives in C++ so the
-      // Python side does not need to know which mechanism each
-      // task uses.
-      .def("sync_or_wait_on_stream",
-           &CotsWeightTaskRunner::sync_or_wait_on_stream, py::arg("task_id"),
-           py::arg("cuda_stream"))
-      .def("wait_kernel_sync_installed_for_task",
-           &CotsWeightTaskRunner::wait_kernel_sync_installed_for_task,
-           py::arg("task_id"))
       .def("sync_blocking", &CotsWeightTaskRunner::sync_blocking)
       .def("set_worker_affinity", &CotsWeightTaskRunner::set_worker_affinity,
            py::arg("cpu_set"))
-      // §1c.29 wait-kernel sync — install + wait launcher + test helpers.
-      .def("install_wait_kernel_sync_for_task",
-           &CotsWeightTaskRunner::install_wait_kernel_sync_for_task,
-           py::arg("task_id"))
-      .def("wait_kernel_sync_on_stream",
-           &CotsWeightTaskRunner::wait_kernel_sync_on_stream,
-           py::arg("task_id"), py::arg("cuda_stream"))
-      .def("wait_kernel_get_req_slot",
-           &CotsWeightTaskRunner::wait_kernel_get_req_slot, py::arg("task_id"))
-      .def("wait_kernel_get_done_slot",
-           &CotsWeightTaskRunner::wait_kernel_get_done_slot, py::arg("task_id"))
-      .def("wait_kernel_set_req_slot",
-           &CotsWeightTaskRunner::wait_kernel_set_req_slot, py::arg("task_id"),
-           py::arg("value"))
-      .def("wait_kernel_set_done_slot",
-           &CotsWeightTaskRunner::wait_kernel_set_done_slot, py::arg("task_id"),
-           py::arg("value"))
       .def("last_observed_num_threads",
            &CotsWeightTaskRunner::last_observed_num_threads)
       .def("has_error", &CotsWeightTaskRunner::has_error)

@@ -272,36 +272,6 @@ class NativeCotsWeightRunner:
             )
         cots_ops.register_weight_task_id_map(self._runner_id, self._task_id_for)
         self._installed = True
-        # Cache n_slabs so wait-kernel installation does not have to
-        # re-walk task_id_for. Set last so any populate-time error
-        # leaves the cache empty.
-        self._n_slabs: int = n_slabs
-
-    def install_wait_kernel_sync(self) -> None:
-        """Install host-mapped pinned req/done slots for every slab.
-
-        Must be called after `install()`. This is retained for low-level
-        wait-kernel diagnostics; the production offloader uses host-callback
-        sync.
-
-        After this returns, every slab's `wait_kernel_sync_installed=True`, the
-        captured `dispatch_cb` writes `req_slot=seq` per dispatch,
-        the worker writes `done_slot=seq` (in a finally-style
-        block) per dispatch, and `cots_sync_then_uva` routes
-        through the wait kernel via `sync_or_wait_on_stream`.
-        """
-        from vllm.model_executor.offloader import cots_ops
-
-        if not self._installed:
-            raise RuntimeError(
-                "NativeCotsWeightRunner.install_wait_kernel_sync() called "
-                "before install(); wait-kernel sync needs the slab pool to "
-                "exist first"
-            )
-        cots_ops.install_wait_kernel_sync_for_all_tasks(
-            self._runner_id,
-            self._n_slabs,
-        )
 
     def set_active_dispatch(self, bucket: int, live_num_tokens: int) -> None:
         """Publish OOG dispatch state for native custom-op resolution."""

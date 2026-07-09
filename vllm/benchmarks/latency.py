@@ -126,9 +126,8 @@ def main(args: argparse.Namespace):
     # call to `run_to_completion(do_profile=False)` (warmup AND
     # measured iters) gets its own NVTX marker pair when
     # VLLM_COTS_NVTX=1. Counter reset is independently controlled by
-    # VLLM_COTS_COUNTERS=1 so counter-only runs do not perturb the
-    # wait-kernel path with NVTX ranges. VLLM_COTS_DIAG=1 remains a
-    # backward-compatible alias for both.
+    # VLLM_COTS_COUNTERS=1 so counter-only runs do not emit NVTX ranges.
+    # VLLM_COTS_DIAG=1 remains a backward-compatible alias for both.
 
     def _diag_pre():
         if COUNTERS_ENABLED:

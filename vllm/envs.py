@@ -48,7 +48,6 @@ if TYPE_CHECKING:
     VLLM_COTS_DIAG: bool = False
     VLLM_COTS_COUNTERS: bool = False
     VLLM_COTS_NVTX: bool = False
-    VLLM_COTS_WAIT_KERNEL_DIAG: bool = False
     VLLM_COTS_DUMP_COUNTERS_ON_SHUTDOWN: bool = False
     VLLM_COTS_DISPATCH_TRACE: bool = False
     VLLM_USE_FLASHINFER_SAMPLER: bool | None = None
@@ -708,8 +707,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_COTS_DIAG": lambda: os.getenv("VLLM_COTS_DIAG", "0") == "1",
     "VLLM_COTS_COUNTERS": lambda: os.getenv("VLLM_COTS_COUNTERS", "0") == "1",
     "VLLM_COTS_NVTX": lambda: os.getenv("VLLM_COTS_NVTX", "0") == "1",
-    "VLLM_COTS_WAIT_KERNEL_DIAG": lambda: os.getenv("VLLM_COTS_WAIT_KERNEL_DIAG", "0")
-    == "1",
     "VLLM_COTS_DUMP_COUNTERS_ON_SHUTDOWN": lambda: os.getenv(
         "VLLM_COTS_DUMP_COUNTERS_ON_SHUTDOWN", "0"
     )

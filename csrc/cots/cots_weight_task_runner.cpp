@@ -45,9 +45,8 @@ namespace {
 constexpr int kMaxCpus = 64;
 
 // Instrumentation gates. `VLLM_COTS_DIAG=1` is the umbrella shortcut; split
-// flags let benchmark runs enable counters or the diagnostic wait kernel
-// independently. NVTX is shared across COTS runners via NvtxScope in
-// cots_common.h.
+// flags let benchmark runs enable counters independently. NVTX is shared
+// across COTS runners via NvtxScope in cots_common.h.
 namespace cots_diag {
 inline bool legacy_enabled() {
   static const bool enabled = []() { return env_flag("VLLM_COTS_DIAG"); }();
@@ -61,12 +60,6 @@ inline bool counters_enabled() {
   return enabled;
 }
 
-inline bool wait_kernel_diag_enabled() {
-  static const bool enabled = []() {
-    return legacy_enabled() || env_flag("VLLM_COTS_WAIT_KERNEL_DIAG");
-  }();
-  return enabled;
-}
 }  // namespace cots_diag
 
 // Phase 1c is bfloat16-locked (see header comment + cpu_dtype literal in
@@ -93,40 +86,6 @@ CotsWeightTaskRunner::~CotsWeightTaskRunner() {
   // Drain before destructing the queue so any in-flight task completes.
   if (task_queue_) {
     task_queue_->sync(0);
-  }
-  // §1c.29 wait-kernel sync: free per-slab host-mapped pinned slots. These are
-  // allocated lazily via cudaHostAlloc(cudaHostAllocMapped) by
-  // install_wait_kernel_sync_for_task; teardown must release them or the host
-  // pinned region leaks. Walk the slabs_ array (sized at install
-  // time) and free any with wait_kernel_sync_installed=true.
-  if (slabs_) {
-    for (int64_t i = 0; i < slab_count_; ++i) {
-      TaskSlab& s = slabs_[i];
-      if (s.wait_kernel_sync_installed.load(std::memory_order_acquire)) {
-        if (s.host_req_slot != nullptr) {
-          cudaFreeHost(s.host_req_slot);
-          s.host_req_slot = nullptr;
-        }
-        if (s.host_done_slot != nullptr) {
-          cudaFreeHost(s.host_done_slot);
-          s.host_done_slot = nullptr;
-        }
-        s.wait_kernel_sync_installed.store(false, std::memory_order_release);
-      }
-    }
-  }
-  // Free wait-kernel sync diag counter cells if allocated.
-  if (wait_kernel_immediate_resume_host_ != nullptr) {
-    cudaFreeHost(wait_kernel_immediate_resume_host_);
-    wait_kernel_immediate_resume_host_ = nullptr;
-  }
-  if (wait_kernel_lagging_wait_host_ != nullptr) {
-    cudaFreeHost(wait_kernel_lagging_wait_host_);
-    wait_kernel_lagging_wait_host_ = nullptr;
-  }
-  if (wait_kernel_spin_iters_host_ != nullptr) {
-    cudaFreeHost(wait_kernel_spin_iters_host_);
-    wait_kernel_spin_iters_host_ = nullptr;
   }
 }
 
@@ -403,53 +362,6 @@ void CotsWeightTaskRunner::sync_on_stream(uintptr_t cuda_stream) {
               cudaGetErrorString(err));
 }
 
-void CotsWeightTaskRunner::sync_or_wait_on_stream(int64_t task_id,
-                                                  uintptr_t cuda_stream) {
-  // §1c.29 commit 2 — unified entry. Per-slab branch: if wait-kernel sync is
-  // installed for this task, the captured node is the wait kernel
-  // (reads the worker-published done_slot=seq). Otherwise the
-  // captured node stays the host-callback SyncCallback node that
-  // blocks the driver thread on TaskQueue::sync(0). Both
-  // mechanisms can coexist within the same offloader / same
-  // CotsWeightTaskRunner instance — the branch is per-slab, not per-
-  // runner — but in practice the offloader sets the flag for ALL
-  // slabs at install time (weight_capture_sync_mode="wait_kernel" is binary at
-  // the runner level) so the branch is uniform across a single
-  // offloader's slabs.
-  TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
-              "sync_or_wait_on_stream: task_id ", task_id, " out of range");
-  TaskSlab& s = slabs_[task_id];
-  if (s.wait_kernel_sync_installed.load(std::memory_order_acquire)) {
-    // §1c.29 commit 2 review-fix: route through the no-check
-    // launcher so a prior worker error does not block the wait
-    // kernel from being recorded/launched. Without this, a worker
-    // throw would set has_error_, then the next captured
-    // sync_or_wait_on_stream would raise from check_error before
-    // the wait kernel was launched, wedging the stream with no
-    // done_slot consumer. Errors are still surfaced by
-    // check_error() at the next safe Python entry point (the next
-    // submit_on_stream, sync_blocking, etc.).
-    wait_kernel_sync_on_stream_no_check(task_id, cuda_stream);
-  } else {
-    // Legacy path: keep check_error() in sync_on_stream. The
-    // captured SyncCallback host_fn blocks the driver thread on
-    // TaskQueue::sync(0); if the host_fn never gets recorded
-    // (because check_error raised), the stream isn't really
-    // "wedged" — it just hasn't been told to drain anything. The
-    // worker still completes; the next call surfaces the error.
-    sync_on_stream(cuda_stream);
-  }
-}
-
-bool CotsWeightTaskRunner::wait_kernel_sync_installed_for_task(
-    int64_t task_id) const {
-  TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
-              "wait_kernel_sync_installed_for_task: task_id ", task_id,
-              " out of range");
-  return slabs_[task_id].wait_kernel_sync_installed.load(
-      std::memory_order_acquire);
-}
-
 void CotsWeightTaskRunner::sync_blocking() {
   task_queue_->sync(0);
   // Surface any worker error that fired while we were waiting.
@@ -651,38 +563,7 @@ void CotsWeightTaskRunner::DispatchCallback(void* user_data) {
     slab->enqueue_time_ns.store(now_ns(), std::memory_order_release);
     self->dispatch_cb_count_.fetch_add(1, std::memory_order_relaxed);
   }
-  // §1c.29 commit 2 — wait-kernel sync sequence publish. When wait-kernel sync
-  // is installed for this slab, increment the slab-local seq, capture it into
-  // the worker lambda, ENQUEUE the lambda FIRST, THEN publish
-  // host_req_slot=seq. Per §1c.29 commit 2 review-fix this is the
-  // strictly stronger order: the GPU wait kernel cannot observe
-  // req=seq before the worker for that seq is queued. The two
-  // CPU operations execute back-to-back and the wait kernel only
-  // fires later as a captured stream node; in practice the GPU
-  // never observes the in-between state, but the cleaner order
-  // matches the standalone smoke and costs nothing.
-  //
-  // Wrap behavior: uint32_t monotonically increases. At ~1k ops/
-  // generate this overflows after 2^32 ≈ 4.3e6 generates, far
-  // beyond any practical run. Documented inline rather than
-  // reset-on-wrap to keep the hot path branch-free.
-  //
-  // seq=0 in the lambda signals "no wait-kernel sync publish needed" —
-  // RunSlabOnWorker skips the done_slot store, preserving the
-  // legacy non-wait-kernel-sync path bit-for-bit.
-  uint32_t seq = 0;
-  const bool m3 =
-      slab->wait_kernel_sync_installed.load(std::memory_order_acquire);
-  if (m3) {
-    seq = slab->next_seq.fetch_add(1, std::memory_order_relaxed) + 1u;
-  }
-  // Enqueue worker BEFORE publishing req_slot.
-  self->task_queue_->enqueue(
-      [self, slab, seq] { self->RunSlabOnWorker(slab, seq); });
-  if (m3) {
-    std::atomic_thread_fence(std::memory_order_release);
-    *static_cast<volatile uint32_t*>(slab->host_req_slot) = seq;
-  }
+  self->task_queue_->enqueue([self, slab] { self->RunSlabOnWorker(slab); });
 }
 
 // Sync-side host callback. Blocks the CUDA driver thread until the
@@ -709,7 +590,7 @@ void CotsWeightTaskRunner::SyncCallback(void* user_data) {
 
 // --- worker-thread task body ----------------------------------------------
 
-void CotsWeightTaskRunner::RunSlabOnWorker(TaskSlab* slab, uint32_t seq) {
+void CotsWeightTaskRunner::RunSlabOnWorker(TaskSlab* slab) {
   // §1c.24 attribution: stamp worker start + queue wait, gated by
   // VLLM_COTS_DIAG. Production-default leaves worker_t0 at 0 (the
   // worker_busy_total_ns add at the end is also gated). NVTX scope
@@ -902,23 +783,6 @@ void CotsWeightTaskRunner::RunSlabOnWorker(TaskSlab* slab, uint32_t seq) {
     last_error_msg_ = "[cots worker] unknown exception";
     has_error_.store(true, std::memory_order_release);
   }
-  // §1c.29 commit 2 — finally-publish for wait-kernel sync. Even on exception
-  // we MUST write done_slot=seq so the captured cots_wait_done_kernel can exit
-  // its spin loop. Without this publish a worker throw would wedge the GPU
-  // stream in an infinite spin and the next Python- side check would never see
-  // the error (because the next submit/sync is itself behind the wedged
-  // stream). On the success path, has_error_ stays false and the consumer reads
-  // y_pinned normally; on the failure path, has_error_ + msg
-  // surface at the next Python-side submit/sync as a
-  // RuntimeError, but the GPU stream is unblocked first so that
-  // check actually runs. seq=0 means "no wait-kernel sync installed for this
-  // slab" — skip the publish to keep the legacy path bit-for-bit
-  // identical.
-  if (seq != 0 &&
-      slab->wait_kernel_sync_installed.load(std::memory_order_acquire)) {
-    std::atomic_thread_fence(std::memory_order_release);
-    *static_cast<volatile uint32_t*>(slab->host_done_slot) = seq;
-  }
   // §1c.24: worker compute duration (NVTX scope ends when the
   // function returns; this counter sums it for the bench summary).
   // Gated together with the start-of-function timestamp.
@@ -1021,21 +885,6 @@ CotsWeightTaskRunner::get_counters() const {
                    load(worker_queue_wait_total_ns_));
   out.emplace_back("worker_clamp_override_count",
                    load(worker_clamp_override_count_));
-  // §1c.29 wait-kernel sync diag counters. Populated only when
-  // `VLLM_COTS_DIAG=1` AND a captured graph that fires
-  // `cots_wait_done_kernel_diag` runs (production-default path skips
-  // these). Stored as host-mapped pinned int64_t cells so the
-  // GPU can atomicAdd; the host pointer is read here.
-  out.emplace_back("wait_kernel_immediate_resume_count",
-                   wait_kernel_immediate_resume_host_
-                       ? *wait_kernel_immediate_resume_host_
-                       : 0);
-  out.emplace_back(
-      "wait_kernel_lagging_wait_count",
-      wait_kernel_lagging_wait_host_ ? *wait_kernel_lagging_wait_host_ : 0);
-  out.emplace_back(
-      "wait_kernel_spin_iters_total",
-      wait_kernel_spin_iters_host_ ? *wait_kernel_spin_iters_host_ : 0);
   return out;
 }
 
@@ -1071,178 +920,6 @@ void CotsWeightTaskRunner::reset_counters() {
   worker_busy_total_ns_.store(0, std::memory_order_relaxed);
   worker_queue_wait_total_ns_.store(0, std::memory_order_relaxed);
   worker_clamp_override_count_.store(0, std::memory_order_relaxed);
-  // §1c.29 wait-kernel sync diag counters. Lazy-allocated; only zero them
-  // if they exist (i.e., wait-kernel sync was installed at least once).
-  if (wait_kernel_immediate_resume_host_)
-    *wait_kernel_immediate_resume_host_ = 0;
-  if (wait_kernel_lagging_wait_host_) *wait_kernel_lagging_wait_host_ = 0;
-  if (wait_kernel_spin_iters_host_) *wait_kernel_spin_iters_host_ = 0;
-}
-
-// §1c.29 wait-kernel sync — install per-slab host-mapped pinned slots.
-// Shared wait-kernel diagnostics and launch checks live in cots_common.h.
-void CotsWeightTaskRunner::install_wait_kernel_sync_for_task(int64_t task_id) {
-  check_error();
-  TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
-              "install_wait_kernel_sync_for_task: task_id ", task_id,
-              " out of range");
-  TaskSlab& s = slabs_[task_id];
-  TORCH_CHECK(!s.wait_kernel_sync_installed.load(std::memory_order_acquire),
-              "install_wait_kernel_sync_for_task: wait-kernel sync already "
-              "installed for task_id=",
-              task_id, " (idempotency violation)");
-  // Lazy-alloc the per-runner diag counter cells, but ONLY when
-  // VLLM_COTS_DIAG=1 — production wait-kernel sync should not pay the pinned-
-  // allocation surface for cells the diag kernel will never read.
-  // Per reviewer (§1c.29 commit 1 fix): diag-only allocation
-  // surface keeps the production failure space minimal.
-  // wait_kernel_sync_on_stream re-checks diag_enabled() at each launch and
-  // selects the diag kernel only if both the env is set AND the
-  // cells are allocated; in production these cells stay nullptr
-  // and the production launcher (which doesn't take counter ptrs)
-  // is used instead.
-  if (cots_diag::wait_kernel_diag_enabled()) {
-    ensure_mapped_i64_cell(
-        &wait_kernel_immediate_resume_host_, &wait_kernel_immediate_resume_dev_,
-        "install_wait_kernel_sync_for_task", "wait_kernel_immediate_resume");
-    ensure_mapped_i64_cell(
-        &wait_kernel_lagging_wait_host_, &wait_kernel_lagging_wait_dev_,
-        "install_wait_kernel_sync_for_task", "wait_kernel_lagging_wait");
-    ensure_mapped_i64_cell(
-        &wait_kernel_spin_iters_host_, &wait_kernel_spin_iters_dev_,
-        "install_wait_kernel_sync_for_task", "wait_kernel_spin_iters");
-  }
-  // Allocate one uint32_t per slot, host-mapped pinned. We keep
-  // host_*_ptr (CPU-visible) and dev_*_ptr (GPU-visible — same
-  // memory, different virtual address) on the slab. Hard-fails
-  // on any allocation/mapping error per §1c.29 safety gate
-  // (c)/(d) — silent fallback under graph capture would put
-  // different slabs on different mechanisms.
-  void* host_req = nullptr;
-  void* host_done = nullptr;
-  cudaError_t e1 =
-      cudaHostAlloc(&host_req, sizeof(uint32_t), cudaHostAllocMapped);
-  TORCH_CHECK(
-      e1 == cudaSuccess,
-      "install_wait_kernel_sync_for_task: cudaHostAlloc(req_slot) failed: ",
-      cudaGetErrorString(e1));
-  cudaError_t e2 =
-      cudaHostAlloc(&host_done, sizeof(uint32_t), cudaHostAllocMapped);
-  if (e2 != cudaSuccess) {
-    cudaFreeHost(host_req);  // partial-failure cleanup
-    TORCH_CHECK(
-        false,
-        "install_wait_kernel_sync_for_task: cudaHostAlloc(done_slot) failed: ",
-        cudaGetErrorString(e2));
-  }
-  *static_cast<uint32_t*>(host_req) = 0;
-  *static_cast<uint32_t*>(host_done) = 0;
-  void* dev_req = nullptr;
-  void* dev_done = nullptr;
-  cudaError_t e3 = cudaHostGetDevicePointer(&dev_req, host_req, 0);
-  cudaError_t e4 = cudaHostGetDevicePointer(&dev_done, host_done, 0);
-  if (e3 != cudaSuccess || e4 != cudaSuccess) {
-    cudaFreeHost(host_req);
-    cudaFreeHost(host_done);
-    TORCH_CHECK(
-        false,
-        "install_wait_kernel_sync_for_task: cudaHostGetDevicePointer failed: ",
-        cudaGetErrorString(e3 != cudaSuccess ? e3 : e4));
-  }
-  s.host_req_slot = host_req;
-  s.dev_req_slot = dev_req;
-  s.host_done_slot = host_done;
-  s.dev_done_slot = dev_done;
-  s.next_seq.store(0, std::memory_order_relaxed);
-  s.wait_kernel_sync_installed.store(true, std::memory_order_release);
-}
-
-void CotsWeightTaskRunner::wait_kernel_sync_on_stream(int64_t task_id,
-                                                      uintptr_t cuda_stream) {
-  check_error();
-  wait_kernel_sync_on_stream_no_check(task_id, cuda_stream);
-}
-
-void CotsWeightTaskRunner::wait_kernel_sync_on_stream_no_check(
-    int64_t task_id, uintptr_t cuda_stream) {
-  // §1c.29 commit 2 review-fix — DO NOT call check_error() here.
-  // This launcher is used by `sync_or_wait_on_stream` on the
-  // captured-graph hot path; if a prior worker task set
-  // has_error_, raising here would prevent the wait kernel from
-  // being recorded/launched and the stream would be wedged with
-  // no done_slot consumer. The error is surfaced at the next
-  // Python-side entry point that is safe to short-circuit
-  // (submit_on_stream's check_error, sync_blocking's, etc.).
-  TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
-              "wait_kernel_sync_on_stream: task_id ", task_id, " out of range");
-  TaskSlab& s = slabs_[task_id];
-  TORCH_CHECK(
-      s.wait_kernel_sync_installed.load(std::memory_order_acquire),
-      "wait_kernel_sync_on_stream: wait-kernel sync not installed for task_id=",
-      task_id, "; call install_wait_kernel_sync_for_task first");
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
-  launch_wait_done_kernel(
-      static_cast<uint32_t*>(s.dev_req_slot),
-      static_cast<uint32_t*>(s.dev_done_slot),
-      cots_diag::wait_kernel_diag_enabled(), wait_kernel_spin_iters_dev_,
-      wait_kernel_immediate_resume_dev_, wait_kernel_lagging_wait_dev_, stream,
-      "wait_kernel_sync_on_stream");
-}
-
-uint32_t CotsWeightTaskRunner::wait_kernel_get_req_slot(int64_t task_id) const {
-  TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
-              "wait_kernel_get_req_slot: task_id out of range");
-  const TaskSlab& s = slabs_[task_id];
-  TORCH_CHECK(
-      s.wait_kernel_sync_installed.load(std::memory_order_acquire),
-      "wait_kernel_get_req_slot: wait-kernel sync not installed for task_id=",
-      task_id);
-  return *static_cast<volatile uint32_t*>(s.host_req_slot);
-}
-
-uint32_t CotsWeightTaskRunner::wait_kernel_get_done_slot(
-    int64_t task_id) const {
-  TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
-              "wait_kernel_get_done_slot: task_id out of range");
-  const TaskSlab& s = slabs_[task_id];
-  TORCH_CHECK(
-      s.wait_kernel_sync_installed.load(std::memory_order_acquire),
-      "wait_kernel_get_done_slot: wait-kernel sync not installed for task_id=",
-      task_id);
-  return *static_cast<volatile uint32_t*>(s.host_done_slot);
-}
-
-void CotsWeightTaskRunner::wait_kernel_set_req_slot(int64_t task_id,
-                                                    uint32_t value) {
-  TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
-              "wait_kernel_set_req_slot: task_id out of range");
-  TaskSlab& s = slabs_[task_id];
-  TORCH_CHECK(
-      s.wait_kernel_sync_installed.load(std::memory_order_acquire),
-      "wait_kernel_set_req_slot: wait-kernel sync not installed for task_id=",
-      task_id);
-  std::atomic_thread_fence(std::memory_order_release);
-  *static_cast<volatile uint32_t*>(s.host_req_slot) = value;
-  std::atomic_thread_fence(std::memory_order_release);
-}
-
-void CotsWeightTaskRunner::wait_kernel_set_done_slot(int64_t task_id,
-                                                     uint32_t value) {
-  TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
-              "wait_kernel_set_done_slot: task_id out of range");
-  TaskSlab& s = slabs_[task_id];
-  TORCH_CHECK(
-      s.wait_kernel_sync_installed.load(std::memory_order_acquire),
-      "wait_kernel_set_done_slot: wait-kernel sync not installed for task_id=",
-      task_id);
-  // Worker-side publish ordering (§1c.29 reminder): in production
-  // the worker writes y_pinned, releases via fence, THEN writes
-  // done_slot=seq. The test helper omits y_pinned (no real CPU
-  // GEMM in the smoke), but keeps the release fence for
-  // consistency.
-  std::atomic_thread_fence(std::memory_order_release);
-  *static_cast<volatile uint32_t*>(s.host_done_slot) = value;
-  std::atomic_thread_fence(std::memory_order_release);
 }
 
 }  // namespace cots
