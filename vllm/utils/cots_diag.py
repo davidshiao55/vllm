@@ -6,7 +6,6 @@ Split diagnostic gates:
 
 * `VLLM_COTS_NVTX=1` enables NVTX `range_push`/`range_pop` pairs.
 * `VLLM_COTS_COUNTERS=1` enables cheap C++/Python counters.
-* `VLLM_COTS_DIAG=1` is the umbrella shortcut for both.
 
 Centralized so each call site reads the env once at module import,
 not on every entry, and so the gate-check pattern is consistent
@@ -28,9 +27,8 @@ def _flag(name: str) -> bool:
 
 # Single env reads at first import. `ENABLED` is the "some COTS diagnostic is
 # active" umbrella for callers that only need a coarse gate.
-LEGACY_ENABLED = _flag("VLLM_COTS_DIAG")
-NVTX_ENABLED = LEGACY_ENABLED or _flag("VLLM_COTS_NVTX")
-COUNTERS_ENABLED = LEGACY_ENABLED or _flag("VLLM_COTS_COUNTERS")
+NVTX_ENABLED = _flag("VLLM_COTS_NVTX")
+COUNTERS_ENABLED = _flag("VLLM_COTS_COUNTERS")
 ENABLED = NVTX_ENABLED or COUNTERS_ENABLED
 
 

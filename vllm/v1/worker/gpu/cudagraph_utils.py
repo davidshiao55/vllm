@@ -306,7 +306,7 @@ class CudaGraphManager:
         # (latent on the v1 active runner path; only fires under the
         # spec-decode / older runner that calls
         # `cudagraph_manager.run_fullgraph`). Env-gated by
-        # VLLM_COTS_DIAG=1; production default skips the wrapper.
+        # VLLM_COTS_NVTX=1; production default skips the wrapper.
         if not _COTS_NVTX_ENABLED:
             _publish_offloader_dispatch(desc, actual_num_tokens)
             self.graphs[desc].replay()

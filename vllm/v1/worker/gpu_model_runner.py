@@ -3801,7 +3801,7 @@ class GPUModelRunner(
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
         # §1c.25: fast path skips the NVTX wrapper entirely when
-        # VLLM_COTS_DIAG=0 — single attr load + branch, no
+        # VLLM_COTS_NVTX=0 — single attr load + branch, no
         # range_push/pop call cost on the per-forward hot path.
         if not _COTS_NVTX_ENABLED:
             return self._execute_model_impl(scheduler_output, intermediate_tensors)
@@ -4107,7 +4107,7 @@ class GPUModelRunner(
         ):
             # §1c.25: NVTX around the model call tagged with dispatch
             # mode. Fast path skips both the mode-name string build
-            # AND the NVTX call when VLLM_COTS_DIAG=0.
+            # AND the NVTX call when VLLM_COTS_NVTX=0.
             if not _COTS_NVTX_ENABLED:
                 model_output = self._model_forward(
                     input_ids=input_ids,

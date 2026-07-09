@@ -63,7 +63,7 @@ struct alignas(64) TaskSlab {
   std::atomic<int32_t> num_tokens{0};
 
   // §1c.24 diagnostic-only: written in DispatchCallback when
-  // VLLM_COTS_DIAG=1 so the worker can attribute (worker_start −
+  // VLLM_COTS_COUNTERS=1 so the worker can attribute (worker_start -
   // enqueue_time) as TaskQueue wait. 0 = unset (production-default
   // mode never writes this).
   std::atomic<int64_t> enqueue_time_ns{0};
@@ -473,9 +473,9 @@ class CotsWeightTaskRunner {
   // summary split a generate's COTS time into worker compute,
   // queue wait, sync wait, and dispatch_cb fires — without nsys.
   // Useful as a quick check when nsys is unavailable; nsys NVTX
-  // markers (also gated by VLLM_COTS_DIAG=1) are the primary tool
+  // markers (gated by VLLM_COTS_NVTX=1) are the primary tool
   // for full timeline attribution. All increments are gated on
-  // `nvtx_internal::diag_enabled()` in the .cpp so this is purely
+  // `cots_diag::counters_enabled()` in the .cpp so this is purely
   // diagnostic — the production-default hot path skips the
   // timestamp + atomic-add work entirely.
   std::atomic<int64_t> dispatch_cb_count_{0};
@@ -497,7 +497,6 @@ class CotsWeightTaskRunner {
   // Surfaced via get_counters(); non-zero means at least one
   // submit/replay was clamped (informational, not an error).
   std::atomic<int64_t> worker_clamp_override_count_{0};
-
 };
 
 }  // namespace cots

@@ -44,19 +44,12 @@ namespace {
 
 constexpr int kMaxCpus = 64;
 
-// Instrumentation gates. `VLLM_COTS_DIAG=1` is the umbrella shortcut; split
-// flags let benchmark runs enable counters independently. NVTX is shared
-// across COTS runners via NvtxScope in cots_common.h.
+// Instrumentation gates. Counters and NVTX are controlled independently so
+// benchmark runs can collect cheap counters without emitting NVTX ranges.
+// NVTX is shared across COTS runners via NvtxScope in cots_common.h.
 namespace cots_diag {
-inline bool legacy_enabled() {
-  static const bool enabled = []() { return env_flag("VLLM_COTS_DIAG"); }();
-  return enabled;
-}
-
 inline bool counters_enabled() {
-  static const bool enabled = []() {
-    return legacy_enabled() || env_flag("VLLM_COTS_COUNTERS");
-  }();
+  static const bool enabled = []() { return env_flag("VLLM_COTS_COUNTERS"); }();
   return enabled;
 }
 
@@ -554,11 +547,11 @@ void CotsWeightTaskRunner::DispatchCallback(void* user_data) {
   TaskSlab* slab = static_cast<TaskSlab*>(user_data);
   CotsWeightTaskRunner* self = static_cast<CotsWeightTaskRunner*>(slab->self);
   // §1c.24 attribution: stamp enqueue time so the worker can later
-  // compute queue_wait = worker_start - enqueue_time. Gated together
-  // with the NVTX scopes by VLLM_COTS_DIAG=1; in production-default
-  // mode neither now_ns() nor the atomic write fires. Worker reads
-  // enqueue_time_ns conditionally on the same flag, so a
-  // diag-disabled run leaves it at its initial value (0).
+  // compute queue_wait = worker_start - enqueue_time. Gated by
+  // VLLM_COTS_COUNTERS=1; in production-default mode neither now_ns()
+  // nor the atomic write fires. Worker reads enqueue_time_ns
+  // conditionally on the same flag, so a counter-disabled run leaves it
+  // at its initial value (0).
   if (cots_diag::counters_enabled()) {
     slab->enqueue_time_ns.store(now_ns(), std::memory_order_release);
     self->dispatch_cb_count_.fetch_add(1, std::memory_order_relaxed);
@@ -574,7 +567,7 @@ void CotsWeightTaskRunner::SyncCallback(void* user_data) {
   CotsWeightTaskRunner* self = static_cast<CotsWeightTaskRunner*>(args->runner);
   // §1c.24 attribution: time the sync wait — distinguishes "driver
   // blocked waiting for the worker" from "driver doing other work
-  // then unblocking immediately". Same VLLM_COTS_DIAG gate as the
+  // then unblocking immediately". Same VLLM_COTS_COUNTERS gate as the
   // dispatch counter; in production-default mode the timestamps
   // and atomic adds are skipped.
   if (cots_diag::counters_enabled()) {
@@ -592,7 +585,7 @@ void CotsWeightTaskRunner::SyncCallback(void* user_data) {
 
 void CotsWeightTaskRunner::RunSlabOnWorker(TaskSlab* slab) {
   // §1c.24 attribution: stamp worker start + queue wait, gated by
-  // VLLM_COTS_DIAG. Production-default leaves worker_t0 at 0 (the
+  // VLLM_COTS_COUNTERS. Production-default leaves worker_t0 at 0 (the
   // worker_busy_total_ns add at the end is also gated). NVTX scope
   // is independently gated inside NvtxScope's ctor.
   const bool diag = cots_diag::counters_enabled();

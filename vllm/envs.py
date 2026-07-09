@@ -45,7 +45,6 @@ if TYPE_CHECKING:
     NO_COLOR: bool = False
     VLLM_LOG_STATS_INTERVAL: float = 10.0
     VLLM_TRACE_FUNCTION: int = 0
-    VLLM_COTS_DIAG: bool = False
     VLLM_COTS_COUNTERS: bool = False
     VLLM_COTS_NVTX: bool = False
     VLLM_COTS_DUMP_COUNTERS_ON_SHUTDOWN: bool = False
@@ -704,7 +703,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # COTS thesis diagnostics. Most COTS hot paths read these directly from
     # getenv() in C++ to keep the production path independent of Python env
     # plumbing; registering them here prevents unknown-env warnings.
-    "VLLM_COTS_DIAG": lambda: os.getenv("VLLM_COTS_DIAG", "0") == "1",
     "VLLM_COTS_COUNTERS": lambda: os.getenv("VLLM_COTS_COUNTERS", "0") == "1",
     "VLLM_COTS_NVTX": lambda: os.getenv("VLLM_COTS_NVTX", "0") == "1",
     "VLLM_COTS_DUMP_COUNTERS_ON_SHUTDOWN": lambda: os.getenv(

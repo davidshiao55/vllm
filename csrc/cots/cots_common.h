@@ -21,9 +21,7 @@ inline bool env_flag(const char* name) {
 }
 
 inline bool cots_nvtx_enabled() {
-  static const bool enabled = []() {
-    return env_flag("VLLM_COTS_DIAG") || env_flag("VLLM_COTS_NVTX");
-  }();
+  static const bool enabled = []() { return env_flag("VLLM_COTS_NVTX"); }();
   return enabled;
 }
 
