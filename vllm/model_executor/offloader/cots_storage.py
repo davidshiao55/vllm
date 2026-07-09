@@ -203,8 +203,13 @@ class CotsLinearHandle:
         #   rows of the slot are valid. Per-half row count for MLP gate/up
         #   (`gate[:a]` AND `up[:a]` valid → available_rows == a); total
         #   prefix rows for qkv/wo/mlp_down. 0 = empty.
+        # `prefetch_consumed_in_slot[k]`: whether the owner has finished
+        #   consuming the slot. This lets the streamer defer an unsafe K=2
+        #   overwrite if torch.compile hoists a later start_prefetch before
+        #   the previous owner reaches its custom-op consumer.
         self.prefetch_owner_in_slot: list[CotsLinearHandle | None] = []
         self.prefetch_available_rows_in_slot: list[int] = []
+        self.prefetch_consumed_in_slot: list[bool] = []
         # Stage 7-C: row-handle `w_cpu` is stored in transposed
         # `(n_cpu, out_dim)` layout (see install()); its first
         # `n_pref` rows are the contiguous prefetch source. No
@@ -709,6 +714,7 @@ class CotsPrefetchBufferPool:
                 h.w_prefetch_slots = []
                 h.prefetch_owner_in_slot = []
                 h.prefetch_available_rows_in_slot = []
+                h.prefetch_consumed_in_slot = []
                 continue
             if h.split_axis == INPUT_SPLIT_AXIS:
                 # Input-split slot is (max_n_prefetch, out_dim) — matches the
@@ -743,10 +749,12 @@ class CotsPrefetchBufferPool:
             # one handle are visible to all sharers of the physical slot.
             shared_owners: list[CotsLinearHandle | None] = [None] * self.K
             shared_avail: list[int] = [0] * self.K
+            shared_consumed: list[bool] = [True] * self.K
             for h in group_handles:
                 h.w_prefetch_slots = shared_slots
                 h.prefetch_owner_in_slot = shared_owners
                 h.prefetch_available_rows_in_slot = shared_avail
+                h.prefetch_consumed_in_slot = shared_consumed
 
 
 # ---------------------------------------------------------------------------
@@ -789,6 +797,11 @@ class WeightPrefetchStreamer:
         self.current_bucket: int = 0
         # Owned externally; offloader sets after constructing the pool.
         self.buffer_pool: CotsPrefetchBufferPool | None = None
+        # Optional layer handle table for retrying a prefetch that was deferred
+        # because compile hoisted it before the K=2 slot's previous owner was
+        # consumed.
+        self.layer_handles: list[list[CotsLinearHandle]] | None = None
+        self._pending_prefetch_layers: set[int] = set()
 
     def set_current_bucket(
         self, num_tokens: int, bucket_for: Callable[[int], int]
@@ -800,14 +813,24 @@ class WeightPrefetchStreamer:
         memcpy per non-zero handle on `copy_stream`; single event records
         at layer end so `wait(layer_idx)` is one event-sync."""
         b = self.current_bucket
-        if not any(h.n_prefetch_by_bucket.get(b, 0) > 0 for h in handles):
+        active_handles = [h for h in handles if h.n_prefetch_by_bucket.get(b, 0) > 0]
+        if not active_handles:
             # No-op for this bucket. Clear stale wait state from a previous
             # bucket where this layer DID prefetch — otherwise wait(layer_idx)
             # would sync on a stale done-event under per-bucket Planner
             # strategies.
             self._event_valid_for_eager[layer_idx] = False
             self._prefetch_in_capture[layer_idx] = False
+            self._pending_prefetch_layers.discard(layer_idx)
             return
+
+        if self._would_overwrite_unconsumed_slot(active_handles):
+            self._pending_prefetch_layers.add(layer_idx)
+            self._event_valid_for_eager[layer_idx] = False
+            self._prefetch_in_capture[layer_idx] = False
+            return
+
+        self._pending_prefetch_layers.discard(layer_idx)
 
         in_capture = torch.cuda.is_current_stream_capturing()
         self._prefetch_in_capture[layer_idx] = in_capture
@@ -879,20 +902,34 @@ class WeightPrefetchStreamer:
                     h.prefetch_available_rows_in_slot[h.slot_idx] = n // 2
                 else:
                     h.prefetch_available_rows_in_slot[h.slot_idx] = n
+                h.prefetch_consumed_in_slot[h.slot_idx] = False
 
         self._copy_done_events[layer_idx].record(self.copy_stream)
         self._event_valid_for_eager[layer_idx] = not in_capture
+
+    @staticmethod
+    def _would_overwrite_unconsumed_slot(handles: list[CotsLinearHandle]) -> bool:
+        for h in handles:
+            if not h.prefetch_owner_in_slot:
+                continue
+            owner = h.prefetch_owner_in_slot[h.slot_idx]
+            if owner is None or owner is h:
+                continue
+            if not h.prefetch_consumed_in_slot[h.slot_idx]:
+                return True
+        return False
 
     def prepare_for_forward_bucket(
         self, layer_idx: int, handles: list[CotsLinearHandle]
     ) -> None:
         """Idempotent boundary repair for `layer_idx` at `current_bucket`.
         Repairs the layer-0 slot relative to the active bucket. For qkv, wo,
-        and mlp_down, larger previously-filled prefixes can be reused. For
-        mlp_gate_up, the slot is active-adjacent `[gate_active | up_active]`,
-        so any active-size change rewrites the full active prefix. Owner
-        mismatch is a hard error, except an empty slot (`owner is None`) is
-        filled on demand.
+        and mlp_down, larger previously-filled prefixes can be reused when
+        the same handle still owns the slot. For mlp_gate_up, the slot is
+        active-adjacent `[gate_active | up_active]`, so any active-size change
+        rewrites the full active prefix. Foreign ownership at this out-of-graph
+        boundary is reclaimed by refilling the slot for layer 0; in-graph
+        consumers still treat owner mismatch as a hard error.
 
         Phase 1c precondition: bucket dispatch is decided by the active
         bucket (capture-time constant), not by slot state. This method
@@ -912,16 +949,14 @@ class WeightPrefetchStreamer:
                 continue
             avail = h.prefetch_available_rows_in_slot[h.slot_idx]
             owner = h.prefetch_owner_in_slot[h.slot_idx]
-            if owner is not None and owner is not h:
-                raise AssertionError(
-                    f"prepare_for_forward_bucket: slot owner mismatch on "
-                    f"{h.qualified_name} slot {h.slot_idx} (owner={owner})"
-                )
             if h.role == MLP_GATE_UP_ROLE:
                 needs_fill = owner is None or avail != required
             else:
                 needs_fill = owner is None or avail < required
+            if owner is not None and owner is not h:
+                needs_fill = True
             if not needs_fill:
+                h.prefetch_consumed_in_slot[h.slot_idx] = False
                 continue
             if not issued:
                 fork_event = torch.cuda.Event()
@@ -961,6 +996,7 @@ class WeightPrefetchStreamer:
                         )
                 h.prefetch_owner_in_slot[h.slot_idx] = h
                 h.prefetch_available_rows_in_slot[h.slot_idx] = required
+                h.prefetch_consumed_in_slot[h.slot_idx] = False
         if issued:
             self._prefetch_in_capture[layer_idx] = in_capture
             self._copy_done_events[layer_idx].record(self.copy_stream)
@@ -969,6 +1005,17 @@ class WeightPrefetchStreamer:
     def wait(self, layer_idx: int) -> None:
         """Compute stream waits for this layer's prefetch. Branches on
         capture state — port of `prefetch.py:299-329`."""
+        if layer_idx in self._pending_prefetch_layers:
+            if self.layer_handles is None:
+                raise RuntimeError(
+                    "pending COTS prefetch cannot be retried without layer handles"
+                )
+            self.start(layer_idx, self.layer_handles[layer_idx])
+            if layer_idx in self._pending_prefetch_layers:
+                raise RuntimeError(
+                    f"COTS prefetch for layer {layer_idx} is still blocked by "
+                    "an unconsumed K=2 slot at wait time"
+                )
         if torch.cuda.is_current_stream_capturing():
             if not self._prefetch_in_capture[layer_idx]:
                 return

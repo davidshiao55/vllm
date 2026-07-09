@@ -513,6 +513,7 @@ class CotsOffloader(BaseOffloader):
             dry_run=self.dry_run,
         )
         self._streamer.buffer_pool = self._prefetch_buffer_pool
+        self._streamer.layer_handles = self._layer_handles
 
         for i, layer in enumerate(self._layer_modules):
             self._hook_layer_forward(i, layer)
