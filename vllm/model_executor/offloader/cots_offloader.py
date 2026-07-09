@@ -563,30 +563,6 @@ class CotsOffloader(BaseOffloader):
                     f"cots: cpu_num_threads_by_bucket[{b}] = {n}, must be >= 1"
                 )
 
-    def _native_routing_uniform_across_buckets(self) -> bool:
-        """Whether compile-visible operator geometry is bucket-invariant.
-
-        The dispatch bucket selects native task ids at runtime, while the
-        Python-visible operator geometry (`n_prefetch`, `n_cpu_compute`,
-        scatter indices, GPU branch shape) may still differ by bucket. This
-        helper remains useful as a diagnostic and for tests that distinguish
-        uniform and nonuniform routing.
-        """
-        if not self._dispatch_buckets:
-            return True
-        for h in self._handles:
-            pref_values = {
-                int(h.n_prefetch_by_bucket.get(bucket, 0))
-                for bucket in self._dispatch_buckets
-            }
-            cpu_values = {
-                int(h.n_cpu_compute_by_bucket.get(bucket, h.n_cpu))
-                for bucket in self._dispatch_buckets
-            }
-            if len(pref_values) > 1 or len(cpu_values) > 1:
-                return False
-        return True
-
     def _compute_has_cpu_compute_work(self) -> bool:
         """Whether any dispatch bucket leaves rows for CPU GEMM."""
         for h in self._handles:
