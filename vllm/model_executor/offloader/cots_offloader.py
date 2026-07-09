@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
+from cots.dispatch_buckets import cots_default_dispatch_buckets
 from cots.snap import COTS_SNAP_MODEL, qkvo_output_granularity
 
 # Register prefetch custom ops. COTS uses generic wait_prefetch plus
@@ -1059,51 +1060,24 @@ class CotsOffloader(BaseOffloader):
         the same would-have-been decode grid. Both modes add a small set of
         larger fallback buckets for non-captured prefill/mixed forwards.
         """
-        if self._graph_capture_buckets:
-            buckets = list(self._graph_capture_buckets)
-        else:
-            buckets = self._would_have_been_graph_buckets(vllm_config)
-        buckets.extend(self._large_dispatch_fallback_buckets(self._max_num_tokens))
-        return sorted(set(buckets))
-
-    @staticmethod
-    def _would_have_been_graph_buckets(vllm_config) -> list[int]:
         scheduler_config = vllm_config.scheduler_config
         compilation_config = vllm_config.compilation_config
-        max_num_tokens = int(scheduler_config.max_num_batched_tokens)
-        max_capture_size = compilation_config.max_cudagraph_capture_size
-        if max_capture_size is None or int(max_capture_size) <= 0:
-            decode_query_len = 1
-            speculative_config = getattr(vllm_config, "speculative_config", None)
-            if speculative_config and speculative_config.num_speculative_tokens:
-                decode_query_len += int(speculative_config.num_speculative_tokens)
-            max_capture_size = min(
-                int(scheduler_config.max_num_seqs) * decode_query_len * 2,
-                512,
+        decode_query_len = 1
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        if speculative_config and speculative_config.num_speculative_tokens:
+            decode_query_len += int(speculative_config.num_speculative_tokens)
+        return list(
+            cots_default_dispatch_buckets(
+                max_num_seqs=int(scheduler_config.max_num_seqs),
+                max_num_batched_tokens=self._max_num_tokens,
+                decode_query_len=decode_query_len,
+                max_cudagraph_capture_size=(
+                    compilation_config.max_cudagraph_capture_size
+                ),
+                performance_mode=getattr(vllm_config, "performance_mode", None),
+                cudagraph_capture_sizes=self._graph_capture_buckets or None,
             )
-        max_capture_size = min(max_num_tokens, int(max_capture_size))
-        if max_capture_size < 1:
-            return []
-
-        performance_mode = getattr(vllm_config, "performance_mode", None)
-        if performance_mode == "interactivity":
-            interactivity_max = min(max_capture_size, 32)
-            buckets = list(range(1, interactivity_max + 1))
-        else:
-            buckets = [i for i in (1, 2, 4) if i <= max_capture_size]
-        if max_capture_size >= 8:
-            buckets.extend(range(8, min(max_capture_size + 1, 256), 8))
-        if max_capture_size >= 256:
-            buckets.extend(range(256, max_capture_size + 1, 16))
-        return sorted(set(buckets))
-
-    @staticmethod
-    def _large_dispatch_fallback_buckets(max_num_tokens: int) -> list[int]:
-        candidates = (768, 1024, 1536, 2048, 3072, 4096, 6144, 8192)
-        buckets = [b for b in candidates if b <= max_num_tokens]
-        if max_num_tokens > 0:
-            buckets.append(int(max_num_tokens))
-        return buckets
+        )
 
     def _validate_graph_capture_dispatch_coverage(self) -> None:
         missing = sorted(set(self._graph_capture_buckets) - set(self._dispatch_buckets))
