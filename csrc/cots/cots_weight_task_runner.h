@@ -246,19 +246,10 @@ class CotsWeightTaskRunner {
   // native-extension sanity tests; argument tensors are user-managed.
   void run_at_linear_inline(at::Tensor x, at::Tensor w, at::Tensor y_out);
 
-  // Inline call to the custom BF16 row-major-weight GEMM kernel
-  // (csrc/cots/bf16_gemm_transposed.cpp). All tensors BF16 row-major
-  // contiguous. Retained for correctness tests of the production kernel
-  // layout; caller-managed tensors, no TaskQueue involvement.
+  // Correctness helpers for the two production BF16 weight layouts. Tensors
+  // are caller-managed; no TaskQueue or host callback is involved.
   void run_bf16_gemm_transposed_inline(at::Tensor x, at::Tensor w,
                                        at::Tensor y_out);
-
-  // Stage 7-D — natural (N, K) row-major BF16 GEMM kernel.
-  // Sibling to run_bf16_gemm_transposed_inline; same casting
-  // and parallelism strategy but with loop nest swapped for the
-  // natural-layout fast access direction. Used by the production
-  // worker paths for QKV/gate/up after Stage 7-C storage
-  // unification. Caller-managed tensors; no TaskQueue involvement.
   void run_bf16_gemm_natural_inline(at::Tensor x, at::Tensor w,
                                     at::Tensor y_out);
 

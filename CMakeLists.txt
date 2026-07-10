@@ -1017,25 +1017,16 @@ endif()
 # See docs/implementation_roadmap.md Phase 1c.
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
+  set(VLLM_COTS_CPU_KERNEL_SRC
+    "csrc/cots/bf16_gemm_transposed.cpp"
+    "csrc/cots/bf16_gemm_natural.cpp"
+    "csrc/cots/bf16_mlp_gate_up_silu.cpp")
+
   set(VLLM_COTS_EXT_SRC
     "csrc/cots/task_queue.cpp"
     "csrc/cots/cots_weight_task_runner.cpp"
     "csrc/cots/cots_torch_bindings.cpp"
-    # Stage 7 — custom BF16 GEMM kernel for the row-major-weight
-    # layout (oneDNN has no AVX2 fast path for this layout; see
-    # csrc/cots/bf16_gemm_transposed.cpp for the rationale).
-    # Plain C++ host code with AVX2/FMA intrinsics; nvcc compiles
-    # transparently when LANGUAGE=CUDA.
-    "csrc/cots/bf16_gemm_transposed.cpp"
-    # Stage 7-D — sibling kernel for the natural (N, K)
-    # row-major weight layout. Same casting/parallelism strategy
-    # as Path H (pipelined upcast in inner loop, at::parallel_for
-    # on N) but with the loop nest swapped to keep w access
-    # sequential in natural layout. Used by production worker paths
-    # for QKV/gate/up after Stage 7-C storage unification.
-    "csrc/cots/bf16_gemm_natural.cpp"
-    # CPU MLP block fast path: gate/up/SwiGLU into BF16 scratch, then down.
-    "csrc/cots/bf16_mlp_gate_up_silu.cpp")
+    ${VLLM_COTS_CPU_KERNEL_SRC})
 
   include(CheckCXXCompilerFlag)
   check_cxx_compiler_flag("-mavx2" VLLM_COTS_COMPILER_HAS_MAVX2)
@@ -1045,43 +1036,9 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       "COTS Stage 7 BF16 kernels require compiler support for -mavx2 and -mfma")
   endif()
 
-  # Stage 7 — the row-major-weight BF16 GEMM kernel uses AVX2 +
-  # FMA intrinsics + `at::parallel_for` for intra-op parallelism.
-  # This thesis extension is built for the target RTX 4090 host class
-  # and requires an AVX2/FMA-capable x86 CPU at runtime. The kernel
-  # sources still contain scalar reference branches for non-standard
-  # direct compilation without these flags, but the vLLM CMake target
-  # intentionally force-compiles the production TUs with AVX2/FMA.
-  #
-  # `-fopenmp` here is **required for correctness of
-  # `at::parallel_for` performance**, not for any `#pragma omp` in
-  # our own source. ATen's `parallel_for` is defined in
-  # `ATen/Parallel-inl.h`: when our TU's `_OPENMP` macro is set,
-  # it routes through `at::internal::invoke_parallel`
-  # (`ATen/ParallelOpenMP.h:18-53`, which is itself OpenMP-backed).
-  # When `_OPENMP` is unset in our TU, `INTRA_OP_PARALLEL` is not
-  # defined and `parallel_for` silently falls through to a serial
-  # path — observed empirically as ~5× slowdown at thr=16. PyTorch
-  # itself is OMP-built; libgomp is already loaded by libtorch_cpu
-  # so we add no extra link step here, just the compile-time
-  # `-fopenmp` to make our TU see `_OPENMP`.
-  #
-  # If PyTorch is ever rebuilt with TBB (`USE_TBB=1,
-  # USE_NATIVE_PARALLEL=0`), `at::parallel_for` would route through
-  # `ParallelNative.h` instead, and this `-fopenmp` would be a
-  # no-op in terms of dispatch — but it would still pull libgomp
-  # into our link line. We document the OMP runtime dependency
-  # here and rely on it being present for this kernel to scale.
-  set_source_files_properties(
-    "csrc/cots/bf16_gemm_transposed.cpp"
-    PROPERTIES COMPILE_FLAGS "-mavx2 -mfma -fopenmp")
-  # Stage 7-D natural-layout kernel — same compile flags as Path H (AVX2/FMA +
-  # OpenMP for at::parallel_for routing into INTRA_OP_PARALLEL).
-  set_source_files_properties(
-    "csrc/cots/bf16_gemm_natural.cpp"
-    PROPERTIES COMPILE_FLAGS "-mavx2 -mfma -fopenmp")
-  set_source_files_properties(
-    "csrc/cots/bf16_mlp_gate_up_silu.cpp"
+  # -fopenmp makes ATen's inline parallel_for route through its OpenMP
+  # backend. Without it these translation units silently execute serially.
+  set_source_files_properties(${VLLM_COTS_CPU_KERNEL_SRC}
     PROPERTIES COMPILE_FLAGS "-mavx2 -mfma -fopenmp")
 
   message(STATUS "Enabling cots_C extension.")

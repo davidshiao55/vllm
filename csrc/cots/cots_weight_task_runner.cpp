@@ -5,6 +5,7 @@
 
 #include "cots_weight_task_runner.h"
 
+#include "bf16_kernels.h"
 #include "cots_common.h"
 
 #include <ATen/ops/linear.h>
@@ -20,25 +21,6 @@
 
 namespace vllm {
 namespace cots {
-
-// Forward declaration — defined in bf16_gemm_transposed.cpp.
-// Used by run_bf16_gemm_transposed_inline below to call into
-// the Stage 7 custom AVX2 BF16 GEMM kernel without a header.
-void bf16_gemm_transposed_at(const at::Tensor& x, const at::Tensor& w,
-                             at::Tensor& y_out);
-
-// Forward declaration — defined in
-// bf16_gemm_natural.cpp. Stage 7-D probe entry
-// for the natural (N, K) row-major BF16 GEMM kernel.
-void bf16_gemm_natural_at(const at::Tensor& x, const at::Tensor& w,
-                          at::Tensor& y_out);
-
-// Forward declaration — defined in bf16_mlp_gate_up_silu.cpp. Production MLP
-// CPU path: gate/up/SwiGLU into BF16 scratch, then transposed down GEMM.
-void bf16_mlp_gate_up_silu_down(const uint16_t* x, const uint16_t* w_gate,
-                                const uint16_t* w_up, const uint16_t* w_down,
-                                uint16_t* y, uint16_t* z_scratch, int64_t M,
-                                int64_t H, int64_t I, int64_t O);
 
 namespace {
 
@@ -420,12 +402,6 @@ void CotsWeightTaskRunner::run_at_linear_inline(at::Tensor x, at::Tensor w,
 void CotsWeightTaskRunner::run_bf16_gemm_transposed_inline(at::Tensor x,
                                                            at::Tensor w,
                                                            at::Tensor y_out) {
-  // Correctness/diagnostic helper: drive the custom BF16
-  // row-major-weight GEMM kernel (csrc/cots/bf16_gemm_transposed.cpp)
-  // inline. No TaskQueue, no host callback. The wrapped function does
-  // its own dtype/contiguity validation and TORCH_CHECK calls on shape;
-  // we just hold InferenceMode so the dispatcher does not record
-  // autograd metadata.
   c10::InferenceMode g;
   bf16_gemm_transposed_at(x, w, y_out);
 }
@@ -433,8 +409,6 @@ void CotsWeightTaskRunner::run_bf16_gemm_transposed_inline(at::Tensor x,
 void CotsWeightTaskRunner::run_bf16_gemm_natural_inline(at::Tensor x,
                                                         at::Tensor w,
                                                         at::Tensor y_out) {
-  // Stage 7-D probe — sibling kernel for the natural (N, K) row-major
-  // BF16 GEMM layout. Same harness pattern as the Path H helper above.
   c10::InferenceMode g;
   bf16_gemm_natural_at(x, w, y_out);
 }
