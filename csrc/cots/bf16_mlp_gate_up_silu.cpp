@@ -135,8 +135,16 @@ void gate_up_silu_bf16_scratch(const uint16_t* x, const uint16_t* w_gate,
           for (; m + 4 <= M; m += 4) {
             gate_up_silu_tile<4>(x, w_gate, w_up, z_scratch, H, I, m, i);
           }
-          for (; m < M; ++m) {
-            gate_up_silu_tile<1>(x, w_gate, w_up, z_scratch, H, I, m, i);
+          switch (M - m) {
+            case 3:
+              gate_up_silu_tile<3>(x, w_gate, w_up, z_scratch, H, I, m, i);
+              break;
+            case 2:
+              gate_up_silu_tile<2>(x, w_gate, w_up, z_scratch, H, I, m, i);
+              break;
+            case 1:
+              gate_up_silu_tile<1>(x, w_gate, w_up, z_scratch, H, I, m, i);
+              break;
           }
         }
       });
