@@ -32,9 +32,8 @@
 //     post-ops, no quantization scales, no AVX-512 / AMX paths,
 //     no runtime ISA dispatch (the AVX2+FMA gate is a compile-
 //     time `#if`).
-//   * **Not a general-purpose GEMM.** Only the shapes the COTS
-//     down-proj worker uses (M ∈ {1, 2, 4} register-tiled; other
-//     M via a generic fallback that gives up M-fusion).
+//   * **Not a general-purpose GEMM.** It is specialized for COTS'
+//     small-token BF16 down-projection slices.
 //   * **Not a replacement for `at::linear`.** Only beats
 //     `at::linear` on the specific `(K, N)` row-major-weight
 //     layout because oneDNN has no bf16:bf16 AVX2 dispatch for
@@ -78,12 +77,15 @@
 //       - M=1 → N_INNER=4 (N_tile=64). Wins by sharing one
 //         x-broadcast across 4 nb-tiles.
 //       - M=2 → N_INNER=2 (N_tile=32). Hybrid.
+//       - M=3 → N_INNER=2 (N_tile=32). Fused remainder path;
+//         avoids reading the weight matrix three separate times.
 //       - M=4 → N_INNER=1 (N_tile=Nb=16). Wins by **M-fusion**:
 //         each w cache line is FMA'd against 4 m-rows in one
 //         pass → 4× DRAM-traffic reduction vs a per-m outer
 //         loop.
-//       - Other M → per-(m, nb) fallback (correctness only;
-//         no register-tile M-fusion benefit).
+//       - Larger M → groups of four plus one fused 2/3-token
+//         remainder. A one-token remainder keeps the conservative
+//         N_INNER=1 path.
 //   * `K` is the reduction dim, walked element-by-element with
 //     **software prefetch 24 K-rows ahead** to overlap DRAM
 //     latency with FMA compute. No K-blocking because the
@@ -236,17 +238,6 @@ inline __m256 load8_bf16_as_f32(const uint16_t* ptr) {
 constexpr int64_t Nb = 16;
 constexpr int64_t PREFETCH_DIST = 24;  // k-rows ahead
 
-// Register-tile N_INNER constants chosen so the
-// `M_TILE × N_INNER × 2` accumulator footprint stays within the
-// 16-ymm register budget on AVX2 with room for 2 w-load and 1
-// x-broadcast registers (≤ 13 ymm for accumulators).
-//   M=1: 4 sub-tiles → 8 acc + 2 + 1 = 11 ymm. N_tile=64.
-//   M=2: 2 sub-tiles → 8 acc + 2 + 1 = 11 ymm. N_tile=32.
-//   M=4: 1 sub-tile  → 8 acc + 2 + 1 = 11 ymm. N_tile=16 (= Nb).
-constexpr int N_INNER_M1 = 4;
-constexpr int N_INNER_M2 = 2;
-constexpr int N_INNER_M4 = 1;
-
 template <int M_TILE, int N_INNER>
 inline void gemm_tile_kernel(const uint16_t* x, const uint16_t* w, uint16_t* y,
                              int64_t M, int64_t K, int64_t N,
@@ -310,6 +301,44 @@ inline void gemm_tile_kernel(const uint16_t* x, const uint16_t* w, uint16_t* y,
   }
 }
 
+// Run one M_TILE token group across the output dimension. The final partial
+// output tile falls back to one 16-column block; production down-projection
+// widths are divisible by every tile width used below, so that path is
+// normally empty.
+template <int M_TILE, int N_INNER>
+void run_output_tiles(const uint16_t* x, const uint16_t* w, uint16_t* y,
+                      int64_t K, int64_t N) {
+  constexpr int64_t kTileWidth = N_INNER * Nb;
+  const int64_t N_main = (N / Nb) * Nb;
+  const int64_t n_tiles = N_main / kTileWidth;
+  const int64_t covered = n_tiles * kTileWidth;
+  at::parallel_for(0, n_tiles, 1, [=](int64_t begin, int64_t end) {
+    for (int64_t tile = begin; tile < end; ++tile) {
+      gemm_tile_kernel<M_TILE, N_INNER>(x, w, y, M_TILE, K, N,
+                                        tile * kTileWidth);
+    }
+  });
+  for (int64_t n = covered; n < N_main; n += Nb) {
+    gemm_tile_kernel<M_TILE, 1>(x, w, y, M_TILE, K, N, n);
+  }
+}
+
+// Full four-token groups share each weight block across all four tokens.
+// Parallelizing the joint (token-group, output-block) space gives enough work
+// to every thread at large M without introducing nested parallel regions.
+void run_m4_groups(const uint16_t* x, const uint16_t* w, uint16_t* y,
+                   int64_t groups, int64_t K, int64_t N) {
+  const int64_t n_blocks = N / Nb;
+  at::parallel_for(0, groups * n_blocks, 1, [=](int64_t begin, int64_t end) {
+    for (int64_t index = begin; index < end; ++index) {
+      const int64_t group = index / n_blocks;
+      const int64_t block = index % n_blocks;
+      gemm_tile_kernel<4, 1>(x + group * 4 * K, w, y + group * 4 * N, 4, K, N,
+                             block * Nb);
+    }
+  });
+}
+
 }  // namespace
 
 // Public entry. y[M, N] = x[M, K] @ w[K, N], all BF16 row-major.
@@ -333,102 +362,35 @@ void bf16_gemm_transposed(const uint16_t* x, const uint16_t* w, uint16_t* y,
                           int64_t M, int64_t N, int64_t K) {
   const int64_t N_main = (N / Nb) * Nb;
 
-  // Dispatch to a register-tiled (M_TILE, N_INNER) kernel based on M.
-  // See file-level comment for the register-budget analysis.
-  const int64_t N_tile_M1 = N_INNER_M1 * Nb;  // 64
-  const int64_t N_tile_M2 = N_INNER_M2 * Nb;  // 32
-  // M=4 uses N_tile = Nb (16); the fallback uses Nb too.
+  const int64_t m_groups = M / 4;
+  if (M == 4) {
+    // Preserve the dedicated output-only schedule: the joint group/output
+    // index used for larger M would add an unnecessary integer divide here.
+    run_output_tiles<4, 1>(x, w, y, K, N);
+  } else if (m_groups > 0) {
+    run_m4_groups(x, w, y, m_groups, K, N);
+  }
 
-  // Grain size for at::parallel_for. Each iteration is one N-tile,
-  // so a grain of 1 means "one tile per task". Setting grain to 1
-  // matches our earlier static-scheduled OMP behaviour; ATen
-  // dynamically merges tasks when the work is small enough to make
-  // threading overhead dominate.
-  constexpr int64_t kGrain = 1;
-
-  if (M == 1) {
-    const int64_t n_tiles = N_main / N_tile_M1;
-    const int64_t covered = n_tiles * N_tile_M1;
-    at::parallel_for(0, n_tiles, kGrain,
-                     [x, w, y, M, K, N, N_tile_M1](int64_t begin, int64_t end) {
-                       for (int64_t t = begin; t < end; ++t) {
-                         gemm_tile_kernel<1, N_INNER_M1>(x, w, y, M, K, N,
-                                                         t * N_tile_M1);
-                       }
-                     });
-    // Tail in [covered, N_main) — Nb-wide unfused tiles. Tiny
-    // amount of work; keep serial.
-    for (int64_t nb = covered; nb < N_main; nb += Nb) {
-      gemm_tile_kernel<1, 1>(x, w, y, M, K, N, nb);
-    }
-  } else if (M == 2) {
-    const int64_t n_tiles = N_main / N_tile_M2;
-    const int64_t covered = n_tiles * N_tile_M2;
-    at::parallel_for(0, n_tiles, kGrain,
-                     [x, w, y, M, K, N, N_tile_M2](int64_t begin, int64_t end) {
-                       for (int64_t t = begin; t < end; ++t) {
-                         gemm_tile_kernel<2, N_INNER_M2>(x, w, y, M, K, N,
-                                                         t * N_tile_M2);
-                       }
-                     });
-    for (int64_t nb = covered; nb < N_main; nb += Nb) {
-      gemm_tile_kernel<2, 1>(x, w, y, M, K, N, nb);
-    }
-  } else if (M == 4) {
-    const int64_t n_tiles = N_main / Nb;
-    at::parallel_for(0, n_tiles, kGrain,
-                     [x, w, y, M, K, N](int64_t begin, int64_t end) {
-                       for (int64_t t = begin; t < end; ++t) {
-                         gemm_tile_kernel<4, 1>(x, w, y, M, K, N, t * Nb);
-                       }
-                     });
-  } else {
-    // General fallback for M > 4 (and M=3). Process M in M_TILE=4
-    // groups so the register-tile M-fusion still amortizes w reads
-    // across 4 m's per pass — without this, each m would re-read
-    // the full weight matrix, costing M× DRAM traffic at large M
-    // (measured: probe at M=256 showed ~5× regression vs the
-    // M-fused path before this fix).
-    //
-    // M % 4 leftover (0..3 trailing rows) handled by a per-m M=1
-    // tail loop; tail's worst case is 3 m's reading w 3 extra
-    // times — negligible at large M.
-    const int64_t n_nb = N_main / Nb;
-    const int64_t m_groups = M / 4;
-    const int64_t m_tail_start = m_groups * 4;
-
-    // Grouped M_TILE=4 path: parallel on (m_group, nb_idx) joint
-    // space. Each iteration writes a disjoint 4-row × Nb-col tile
-    // of y, so no thread contention.
-    if (m_groups > 0) {
-      const int64_t total = m_groups * n_nb;
-      at::parallel_for(
-          0, total, kGrain, [x, w, y, K, N, n_nb](int64_t begin, int64_t end) {
-            for (int64_t idx = begin; idx < end; ++idx) {
-              const int64_t g = idx / n_nb;
-              const int64_t nb_idx = idx % n_nb;
-              const int64_t m_start = g * 4;
-              gemm_tile_kernel<4, 1>(x + m_start * K, w, y + m_start * N, 4, K,
-                                     N, nb_idx * Nb);
-            }
-          });
-    }
-
-    // M % 4 tail: per-m, no fusion. Cheap (≤ 3 m's).
-    if (m_tail_start < M) {
-      const int64_t tail_total = (M - m_tail_start) * n_nb;
-      at::parallel_for(
-          0, tail_total, kGrain,
-          [x, w, y, K, N, n_nb, m_tail_start](int64_t begin, int64_t end) {
-            for (int64_t idx = begin; idx < end; ++idx) {
-              const int64_t m_off = idx / n_nb;
-              const int64_t nb_idx = idx % n_nb;
-              const int64_t m = m_tail_start + m_off;
-              gemm_tile_kernel<1, 1>(x + m * K, w, y + m * N, 1, K, N,
-                                     nb_idx * Nb);
-            }
-          });
-    }
+  const int64_t m_tail_start = m_groups * 4;
+  const uint16_t* tail_x = x + m_tail_start * K;
+  uint16_t* tail_y = y + m_tail_start * N;
+  switch (M - m_tail_start) {
+    case 3:
+      run_output_tiles<3, 2>(tail_x, w, tail_y, K, N);
+      break;
+    case 2:
+      run_output_tiles<2, 2>(tail_x, w, tail_y, K, N);
+      break;
+    case 1:
+      if (m_groups == 0) {
+        // Preserve the dedicated M=1 tile: one activation broadcast feeds 64
+        // output channels. A one-token remainder after full groups keeps the
+        // conservative 16-column tile that was regression-free in production.
+        run_output_tiles<1, 4>(tail_x, w, tail_y, K, N);
+      } else {
+        run_output_tiles<1, 1>(tail_x, w, tail_y, K, N);
+      }
+      break;
   }
 
   // Tail loop (N % Nb columns) — single-threaded, runs after the
