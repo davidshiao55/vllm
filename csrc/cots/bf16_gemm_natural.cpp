@@ -20,9 +20,8 @@
 //   * Not a oneDNN BRGEMM port — no JIT, no oneDNN packing
 //     (`n16c` blocked layout), no post-ops, no quantization
 //     scales, no runtime ISA dispatch, no AMX/AVX-512 paths.
-//   * Not a general-purpose GEMM — only the M ∈ {1, 4, ...} cases
-//     COTS dispatches; other M handled by a per-m fallback that
-//     gives up M-fusion (cheap at small M tail).
+//   * Not a general-purpose GEMM — it is specialized for COTS' small-token
+//     BF16 linear slices and natural row-major weights.
 //
 // ─────────────────────────────────────────────────────────────
 // Conceptual relationship to oneDNN's f32:bf16 BRGEMM
@@ -54,8 +53,9 @@
 // Each (m, n) pair gets an 8-wide FP32 accumulator; the inner K
 // loop walks k 8 at a time. Both x[m, :] and w[n, :] are read
 // sequentially. At end of K, horizontal-reduce the 8-wide acc to
-// a scalar y[m, n]. M-fusion still works: one w-row load feeds
-// M_TILE FMAs in parallel (M_TILE = 4).
+// a scalar y[m, n]. The production tile computes two output rows
+// together, reusing each activation load across both rows while
+// retaining four-token weight reuse.
 //
 // The **inner BF16 → FP32 upcast sequence** is identical to
 // oneDNN's: `vpmovzxwd + vpslld 16`. That part is just SIMD
@@ -144,8 +144,8 @@ inline uint16_t f32_to_bf16_rne_scalar(float f) {
 // for i in 0..M_TILE-1. Handles K of any value via a 8-wide main
 // loop + scalar K-tail (K % 8 trailing elements).
 template <int M_TILE>
-inline void dot_tile(const uint16_t* x, const uint16_t* w, uint16_t* y,
-                     int64_t K, int64_t N, int64_t m_start, int64_t n) {
+inline void dot_single(const uint16_t* x, const uint16_t* w, uint16_t* y,
+                       int64_t K, int64_t N, int64_t m_start, int64_t n) {
   __m256 acc[M_TILE];
   for (int i = 0; i < M_TILE; ++i) {
     acc[i] = _mm256_setzero_ps();
@@ -187,36 +187,106 @@ inline void dot_tile(const uint16_t* x, const uint16_t* w, uint16_t* y,
   }
 }
 
+// Compute two adjacent output channels for up to four tokens. Each activation
+// vector feeds both weight rows, and each weight vector feeds every token in
+// the tile. At M_TILE=4 this needs eight accumulators plus two weights and one
+// transient activation vector, staying below AVX2's 16-register budget.
+template <int M_TILE>
+inline void dot_pair(const uint16_t* x, const uint16_t* w, uint16_t* y,
+                     int64_t K, int64_t N, int64_t m_start, int64_t n) {
+  __m256 acc0[M_TILE];
+  __m256 acc1[M_TILE];
+  for (int i = 0; i < M_TILE; ++i) {
+    acc0[i] = _mm256_setzero_ps();
+    acc1[i] = _mm256_setzero_ps();
+  }
+
+  const uint16_t* w0 = w + n * K;
+  const uint16_t* w1 = w0 + K;
+  const int64_t K_main = (K / 8) * 8;
+  for (int64_t k = 0; k < K_main; k += 8) {
+    const __m256 w0_vec = load8_bf16_as_f32(w0 + k);
+    const __m256 w1_vec = load8_bf16_as_f32(w1 + k);
+    for (int i = 0; i < M_TILE; ++i) {
+      const __m256 x_vec = load8_bf16_as_f32(x + (m_start + i) * K + k);
+      acc0[i] = _mm256_fmadd_ps(x_vec, w0_vec, acc0[i]);
+      acc1[i] = _mm256_fmadd_ps(x_vec, w1_vec, acc1[i]);
+    }
+  }
+
+  float scalar0[M_TILE];
+  float scalar1[M_TILE];
+  for (int i = 0; i < M_TILE; ++i) {
+    scalar0[i] = hreduce_ps(acc0[i]);
+    scalar1[i] = hreduce_ps(acc1[i]);
+  }
+  for (int64_t k = K_main; k < K; ++k) {
+    const float w0_s = bf16_to_f32_scalar(w0[k]);
+    const float w1_s = bf16_to_f32_scalar(w1[k]);
+    for (int i = 0; i < M_TILE; ++i) {
+      const float x_s = bf16_to_f32_scalar(x[(m_start + i) * K + k]);
+      scalar0[i] += x_s * w0_s;
+      scalar1[i] += x_s * w1_s;
+    }
+  }
+  for (int i = 0; i < M_TILE; ++i) {
+    y[(m_start + i) * N + n] = f32_to_bf16_rne_scalar(scalar0[i]);
+    y[(m_start + i) * N + n + 1] = f32_to_bf16_rne_scalar(scalar1[i]);
+  }
+}
+
 }  // namespace
 
 // Public entry. `y = x @ w^T` where w is `(N, K)` row-major BF16
 // (PyTorch-natural Linear weight layout) and x is `(M, K)` row-major
 // BF16. Output y is `(M, N)` row-major BF16.
 //
-// Handles any (M, N, K): M_TILE=4 register-tile path for groups
-// of 4 m's + per-m fallback for the M % 4 tail; 8-wide K main loop
-// + scalar K-tail for arbitrary K. No N tail because we walk N
-// one column at a time (output is a scalar per (m, n)).
+// Handles any (M, N, K): adjacent output pairs use M_TILE=4 plus one fused
+// M_TILE=1/2/3 remainder. An odd final output uses the single-row fallback.
+// Both paths retain the scalar K tail for arbitrary K.
 void bf16_gemm_natural(const uint16_t* x, const uint16_t* w, uint16_t* y,
                        int64_t M, int64_t N, int64_t K) {
-  // Parallelize on N. Each n-iteration computes M dot products
-  // independently; threads write disjoint output columns of y,
-  // so no contention. Grain=1 means "one N per task" — at::parallel_for
-  // dynamically merges if work is small enough.
-  at::parallel_for(0, N, /*grain=*/1,
+  const int64_t n_pairs = N / 2;
+  at::parallel_for(0, n_pairs, /*grain=*/1,
                    [x, w, y, M, N, K](int64_t n_begin, int64_t n_end) {
-                     for (int64_t n = n_begin; n < n_end; ++n) {
+                     for (int64_t pair = n_begin; pair < n_end; ++pair) {
+                       const int64_t n = pair * 2;
                        int64_t m = 0;
-                       // M_TILE=4 fast path while we have at least 4 m's left.
                        for (; m + 4 <= M; m += 4) {
-                         dot_tile<4>(x, w, y, K, N, m, n);
+                         dot_pair<4>(x, w, y, K, N, m, n);
                        }
-                       // M_TILE=1 fallback for the remainder.
-                       for (; m < M; ++m) {
-                         dot_tile<1>(x, w, y, K, N, m, n);
+                       switch (M - m) {
+                         case 3:
+                           dot_pair<3>(x, w, y, K, N, m, n);
+                           break;
+                         case 2:
+                           dot_pair<2>(x, w, y, K, N, m, n);
+                           break;
+                         case 1:
+                           dot_pair<1>(x, w, y, K, N, m, n);
+                           break;
                        }
                      }
                    });
+
+  if (N % 2 != 0) {
+    const int64_t n = N - 1;
+    int64_t m = 0;
+    for (; m + 4 <= M; m += 4) {
+      dot_single<4>(x, w, y, K, N, m, n);
+    }
+    switch (M - m) {
+      case 3:
+        dot_single<3>(x, w, y, K, N, m, n);
+        break;
+      case 2:
+        dot_single<2>(x, w, y, K, N, m, n);
+        break;
+      case 1:
+        dot_single<1>(x, w, y, K, N, m, n);
+        break;
+    }
+  }
 }
 
 #else  // !VLLM_COTS_HAS_AVX2_FMA
