@@ -923,11 +923,13 @@ class CotsOffloader(BaseOffloader):
         batch_descriptor: BatchDescriptor,
         num_tokens_unpadded: int,
     ) -> None:
-        """OOG per-forward entry. Owns ALL pre-forward state setup that
-        was previously split between the in-graph pre-hook (bucket +
-        slot repair) and the OOG live-token update. Single boundary for
-        both eager and FULL CUDA Graph paths (replay-time too, not just
-        capture-time).
+        """Publish out-of-graph state for the next model forward.
+
+        This is the single state boundary for eager and CUDA Graph paths,
+        including replay. Synchronization remains mode-specific: eager
+        forwards consume layer 0's repair through ``wait_prefetch``, while
+        vLLM's FULL and PIECEWISE graph managers call ``sync_prev_onload``
+        immediately before capture and replay.
 
         Order matters:
         1. `_prepare_before_forward_bucket(...)` — sets
@@ -938,9 +940,7 @@ class CotsOffloader(BaseOffloader):
             authoritative vLLM dispatch bucket to COTS custom ops.
             CPU ops use it to resolve `(layer_idx, bucket, op_kind) -> task_id`;
             prefetch/scatter ops use it to resolve existing handle route tables.
-        3. `sync_prev_onload()` — drains copy_stream into compute
-            stream so the forward sees the filled slot.
-        4. `_set_live_num_tokens(num_tokens_unpadded)` — live-row cap
+        3. `_set_live_num_tokens(num_tokens_unpadded)` — live-row cap
             pushed to the C++ worker. This is independent from task
             selection.
         """
@@ -951,7 +951,6 @@ class CotsOffloader(BaseOffloader):
         if self._runner is not None:
             assert self._runner is not None
             self._runner.set_active_dispatch(active_bucket, num_tokens_unpadded)
-        self.sync_prev_onload()
         # CPU work scales with the semantic batch size, not bucket
         # capacity. Task selection is handled by the active dispatch
         # state above.
