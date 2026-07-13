@@ -4,7 +4,6 @@
 import dataclasses
 import io
 import json
-import os
 import pickle
 from collections.abc import Callable
 from pickle import Pickler
@@ -21,24 +20,6 @@ from vllm.config.utils import Range
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
-
-
-def _format_graph_ops(graph: fx.GraphModule) -> str:
-    """Compact op list for compile/cache diagnostics."""
-
-    ops = []
-    for node in graph.graph.nodes:
-        if node.op in ("placeholder", "output"):
-            continue
-        target = node.target
-        if hasattr(target, "_qualified_op_name"):
-            name = target._qualified_op_name
-        elif hasattr(target, "name"):
-            name = target.name()
-        else:
-            name = str(target)
-        ops.append(f"{node.op}:{name}")
-    return ", ".join(ops)
 
 
 def get_fake_args_from_graph(graph: fx.GraphModule) -> list[Any]:
@@ -281,28 +262,15 @@ class PiecewiseBackend:
             else:
                 args_list = get_fake_args_from_graph(self.graph)
 
-            try:
-                range_entry.runnable = self.vllm_backend.compiler_manager.compile(
-                    self.graph,
-                    args_list,
-                    self.vllm_backend.inductor_config,
-                    self.compilation_config,
-                    compile_range=range_entry.compile_range,
-                    graph_index=self.piecewise_compile_index,
-                    num_graphs=self.total_piecewise_compiles,
-                )
-            except Exception:
-                if os.getenv("VLLM_COTS_COMPILE_CACHE_DEBUG", "0") == "1":
-                    logger.exception(
-                        "Piecewise compile/cache failure: submod=%s index=%d/%d "
-                        "range=%s ops=[%s]",
-                        self.submod_name,
-                        self.piecewise_compile_index,
-                        self.total_piecewise_compiles,
-                        range_entry.compile_range,
-                        _format_graph_ops(self.graph),
-                    )
-                raise
+            range_entry.runnable = self.vllm_backend.compiler_manager.compile(
+                self.graph,
+                args_list,
+                self.vllm_backend.inductor_config,
+                self.compilation_config,
+                compile_range=range_entry.compile_range,
+                graph_index=self.piecewise_compile_index,
+                num_graphs=self.total_piecewise_compiles,
+            )
 
             range_entry.compiled = True
 
@@ -384,32 +352,12 @@ class PiecewiseBackend:
                     return self.range_entries[range]
         return None
 
-    def _static_range_entry(self) -> RangeEntry:
-        """Return a deterministic compiled entry for shape-independent pieces.
-
-        Some piecewise subgraphs have no symbolic batch-size placeholder. In
-        that case every compiled range is equivalent for dispatch purposes, so
-        runtime shape lookup is neither possible nor needed.
-        """
-        for compile_range in self.compile_ranges:
-            entry = self.range_entries.get(compile_range)
-            if entry is not None:
-                return entry
-        return next(iter(self.range_entries.values()))
-
     def __call__(self, *args: Any) -> Any:
-        range_entry: RangeEntry | None
-        if not self.sym_shape_indices:
-            runtime_shape_repr: object = "<static>"
-            range_entry = self._static_range_entry()
-        else:
-            runtime_shape = args[self.sym_shape_indices[0]]
-            runtime_shape_repr = runtime_shape
-            range_entry = self._find_range_for_shape(runtime_shape)
+        runtime_shape = args[self.sym_shape_indices[0]]
+        range_entry = self._find_range_for_shape(runtime_shape)
 
         assert range_entry is not None, (
-            f"Shape: {runtime_shape_repr} out of considered ranges: "
-            f"{self.compile_ranges}"
+            f"Shape: {runtime_shape} out of considered ranges: {self.compile_ranges}"
         )
         assert range_entry.compiled, (
             "All ranges should be compiled or loaded up front in "

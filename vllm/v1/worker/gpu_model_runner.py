@@ -4,7 +4,6 @@
 import functools
 import gc
 import itertools
-import json
 import threading
 import time
 from collections import defaultdict
@@ -104,7 +103,6 @@ from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.tracing import instrument
 from vllm.utils import length_from_prompt_token_ids_or_embeds
-from vllm.utils.cots_diag import NVTX_ENABLED as _COTS_NVTX_ENABLED
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.nvtx_pytorch_hooks import PytHooks
@@ -176,13 +174,8 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
-from vllm.v1.utils import (
-    CpuGpuBuffer,
-    compute_iteration_details,
-    record_function_or_nullcontext,
-)
+from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
-from vllm.v1.worker.cots_runtime import CotsRuntime
 from vllm.v1.worker.cp_utils import (
     check_attention_cp_compatibility,
     get_total_cp_world_size,
@@ -497,7 +490,6 @@ class GPUModelRunner(
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
-        self.cots_runtime = CotsRuntime()
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -3778,40 +3770,11 @@ class GPUModelRunner(
         self,
         batch_descriptor: BatchDescriptor,
         num_tokens_unpadded: int,
-        trace_context: dict[str, Any] | None = None,
     ) -> None:
-        """Push per-forward dispatch state before any model forward.
-
-        This is the single vLLM boundary for bucket-sized out-of-graph
-        runtime state. It covers scheduler forwards, profile dummy
-        forwards, and CUDA Graph warmup/capture/replay forwards so
-        native runtime ops never need to infer their active bucket from
-        compile-visible tensor shapes or scalar constants.
-        """
-        self.cots_runtime.on_dispatch(
-            batch_descriptor=batch_descriptor,
-            num_tokens_unpadded=num_tokens_unpadded,
-            trace_context=trace_context,
-        )
+        get_offloader().on_dispatch(batch_descriptor, num_tokens_unpadded)
 
     @torch.inference_mode()
     def execute_model(
-        self,
-        scheduler_output: "SchedulerOutput",
-        intermediate_tensors: IntermediateTensors | None = None,
-    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
-        # §1c.25: fast path skips the NVTX wrapper entirely when
-        # VLLM_COTS_NVTX=0 — single attr load + branch, no
-        # range_push/pop call cost on the per-forward hot path.
-        if not _COTS_NVTX_ENABLED:
-            return self._execute_model_impl(scheduler_output, intermediate_tensors)
-        torch.cuda.nvtx.range_push("cots:execute_model")
-        try:
-            return self._execute_model_impl(scheduler_output, intermediate_tensors)
-        finally:
-            torch.cuda.nvtx.range_pop()
-
-    def _execute_model_impl(
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
@@ -4052,36 +4015,8 @@ class GPUModelRunner(
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
 
-        trace_context = None
-        trace_forward_start = 0.0
-        if envs.VLLM_COTS_DISPATCH_TRACE:
-            trace_iter = getattr(self, "_cots_dispatch_trace_iter", 0)
-            self._cots_dispatch_trace_iter = trace_iter + 1
-            details = compute_iteration_details(scheduler_output)
-            trace_context = {
-                "step": int(trace_iter),
-                "source": "execute_model",
-                "ctx_req": int(details.num_ctx_requests),
-                "ctx_tok": int(details.num_ctx_tokens),
-                "gen_req": int(details.num_generation_requests),
-                "gen_tok": int(details.num_generation_tokens),
-                "num_reqs": int(num_reqs),
-                "num_reqs_padded": int(num_reqs_padded),
-                "max_query_len": int(max_num_scheduled_tokens),
-                "num_tokens_unpadded": int(num_tokens_unpadded),
-                "num_tokens_padded": int(num_tokens_padded),
-                "cudagraph_mode": cudagraph_mode.name,
-                "should_ubatch": bool(should_ubatch),
-                "pad_attn": bool(pad_attn),
-            }
-            trace_forward_start = time.perf_counter()
-
         # Run the model.
-        self._publish_forward_dispatch(
-            batch_desc,
-            num_tokens_unpadded,
-            trace_context=trace_context,
-        )
+        self._publish_forward_dispatch(batch_desc, num_tokens_unpadded)
 
         # Use persistent buffers for CUDA graphs.
         # When spec decode is enabled, defer connector finalization
@@ -4105,36 +4040,13 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
-            # §1c.25: NVTX around the model call tagged with dispatch
-            # mode. Fast path skips both the mode-name string build
-            # AND the NVTX call when VLLM_COTS_NVTX=0.
-            if not _COTS_NVTX_ENABLED:
-                model_output = self._model_forward(
-                    input_ids=input_ids,
-                    positions=positions,
-                    intermediate_tensors=intermediate_tensors,
-                    inputs_embeds=inputs_embeds,
-                    **model_kwargs,
-                )
-            else:
-                _mode_name = (
-                    "FULL"
-                    if cudagraph_mode == CUDAGraphMode.FULL
-                    else "PIECEWISE"
-                    if cudagraph_mode == CUDAGraphMode.PIECEWISE
-                    else "NONE"
-                )
-                torch.cuda.nvtx.range_push(f"cots:model_forward[{_mode_name}]")
-                try:
-                    model_output = self._model_forward(
-                        input_ids=input_ids,
-                        positions=positions,
-                        intermediate_tensors=intermediate_tensors,
-                        inputs_embeds=inputs_embeds,
-                        **model_kwargs,
-                    )
-                finally:
-                    torch.cuda.nvtx.range_pop()
+            model_output = self._model_forward(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+                **model_kwargs,
+            )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4213,15 +4125,6 @@ class GPUModelRunner(
         # previous model forward without breaking async scheduling.
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
-
-        if trace_context is not None:
-            payload = {
-                **trace_context,
-                "event": "cots_forward_trace",
-                "forward_submit_ms": (time.perf_counter() - trace_forward_start)
-                * 1000.0,
-            }
-            logger.info("COTS_FORWARD_TRACE %s", json.dumps(payload, sort_keys=True))
 
         return None
 
@@ -5311,7 +5214,6 @@ class GPUModelRunner(
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
-        compile_batch_descriptor: BatchDescriptor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -5339,9 +5241,6 @@ class GPUModelRunner(
             profile_seq_lens: If provided, use this value for seq_lens instead
                 of max_query_len. Used to profile attention workspace that
                 scales with context length.
-            compile_batch_descriptor: Optional graph descriptor to publish
-                during eager graph warmup so descriptor-specialized compile
-                variants are materialized before CUDA stream capture starts.
         """
         mm_config = self.vllm_config.model_config.multimodal_config
         if mm_config and mm_config.mm_encoder_only:
@@ -5437,10 +5336,6 @@ class GPUModelRunner(
                 f"Cudagraph runtime mode mismatch in dummy_run. "
                 f"Expected {_cudagraph_mode}, but got {cudagraph_runtime_mode}."
             )
-
-        if compile_batch_descriptor is not None:
-            assert compile_batch_descriptor.num_tokens == batch_desc.num_tokens
-            batch_desc = compile_batch_descriptor
 
         num_tokens_padded = batch_desc.num_tokens
         num_reqs_padded = (
@@ -6178,15 +6073,6 @@ class GPUModelRunner(
         if num_warmups is None:
             num_warmups = self.compilation_config.cudagraph_num_of_warmups
         force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL
-        offload_config = self.vllm_config.offload_config
-        compile_batch_descriptor = (
-            desc
-            if (
-                offload_config.offload_backend == "cots"
-                and float(offload_config.cots.f_cpu_store) > 0.0
-            )
-            else None
-        )
         for _ in range(num_warmups):
             self._dummy_run(
                 desc.num_tokens,
@@ -6197,7 +6083,6 @@ class GPUModelRunner(
                 skip_eplb=True,
                 remove_lora=False,
                 num_active_loras=desc.num_active_loras,
-                compile_batch_descriptor=compile_batch_descriptor,
             )
         self._dummy_run(
             desc.num_tokens,

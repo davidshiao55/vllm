@@ -19,7 +19,6 @@ from vllm.compilation.counter import compilation_counter
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 from vllm.config import (
     CompilationMode,
-    CUDAGraphMode,
     VllmConfig,
     get_current_vllm_config,
     set_current_vllm_config,
@@ -669,6 +668,7 @@ def maybe_use_cudagraph_partition_wrapper(
     graph wrapper class to maintain more control over static graph
     capture and replay.
     """
+    from vllm.config import CUDAGraphMode
 
     compilation_config = vllm_config.compilation_config
     if (

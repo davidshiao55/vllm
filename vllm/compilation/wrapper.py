@@ -153,23 +153,18 @@ class TorchCompileWithNoGuardsWrapper:
                 msg += "upgrade PyTorch version to use AOT compile."
                 logger.warning(msg)
 
-        self._compiled_ptr = compiled_ptr
-        self._compile_options = options
         with aot_context:
-            self._compiled_callable = self._make_compiled_callable(backend)
+            self._compiled_callable = torch.compile(
+                compiled_ptr,
+                fullgraph=True,
+                dynamic=False,
+                backend=backend,
+                options=options,
+            )
 
         if envs.VLLM_USE_BYTECODE_HOOK and mode != CompilationMode.STOCK_TORCH_COMPILE:
             torch._dynamo.convert_frame.register_bytecode_hook(self.bytecode_hook)
             self._compiled_bytecode: CodeType | None = None
-
-    def _make_compiled_callable(self, backend: Any) -> Any:
-        return torch.compile(
-            self._compiled_ptr,
-            fullgraph=True,
-            dynamic=False,
-            backend=backend,
-            options=self._compile_options,
-        )
 
     def aot_compile(self, *args: Any, **kwargs: Any) -> Any:
         if not hasattr(self._compiled_callable, "aot_compile"):
@@ -201,13 +196,12 @@ class TorchCompileWithNoGuardsWrapper:
                         self.forward, *args, **kwargs
                     )
         else:
-            first_compile = self.first_compile
-            self.first_compile = False
             ctx = (
                 nullcontext()
-                if first_compile or not self.evaluate_guards
+                if self.first_compile or not self.evaluate_guards
                 else torch.compiler.set_stance("fail_on_recompile")
             )
+            self.first_compile = False
             with _compilation_context(), ctx:
                 return self._call_with_optional_nvtx_range(
                     self._compiled_callable, *args, **kwargs
@@ -238,7 +232,7 @@ class TorchCompileWithNoGuardsWrapper:
         if frame.f_locals["self"] is not self:
             return
 
-        self._store_compiled_bytecode(new_code)
+        self._compiled_bytecode = new_code
 
         path = self.vllm_config.compile_debug_dump_path()
         if path:
@@ -276,13 +270,8 @@ class TorchCompileWithNoGuardsWrapper:
             )
             raise RuntimeError(msg)
 
-    def _store_compiled_bytecode(self, new_code: CodeType) -> None:
-        self._compiled_bytecode = new_code
-
     @contextmanager
-    def _dispatch_to_compiled_code(
-        self, compiled_bytecode: CodeType | None = None
-    ) -> Generator[None, None, None]:
+    def _dispatch_to_compiled_code(self) -> Generator[None, None, None]:
         # noqa: E501
         """
         Context manager to dispatch to internally compiled code for torch<2.8.
@@ -294,10 +283,8 @@ class TorchCompileWithNoGuardsWrapper:
         See https://dev-discuss.pytorch.org/t/what-is-the-relationship-requirement-among-original-bytecode-transformed-bytecode-and-bytecode-returned-by-hooks-in-dynamo/1693/7 for more details.
         """  # noqa: E501 line too long
         original = self.original_code_object()
-        if compiled_bytecode is None:
-            compiled_bytecode = self._compiled_bytecode
-        assert compiled_bytecode is not None
-        self.__class__.forward.__code__ = compiled_bytecode
+        assert self._compiled_bytecode is not None
+        self.__class__.forward.__code__ = self._compiled_bytecode
         try:
             yield
         finally:

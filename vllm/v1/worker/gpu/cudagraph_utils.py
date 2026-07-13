@@ -18,10 +18,9 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
-from vllm.model_executor.offloader.base import ForwardDispatchInfo, get_offloader
+from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.utils.cots_diag import NVTX_ENABLED as _COTS_NVTX_ENABLED
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
@@ -42,30 +41,6 @@ class BatchExecutionDescriptor:
     num_tokens: int
     num_reqs: int | None  # None means no request padding is needed (PIECEWISE graphs)
     uniform_token_count: int | None = None
-
-
-def _batch_descriptor_from_execution(
-    desc: BatchExecutionDescriptor,
-) -> BatchDescriptor:
-    return BatchDescriptor(
-        num_tokens=desc.num_tokens,
-        num_reqs=desc.num_reqs,
-        uniform=desc.uniform_token_count is not None,
-    )
-
-
-def _publish_offloader_dispatch(
-    desc: BatchExecutionDescriptor,
-    actual_num_tokens: int | None = None,
-) -> None:
-    get_offloader().on_dispatch(
-        ForwardDispatchInfo(
-            batch_descriptor=_batch_descriptor_from_execution(desc),
-            num_tokens_unpadded=(
-                desc.num_tokens if actual_num_tokens is None else actual_num_tokens
-            ),
-        )
-    )
 
 
 def _is_compatible(
@@ -227,10 +202,7 @@ class CudaGraphManager:
                     # Prepare inputs and get forward function
                     forward_fn = create_forward_fn(desc)
 
-                    # Warmup. This utility path bypasses the active
-                    # GPUModelRunner dispatch boundary, so publish offloader
-                    # state before every forward it drives directly.
-                    _publish_offloader_dispatch(desc)
+                    # Warmup
                     forward_fn(CUDAGraphMode.NONE)
 
                     # Capture
@@ -238,26 +210,22 @@ class CudaGraphManager:
                         "CG Capture: mode=%s, batch_desc=%s", desc.cg_mode.name, desc
                     )
                     if desc.cg_mode == CUDAGraphMode.PIECEWISE:
-                        _publish_offloader_dispatch(desc)
                         forward_fn(CUDAGraphMode.PIECEWISE)
                     else:
                         assert desc not in self.graphs, (
                             f"Graph already captured for {desc}"
                         )
                         graph = torch.cuda.CUDAGraph()
-                        offloader = get_offloader()
-                        # FULL capture bypasses the model-runner dispatch
-                        # boundary on this older utility path, so publish the
-                        # same unified offloader state here before native COTS
-                        # ops execute or capture.
-                        _publish_offloader_dispatch(desc)
+                        # Sync offloader's copy stream before capture.
+                        # Ensure any pre-capture prefetches from offloader are complete.
+                        get_offloader().sync_prev_onload()
                         with torch.cuda.graph(graph, self.pool):
                             forward_fn(CUDAGraphMode.NONE)
                             # Join offloader's copy stream after forward to avoid
                             # unjoined stream error. The last layer's start_prefetch
                             # forks copy_stream, but wait_prefetch only happens in
                             # the next forward pass.
-                            offloader.join_after_forward()
+                            get_offloader().join_after_forward()
                         self.graphs[desc] = graph
         self._graphs_captured = True
 
@@ -273,25 +241,11 @@ class CudaGraphManager:
                 if _is_compatible(desc, num_reqs, num_tokens, uniform_token_count):
                     return desc
         return BatchExecutionDescriptor(
-            cg_mode=CUDAGraphMode.NONE,
-            num_tokens=num_tokens,
-            num_reqs=num_reqs,
+            cg_mode=CUDAGraphMode.NONE, num_tokens=num_tokens, num_reqs=num_reqs
         )
 
-    def run_fullgraph(
-        self,
-        desc: BatchExecutionDescriptor,
-        actual_num_tokens: int | None = None,
-    ):
-        """Replay a captured FULL cudagraph.
-
-        `actual_num_tokens` is the live unpadded token count (from
-        `scheduler_output.total_num_scheduled_tokens`). vLLM captures
-        the graph at `desc.num_tokens` (a padded bucket capacity) and
-        replays it for any live count up to that bucket. The native
-        COTS runner uses `actual_num_tokens` to avoid CPU GEMM work for
-        padded rows.
-        """
+    def run_fullgraph(self, desc: BatchExecutionDescriptor):
+        """Replay a captured FULL cudagraph."""
         assert desc.cg_mode == CUDAGraphMode.FULL, (
             f"Expected FULL mode, got {desc.cg_mode}"
         )
@@ -302,29 +256,8 @@ class CudaGraphManager:
         # H2D copies on copy_stream that the graph's captured events
         # cannot see. Without this, replay could overwrite static buffers
         # while those copies are still in flight.
-        # §1c.25 — diagnostic NVTX around FULL replay boundaries
-        # (latent on the v1 active runner path; only fires under the
-        # spec-decode / older runner that calls
-        # `cudagraph_manager.run_fullgraph`). Env-gated by
-        # VLLM_COTS_NVTX=1; production default skips the wrapper.
-        if not _COTS_NVTX_ENABLED:
-            _publish_offloader_dispatch(desc, actual_num_tokens)
-            self.graphs[desc].replay()
-            return
-        torch.cuda.nvtx.range_push("cots:replay_prep_full")
-        try:
-            # FULL graph replay bypasses the model-runner dispatch boundary
-            # on this older utility path. Publish the unified state here so
-            # native COTS resolves task slabs from the active dispatch rather
-            # than stale globals or tensor-shape inference.
-            _publish_offloader_dispatch(desc, actual_num_tokens)
-        finally:
-            torch.cuda.nvtx.range_pop()
-        torch.cuda.nvtx.range_push("cots:cudagraph_replay_full")
-        try:
-            self.graphs[desc].replay()
-        finally:
-            torch.cuda.nvtx.range_pop()
+        get_offloader().sync_prev_onload()
+        self.graphs[desc].replay()
 
 
 class ModelCudaGraphManager(CudaGraphManager):
@@ -394,11 +327,11 @@ class ModelCudaGraphManager(CudaGraphManager):
             )
 
             def forward_fn(cg_mode: CUDAGraphMode) -> None:
-                # Keep the decorated descriptor available even when this helper
-                # captures FULL graphs by asking the model to run with runtime
-                # mode NONE inside the outer torch.cuda.graph. Native COTS uses
-                # it to publish the active dispatch bucket out of graph.
-                batch_descriptor = _batch_descriptor_from_execution(desc)
+                batch_descriptor = (
+                    BatchDescriptor(num_tokens=num_tokens)
+                    if cg_mode == CUDAGraphMode.PIECEWISE
+                    else None
+                )
                 with set_forward_context(
                     attn_metadata if cg_mode != CUDAGraphMode.PIECEWISE else None,
                     self.vllm_config,
@@ -447,12 +380,10 @@ class ModelCudaGraphManager(CudaGraphManager):
         super().capture(create_forward_fn, progress_bar_desc)
 
     def run_fullgraph(
-        self,
-        desc: BatchExecutionDescriptor,
-        actual_num_tokens: int | None = None,
+        self, desc: BatchExecutionDescriptor
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | IntermediateTensors:
         """Replay a captured FULL cudagraph and return hidden states."""
-        super().run_fullgraph(desc, actual_num_tokens=actual_num_tokens)
+        super().run_fullgraph(desc)
         if not self.is_last_pp_rank:
             assert self.intermediate_tensors is not None
             return self.intermediate_tensors[: desc.num_tokens]

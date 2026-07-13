@@ -48,7 +48,6 @@ if TYPE_CHECKING:
     VLLM_COTS_COUNTERS: bool = False
     VLLM_COTS_NVTX: bool = False
     VLLM_COTS_DUMP_COUNTERS_ON_SHUTDOWN: bool = False
-    VLLM_COTS_DISPATCH_TRACE: bool = False
     VLLM_USE_FLASHINFER_SAMPLER: bool | None = None
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
@@ -708,8 +707,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_COTS_DUMP_COUNTERS_ON_SHUTDOWN": lambda: os.getenv(
         "VLLM_COTS_DUMP_COUNTERS_ON_SHUTDOWN", "0"
     )
-    == "1",
-    "VLLM_COTS_DISPATCH_TRACE": lambda: os.getenv("VLLM_COTS_DISPATCH_TRACE", "0")
     == "1",
     # If set, vllm will use flashinfer sampler
     "VLLM_USE_FLASHINFER_SAMPLER": lambda: bool(

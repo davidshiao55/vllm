@@ -5,9 +5,8 @@
 """Base classes for model parameter offloading."""
 
 from abc import ABC, abstractmethod
-from collections.abc import Generator, Mapping
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from collections.abc import Generator
+from typing import TYPE_CHECKING
 
 import torch.nn as nn
 
@@ -16,31 +15,6 @@ from vllm.logger import init_logger
 if TYPE_CHECKING:
     from vllm.config import OffloadConfig
     from vllm.forward_context import BatchDescriptor
-
-
-@dataclass(frozen=True)
-class ForwardDispatchInfo:
-    """All per-forward dispatch state the offloader needs, pushed OOG.
-
-    Single boundary between vLLM's model runner and the offloader so
-    future per-forward state can land here without another vLLM-side
-    call site. Pushed by `GPUModelRunner._publish_forward_dispatch`
-    on the active runner path, and by legacy cudagraph utilities when
-    they drive forwards directly.
-
-    - `batch_descriptor.num_tokens` is the padded forward shape / CUDA graph
-      replay capacity. It replaces the in-graph pre-hook's `anchor.shape[0]`
-      inference, which saturated to the persistent input-buffer size under FULL
-      CUDA Graph capture.
-    - `num_tokens_unpadded` is the live row count. Graph/slab sizes
-      remain bucket-capacity sized; offloaders may use this value to
-      avoid doing CPU work for padded rows.
-    """
-
-    batch_descriptor: "BatchDescriptor"
-    num_tokens_unpadded: int
-    trace_context: Mapping[str, Any] | None = None
-
 
 logger = init_logger(__name__)
 
@@ -90,35 +64,13 @@ class BaseOffloader(ABC):
         """
         return
 
-    def prepare_before_forward(self, num_tokens: int) -> None:  # noqa: B027
-        """Prepare offloader state for a model forward.
-
-        Called from eager pre-hooks and outside FULL CUDA graph capture/replay
-        so offloaders can repair runtime state that depends on the active
-        token bucket.
-        """
+    def on_dispatch(  # noqa: B027
+        self,
+        batch_descriptor: "BatchDescriptor",
+        num_tokens_unpadded: int,
+    ) -> None:
+        """Publish per-forward state to offloaders that require it."""
         pass
-
-    def set_live_num_tokens(self, live_num_tokens: int) -> None:  # noqa: B027
-        """Push the live (unpadded) token count to the offloader.
-
-        A CUDA graph bucket is a capacity, not a guarantee that every
-        row in the bucket is semantically live. Offloaders that execute
-        CPU work may use this value as a live-row cap while keeping
-        graph capture, slab allocation, and buffer sizing bucket-based.
-        """
-        pass
-
-    def on_dispatch(self, info: ForwardDispatchInfo) -> None:
-        """Single OOG entry point for all per-forward dispatch state.
-
-        Called before scheduler, profile dummy, warmup, CUDA Graph
-        capture, or CUDA Graph replay forwards. Default impl delegates to the
-        per-piece hooks so existing offloaders keep working unchanged.
-        """
-        self.prepare_before_forward(info.batch_descriptor.num_tokens)
-        self.sync_prev_onload()
-        self.set_live_num_tokens(info.num_tokens_unpadded)
 
     def shutdown(self) -> None:  # noqa: B027
         """Called from worker shutdown so offloaders can drain native

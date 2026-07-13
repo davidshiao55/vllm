@@ -24,7 +24,7 @@ from vllm.config.cots import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.offloader.base import BaseOffloader, ForwardDispatchInfo
+from vllm.model_executor.offloader.base import BaseOffloader
 from vllm.model_executor.offloader.cots_operators import (
     CotsQKVOp,
     CotsSwiGLUMLPOp,
@@ -52,6 +52,7 @@ from vllm.utils.platform_utils import is_pin_memory_available
 
 if TYPE_CHECKING:
     from vllm.config import CotsOffloadConfig
+    from vllm.forward_context import BatchDescriptor
 
 logger = init_logger(__name__)
 
@@ -898,27 +899,7 @@ class CotsOffloader(BaseOffloader):
 
     # --- BaseOffloader lifecycle delegation ---
 
-    def prepare_before_forward(self, num_tokens: int) -> None:
-        """Repair active-bucket state before a forward starts.
-
-        Always sets `_current_bucket` (plan §design-decision 11) so the
-        operator slab/closure lookup has a valid bucket regardless of
-        whether prefetch is active. Layer-0 slot repair and streamer
-        bucket mirroring run only when the option-A streamer exists.
-        Steady-state next-layer prefetches are
-        emitted inside each layer wrapper so FULL CUDA graph capture
-        records them as graph nodes rather than relying on replay-time
-        Python state.
-
-        Kept free of pybind calls so it can be used from graph-boundary helper
-        paths. The C++ runtime token row cap is pushed separately by
-        `on_dispatch`, outside captured graphs.
-        """
-        self._prepare_before_forward_bucket(
-            num_tokens, self._dispatch_bucket_for(num_tokens)
-        )
-
-    def set_live_num_tokens(self, live_num_tokens: int) -> None:
+    def _set_live_num_tokens(self, live_num_tokens: int) -> None:
         """Push the live unpadded token count to the C++ worker.
 
         CUDA graph buckets and native slabs are capacity-sized. This
@@ -937,40 +918,11 @@ class CotsOffloader(BaseOffloader):
 
         cots_ops.set_live_num_tokens(self._runner._runner_id, int(live_num_tokens))
 
-    def _log_dispatch_trace(
+    def on_dispatch(
         self,
-        info: ForwardDispatchInfo,
-        *,
-        num_tokens_padded: int,
+        batch_descriptor: BatchDescriptor,
         num_tokens_unpadded: int,
-        active_bucket: int,
     ) -> None:
-        if (
-            info.trace_context is None
-            or os.environ.get("VLLM_COTS_DISPATCH_TRACE", "0") != "1"
-        ):
-            return
-
-        f_cpu_compute, f_prefetch_compute = self._dispatch_table.get(
-            active_bucket, (0.0, 0.0)
-        )
-        payload = {
-            **dict(info.trace_context),
-            "event": "cots_dispatch_trace",
-            "pid": os.getpid(),
-            "num_tokens_padded": int(num_tokens_padded),
-            "num_tokens_unpadded": int(num_tokens_unpadded),
-            "cots_dispatch_bucket": int(active_bucket),
-            "dispatch_bucket_source": "num_tokens",
-            "f_cpu_store": float(self.f_cpu_store),
-            "f_cpu_compute": float(f_cpu_compute),
-            "f_prefetch_compute": float(f_prefetch_compute),
-            "has_cpu_compute_work": bool(self._has_cpu_compute_work),
-            "has_prefetch_buffer": bool(self._prefetch_buffer_pool is not None),
-        }
-        logger.info("COTS_DISPATCH_TRACE %s", json.dumps(payload, sort_keys=True))
-
-    def on_dispatch(self, info: ForwardDispatchInfo) -> None:
         """OOG per-forward entry. Owns ALL pre-forward state setup that
         was previously split between the in-graph pre-hook (bucket +
         slot repair) and the OOG live-token update. Single boundary for
@@ -978,7 +930,7 @@ class CotsOffloader(BaseOffloader):
         capture-time).
 
         Order matters:
-        1. `prepare_before_forward(num_tokens_padded)` — sets
+        1. `_prepare_before_forward_bucket(...)` — sets
             `_current_bucket`, mirrors streamer's bucket, runs layer-0
             slot repair (issues H2D on copy_stream). H2D is OOG so it
             isn't captured; each replay gets fresh repair.
@@ -988,19 +940,13 @@ class CotsOffloader(BaseOffloader):
             prefetch/scatter ops use it to resolve existing handle route tables.
         3. `sync_prev_onload()` — drains copy_stream into compute
             stream so the forward sees the filled slot.
-        4. `set_live_num_tokens(num_tokens_unpadded)` — live-row cap
+        4. `_set_live_num_tokens(num_tokens_unpadded)` — live-row cap
             pushed to the C++ worker. This is independent from task
             selection.
         """
-        num_tokens_padded = int(info.batch_descriptor.num_tokens)
-        num_tokens_unpadded = int(info.num_tokens_unpadded)
-        active_bucket = self._dispatch_bucket_from_descriptor(info.batch_descriptor)
-        self._log_dispatch_trace(
-            info,
-            num_tokens_padded=num_tokens_padded,
-            num_tokens_unpadded=num_tokens_unpadded,
-            active_bucket=active_bucket,
-        )
+        num_tokens_padded = int(batch_descriptor.num_tokens)
+        num_tokens_unpadded = int(num_tokens_unpadded)
+        active_bucket = self._dispatch_bucket_from_descriptor(batch_descriptor)
         self._prepare_before_forward_bucket(num_tokens_padded, active_bucket)
         if self._runner is not None:
             assert self._runner is not None
@@ -1009,7 +955,7 @@ class CotsOffloader(BaseOffloader):
         # CPU work scales with the semantic batch size, not bucket
         # capacity. Task selection is handled by the active dispatch
         # state above.
-        self.set_live_num_tokens(num_tokens_unpadded)
+        self._set_live_num_tokens(num_tokens_unpadded)
 
     def shutdown(self) -> None:
         """Drain and release the shared CPU runner at worker shutdown."""
