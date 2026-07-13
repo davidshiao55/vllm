@@ -4,10 +4,56 @@
 import pytest
 import torch
 
+from vllm.model_executor.offloader.cots_offloader import (
+    _hidden_states_arg_position,
+    _resolve_hidden_states_arg,
+)
 from vllm.model_executor.offloader.cots_operators import (
     _assert_prefetch_slot_ready,
 )
 from vllm.model_executor.offloader.cots_storage import CotsLinearHandle
+
+
+class _QwenStyleDecoderLayer(torch.nn.Module):
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        return hidden_states, residual
+
+
+class _UnnamedHiddenStatesLayer(torch.nn.Module):
+    def forward(
+        self,
+        positions: torch.Tensor,
+        activations: torch.Tensor,
+    ) -> torch.Tensor:
+        return activations
+
+
+def test_cots_prefetch_anchor_resolves_qwen_hidden_states() -> None:
+    layer = _QwenStyleDecoderLayer()
+    positions = torch.arange(4)
+    hidden_states = torch.randn(4, 8)
+    residual = torch.randn(4, 8)
+
+    position = _hidden_states_arg_position(layer.forward)
+    anchor = _resolve_hidden_states_arg(
+        (positions, hidden_states, residual), {}, position, layer
+    )
+
+    assert position == 1
+    assert anchor is hidden_states
+    assert anchor is not positions
+
+
+def test_cots_prefetch_anchor_requires_named_hidden_states() -> None:
+    layer = _UnnamedHiddenStatesLayer()
+
+    with pytest.raises(ValueError, match="expose a hidden_states argument"):
+        _hidden_states_arg_position(layer.forward)
 
 
 def _stale_prefetch_handle() -> CotsLinearHandle:

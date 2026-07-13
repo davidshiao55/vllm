@@ -51,18 +51,6 @@ def _assert_prefetch_slot_ready(
     )
 
 
-def _prefetch_slot_guard(
-    h: CotsLinearHandle,
-    offloader: CotsOffloader,
-    dummy_idx: int,
-) -> torch.Tensor:
-    if h.prefetch_slot_guards:
-        return h.prefetch_slot_guards[h.slot_idx]
-    if len(offloader._dummy_prefetch_slot_guards) <= dummy_idx:
-        raise RuntimeError("COTS prefetch guard dummies were not allocated")
-    return offloader._dummy_prefetch_slot_guards[dummy_idx]
-
-
 class CotsOutputSplitLinearOp:
     """Patched `quant_method.apply` for output-split linears.
 
@@ -144,7 +132,6 @@ class CotsOutputSplitLinearOp:
         # the copy stream's H2D.
         out_pref = torch.ops.vllm.cots_prefetch_linear(
             x,
-            _prefetch_slot_guard(h, offloader, 0),
             runner_id,
             int(h.layer_idx),
             cots_ops.op_kind_code(self._op_kind),
@@ -330,8 +317,6 @@ class CotsSwiGLUMLPOp:
         out_gpu = torch.ops.vllm.cots_mlp_prefetch_add(
             x,
             out_gpu,
-            _prefetch_slot_guard(gu_h, offloader, 0),
-            _prefetch_slot_guard(dn_h, offloader, 1),
             runner_id,
             int(gu_h.layer_idx),
             cots_ops.op_kind_code("mlp_block"),

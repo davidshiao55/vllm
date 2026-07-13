@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 from collections.abc import Callable, Generator, Sequence
@@ -14,8 +15,7 @@ import torch.nn as nn
 from cots.dispatch_buckets import cots_default_dispatch_buckets
 from cots.snap import COTS_SNAP_MODEL, qkvo_output_granularity
 
-# Register prefetch custom ops. COTS uses generic wait_prefetch plus
-# COTS-specific guarded start/consumer ops for hidden prefetch-slot aliases.
+# Register prefetch custom ops; COTS reuses generic wait/start prefetch ops.
 import vllm.model_executor.offloader.cots_ops  # noqa: F401
 import vllm.model_executor.offloader.prefetch_ops  # noqa: F401
 from vllm.config.cots import (
@@ -54,6 +54,56 @@ if TYPE_CHECKING:
     from vllm.config import CotsOffloadConfig
 
 logger = init_logger(__name__)
+
+
+def _hidden_states_arg_position(forward: Callable[..., object]) -> int | None:
+    """Return the positional index for a decoder layer's hidden states."""
+    parameters = tuple(inspect.signature(forward).parameters.values())
+    hidden_states = next(
+        (parameter for parameter in parameters if parameter.name == "hidden_states"),
+        None,
+    )
+    if hidden_states is None:
+        raise ValueError(
+            "COTS requires decoder layer forward to expose a hidden_states argument"
+        )
+    if hidden_states.kind == inspect.Parameter.KEYWORD_ONLY:
+        return None
+    if hidden_states.kind not in (
+        inspect.Parameter.POSITIONAL_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    ):
+        raise ValueError(
+            "COTS requires hidden_states to be a positional or keyword argument"
+        )
+    positional_names = [
+        parameter.name
+        for parameter in parameters
+        if parameter.kind
+        in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    ]
+    return positional_names.index("hidden_states")
+
+
+def _resolve_hidden_states_arg(
+    args: Sequence[object],
+    kwargs: dict[str, object],
+    position: int | None,
+    layer: nn.Module,
+) -> torch.Tensor:
+    hidden_states = kwargs.get("hidden_states")
+    if hidden_states is None and position is not None and len(args) > position:
+        hidden_states = args[position]
+    if not isinstance(hidden_states, torch.Tensor):
+        raise RuntimeError(
+            "COTS prefetch could not resolve tensor argument 'hidden_states' "
+            f"for {type(layer).__name__}.forward"
+        )
+    return hidden_states
+
 
 LINEAR_OP_KIND_BY_ROLE = {
     QKV_ROLE: "qkv",
@@ -159,9 +209,6 @@ class CotsOffloader(BaseOffloader):
         # (phase1a_findings.md §1.5).
         self._dummy_gpu_anchor_a: torch.Tensor | None = None
         self._dummy_gpu_anchor_b: torch.Tensor | None = None
-        # Distinct fallback guards for COTS prefetch custom-op schemas. Real
-        # prefetch handles pass per-slot guards; these fill unused guard slots.
-        self._dummy_prefetch_slot_guards: tuple[torch.Tensor, ...] = ()
 
     # ------------------------------------------------------------------
     # Lifecycle: wrap_modules → (weight loading) → post_init.
@@ -218,8 +265,6 @@ class CotsOffloader(BaseOffloader):
         for h in self._handles:
             h.apply_prefetch_split_per_bucket(self._dispatch_table)
         self._has_cpu_compute_work = self._compute_has_cpu_compute_work()
-        if self._handles:
-            self._allocate_prefetch_slot_guard_dummies()
 
         # Allocate shared CPU-compute buffers only when some bucket actually
         # leaves rows on the CPU-compute path. Pure-prefetch configurations
@@ -794,6 +839,10 @@ class CotsOffloader(BaseOffloader):
         original_forward = layer.forward
         n_layers = len(self._layer_modules)
 
+        # Qwen passes positions first; only hidden_states carries the previous
+        # layer's completion dependency needed for safe K=2 slot reuse.
+        hidden_states_position = _hidden_states_arg_position(original_forward)
+
         layer_has_prefetch = any(
             h.max_n_prefetch > 0 for h in self._layer_handles[index]
         )
@@ -803,48 +852,21 @@ class CotsOffloader(BaseOffloader):
             and next_idx != index
             and any(h.max_n_prefetch > 0 for h in self._layer_handles[next_idx])
         )
-        next_prefetch_guards = (
-            self._prefetch_slot_guards_for_layer(next_idx) if next_has_prefetch else ()
-        )
 
         def forward(*args, **kwargs):
             layer.forward = original_forward
-            anchor = args[0] if args else next(iter(kwargs.values()))
+            anchor = _resolve_hidden_states_arg(
+                args, kwargs, hidden_states_position, layer
+            )
             if layer_has_prefetch:
                 torch.ops.vllm.wait_prefetch(anchor, index)
             if next_has_prefetch:
-                torch.ops.vllm.cots_start_prefetch(
-                    anchor, *next_prefetch_guards, next_idx
-                )
+                torch.ops.vllm.start_prefetch(anchor, next_idx)
             output = original_forward(*args, **kwargs)
             layer.forward = forward
             return output
 
         layer.forward = forward
-
-    def _prefetch_slot_guards_for_layer(
-        self, layer_idx: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        guards: list[torch.Tensor] = []
-        seen: set[int] = set()
-        for h in self._layer_handles[layer_idx]:
-            if h.max_n_prefetch <= 0 or not h.prefetch_slot_guards:
-                continue
-            guard = h.prefetch_slot_guards[h.slot_idx]
-            key = id(guard)
-            if key in seen:
-                continue
-            guards.append(guard)
-            seen.add(key)
-        if len(guards) > 4:
-            raise RuntimeError(
-                "COTS guarded prefetch supports at most four distinct slot "
-                f"guards per layer, got {len(guards)} for layer {layer_idx}"
-            )
-        if len(self._dummy_prefetch_slot_guards) < 4:
-            raise RuntimeError("COTS prefetch guard dummies were not allocated")
-        guards.extend(self._dummy_prefetch_slot_guards[len(guards) : 4])
-        return guards[0], guards[1], guards[2], guards[3]
 
     def _dispatch_bucket_for(self, num_tokens: int) -> int:
         """Round-up lookup on `_dispatch_buckets`.
@@ -1090,14 +1112,6 @@ class CotsOffloader(BaseOffloader):
             )
 
     # --- Activation buffer allocation ---
-
-    def _allocate_prefetch_slot_guard_dummies(self) -> None:
-        if self._dummy_prefetch_slot_guards:
-            return
-        device = torch.device("cuda")
-        self._dummy_prefetch_slot_guards = tuple(
-            torch.empty((), dtype=torch.int32, device=device) for _ in range(4)
-        )
 
     def _allocate_activation_buffers(self) -> None:
         """Allocate `_x_pinned`, `_y_pinned`, `_y_gpu` sized to the worst-case

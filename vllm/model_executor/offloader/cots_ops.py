@@ -27,12 +27,6 @@ ordering between submit, GPU GEMMs, sync, and UVA copy.
       The impl reaches the slab's pinned output via
       `CotsWeightTaskRunner.y_pinned_view(task_id, bucket)`.
 
-  * vllm.cots_start_prefetch(anchor, guard0, guard1, guard2, guard3, layer_idx)
-      mutates_args=["anchor", "guard0", "guard1", "guard2", "guard3"]
-      `anchor` preserves the layer-forward scheduling edge. The guard tensors
-      are one-token aliases for the physical COTS prefetch slots this start
-      may write, making the hidden slot lifetime visible to torch.compile.
-
 These ops accept ONLY CUDA tensors and scalar ids — no CPU tensor
 arguments. Inductor's functionalization on captured graphs
 materializes any CPU view it sees (in the worst case via a GPU
@@ -609,41 +603,14 @@ def _check_prefetch_slot_ready(handle: Any, required_rows: int, op_name: str) ->
         )
 
 
-def _cots_start_prefetch_impl(
-    anchor: torch.Tensor,
-    guard0: torch.Tensor,
-    guard1: torch.Tensor,
-    guard2: torch.Tensor,
-    guard3: torch.Tensor,
-    layer_idx: int,
-) -> None:
-    del anchor, guard0, guard1, guard2, guard3
-    from vllm.model_executor.offloader.base import get_offloader
-
-    get_offloader()._start_prefetch(layer_idx)
-
-
-def _cots_start_prefetch_fake(
-    anchor: torch.Tensor,
-    guard0: torch.Tensor,
-    guard1: torch.Tensor,
-    guard2: torch.Tensor,
-    guard3: torch.Tensor,
-    layer_idx: int,
-) -> None:
-    return
-
-
 def _cots_prefetch_linear_impl(
     x_gpu: torch.Tensor,
-    slot_guard: torch.Tensor,
     runner_id: int,
     layer_idx: int,
     op_kind_code: int,
     max_n_prefetch: int,
     enabled: bool,
 ) -> torch.Tensor:
-    del slot_guard
     if not enabled:
         return x_gpu.new_empty((x_gpu.shape[0], int(max_n_prefetch)))
     handle, op_kind, bucket = _require_route(
@@ -667,14 +634,13 @@ def _cots_prefetch_linear_impl(
 
 def _cots_prefetch_linear_fake(
     x_gpu: torch.Tensor,
-    slot_guard: torch.Tensor,
     runner_id: int,
     layer_idx: int,
     op_kind_code: int,
     max_n_prefetch: int,
     enabled: bool,
 ) -> torch.Tensor:
-    del slot_guard, runner_id, layer_idx, op_kind_code, enabled
+    del runner_id, layer_idx, op_kind_code, enabled
     return x_gpu.new_empty((x_gpu.shape[0], int(max_n_prefetch)))
 
 
@@ -748,15 +714,12 @@ def _cots_scatter_col_outputs_fake(
 def _cots_mlp_prefetch_add_impl(
     x_gpu: torch.Tensor,
     out_base: torch.Tensor,
-    gu_slot_guard: torch.Tensor,
-    dn_slot_guard: torch.Tensor,
     runner_id: int,
     layer_idx: int,
     op_kind_code: int,
     has_base_gpu: bool,
     enabled: bool,
 ) -> torch.Tensor:
-    del gu_slot_guard, dn_slot_guard
     if not enabled:
         return out_base
     fused_op, op_kind, bucket = _require_route(
@@ -785,16 +748,13 @@ def _cots_mlp_prefetch_add_impl(
 def _cots_mlp_prefetch_add_fake(
     x_gpu: torch.Tensor,
     out_base: torch.Tensor,
-    gu_slot_guard: torch.Tensor,
-    dn_slot_guard: torch.Tensor,
     runner_id: int,
     layer_idx: int,
     op_kind_code: int,
     has_base_gpu: bool,
     enabled: bool,
 ) -> torch.Tensor:
-    del x_gpu, gu_slot_guard, dn_slot_guard
-    del runner_id, layer_idx, op_kind_code, has_base_gpu, enabled
+    del x_gpu, runner_id, layer_idx, op_kind_code, has_base_gpu, enabled
     return torch.empty_like(out_base)
 
 
@@ -875,17 +835,8 @@ def register_cots_offloader_ops() -> None:
         fake_impl=_cots_sync_then_uva_fake,
     )
     direct_register_custom_op(
-        op_name="cots_start_prefetch",
-        op_func=_cots_start_prefetch_impl,
-        # Guard tensors are per physical COTS prefetch slot. Mutating them makes
-        # producer/consumer aliasing visible without exposing weight slot data.
-        mutates_args=["anchor", "guard0", "guard1", "guard2", "guard3"],
-        fake_impl=_cots_start_prefetch_fake,
-    )
-    direct_register_custom_op(
         op_name="cots_prefetch_linear",
         op_func=_cots_prefetch_linear_impl,
-        mutates_args=["slot_guard"],
         fake_impl=_cots_prefetch_linear_fake,
     )
     direct_register_custom_op(
@@ -896,7 +847,6 @@ def register_cots_offloader_ops() -> None:
     direct_register_custom_op(
         op_name="cots_mlp_prefetch_add",
         op_func=_cots_mlp_prefetch_add_impl,
-        mutates_args=["gu_slot_guard", "dn_slot_guard"],
         fake_impl=_cots_mlp_prefetch_add_fake,
     )
     direct_register_custom_op(
