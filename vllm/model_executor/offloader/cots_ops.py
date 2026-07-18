@@ -720,8 +720,10 @@ def _cots_mlp_prefetch_add_impl(
     has_base_gpu: bool,
     enabled: bool,
 ) -> torch.Tensor:
+    # Functional custom ops must return fresh outputs matching their fake impl;
+    # aliasing an input can corrupt Inductor's planned buffer reuse.
     if not enabled:
-        return out_base
+        return out_base.clone()
     fused_op, op_kind, bucket = _require_route(
         runner_id, layer_idx, op_kind_code, "cots_mlp_prefetch_add"
     )
@@ -732,7 +734,7 @@ def _cots_mlp_prefetch_add_impl(
     gu_n_pref = int(gu_h.n_prefetch_by_bucket.get(bucket, 0))
     dn_n_pref = int(dn_h.n_prefetch_by_bucket.get(bucket, 0))
     if gu_n_pref <= 0 or dn_n_pref <= 0:
-        return out_base
+        return out_base.clone()
     _check_prefetch_slot_ready(gu_h, gu_n_pref // 2, "cots_mlp_prefetch_add")
     _check_prefetch_slot_ready(dn_h, dn_n_pref, "cots_mlp_prefetch_add")
     gu_slot = gu_h.w_prefetch_slots[gu_h.slot_idx]
@@ -768,8 +770,9 @@ def _cots_mlp_merge_cpu_impl(
     enable_prefetch: bool,
     enable_cpu: bool,
 ) -> torch.Tensor:
+    # Match the functional custom-op contract on every runtime bucket.
     if not enable_cpu:
-        return out_gpu
+        return out_gpu.clone()
     fused_op, op_kind, bucket = _require_route(
         runner_id, layer_idx, op_kind_code, "cots_mlp_merge_cpu"
     )
@@ -778,7 +781,7 @@ def _cots_mlp_merge_cpu_impl(
     dn_h = fused_op._down
     n_cpu = int(dn_h.n_cpu_compute_by_bucket.get(bucket, dn_h.n_cpu))
     if n_cpu <= 0:
-        return out_gpu
+        return out_gpu.clone()
     rows = int(out_gpu.shape[0])
     out_dim = int(fused_op._out_dim)
     cpu_src = out_cpu_flat.narrow(0, 0, rows * out_dim).view(rows, out_dim)
