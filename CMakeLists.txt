@@ -1003,7 +1003,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
 endif()
 
 #
-# _cots_C extension (COTS native weight task runner)
+# _hybrid_C extension (Hybrid native weight task runner)
 #
 # CUDA-targeted extension: host-side task runners and CPU weight kernels.
 # Exposes stateful pybind11 classes, so we intentionally do NOT use USE_SABI 3
@@ -1017,36 +1017,36 @@ endif()
 # See docs/implementation_roadmap.md Phase 1c.
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
-  set(VLLM_COTS_CPU_KERNEL_SRC
-    "csrc/cots/bf16_gemm_transposed.cpp"
-    "csrc/cots/bf16_gemm_natural.cpp"
-    "csrc/cots/bf16_mlp_gate_up_silu.cpp")
+  set(VLLM_HYBRID_CPU_KERNEL_SRC
+    "csrc/hybrid/bf16_gemm_transposed.cpp"
+    "csrc/hybrid/bf16_gemm_natural.cpp"
+    "csrc/hybrid/bf16_mlp_gate_up_silu.cpp")
 
-  set(VLLM_COTS_EXT_SRC
-    "csrc/cots/task_queue.cpp"
-    "csrc/cots/cots_weight_task_runner.cpp"
-    "csrc/cots/cots_torch_bindings.cpp"
-    ${VLLM_COTS_CPU_KERNEL_SRC})
+  set(VLLM_HYBRID_EXT_SRC
+    "csrc/hybrid/task_queue.cpp"
+    "csrc/hybrid/hybrid_weight_task_runner.cpp"
+    "csrc/hybrid/hybrid_torch_bindings.cpp"
+    ${VLLM_HYBRID_CPU_KERNEL_SRC})
 
   include(CheckCXXCompilerFlag)
-  check_cxx_compiler_flag("-mavx2" VLLM_COTS_COMPILER_HAS_MAVX2)
-  check_cxx_compiler_flag("-mfma" VLLM_COTS_COMPILER_HAS_MFMA)
-  if(NOT VLLM_COTS_COMPILER_HAS_MAVX2 OR NOT VLLM_COTS_COMPILER_HAS_MFMA)
+  check_cxx_compiler_flag("-mavx2" VLLM_HYBRID_COMPILER_HAS_MAVX2)
+  check_cxx_compiler_flag("-mfma" VLLM_HYBRID_COMPILER_HAS_MFMA)
+  if(NOT VLLM_HYBRID_COMPILER_HAS_MAVX2 OR NOT VLLM_HYBRID_COMPILER_HAS_MFMA)
     message(FATAL_ERROR
-      "COTS Stage 7 BF16 kernels require compiler support for -mavx2 and -mfma")
+      "Hybrid Stage 7 BF16 kernels require compiler support for -mavx2 and -mfma")
   endif()
 
   # -fopenmp makes ATen's inline parallel_for route through its OpenMP
   # backend. Without it these translation units silently execute serially.
-  set_source_files_properties(${VLLM_COTS_CPU_KERNEL_SRC}
+  set_source_files_properties(${VLLM_HYBRID_CPU_KERNEL_SRC}
     PROPERTIES COMPILE_FLAGS "-mavx2 -mfma -fopenmp")
 
-  message(STATUS "Enabling cots_C extension.")
+  message(STATUS "Enabling hybrid_C extension.")
   define_extension_target(
-    _cots_C
+    _hybrid_C
     DESTINATION vllm
     LANGUAGE ${VLLM_GPU_LANG}
-    SOURCES ${VLLM_COTS_EXT_SRC}
+    SOURCES ${VLLM_HYBRID_EXT_SRC}
     COMPILE_FLAGS ${VLLM_GPU_FLAGS}
     LIBRARIES CUDA::cudart
     WITH_SOABI)
@@ -1059,7 +1059,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   find_library(TORCH_PYTHON_LIBRARY torch_python
                PATHS "${TORCH_INSTALL_PREFIX}/lib"
                NO_DEFAULT_PATH REQUIRED)
-  target_link_libraries(_cots_C PRIVATE "${TORCH_PYTHON_LIBRARY}")
+  target_link_libraries(_hybrid_C PRIVATE "${TORCH_PYTHON_LIBRARY}")
 endif()
 
 #

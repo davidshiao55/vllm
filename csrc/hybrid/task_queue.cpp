@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
 // Direct port of KTransformers `kt-kernel/cpu_backend/task_queue.cpp`,
-// adapted into vllm::cots and renamed to plan-aligned identifiers.
+// adapted into vllm::hybrid and renamed to plan-aligned identifiers.
 // One worker thread, MPSC linked list with head/tail atomics + a guard
 // mutex/condvar for sleep/wake. Phase 1c host-callback design relies on
 // (a) `enqueue` being lock-free fast path on the producer side and
@@ -16,7 +16,7 @@
 #include <utility>
 
 namespace vllm {
-namespace cots {
+namespace hybrid {
 
 TaskQueue::TaskQueue() : done_(false), pending_(0) {
   Node* dummy = new Node();
@@ -64,7 +64,7 @@ void TaskQueue::sync(size_t allow_n_pending) {
 
 void TaskQueue::Worker() {
   // Visible in `top -H`, `htop`, and Nsight Systems traces.
-  pthread_setname_np(pthread_self(), "cots-cpu-wkr");
+  pthread_setname_np(pthread_self(), "hybrid-cpu-wkr");
 
   Node* curr = head_.load(std::memory_order_relaxed);
   while (!done_.load(std::memory_order_acquire)) {
@@ -74,9 +74,9 @@ void TaskQueue::Worker() {
         // Task body is responsible for its own try/catch; if it throws,
         // we still need to decrement pending and notify cv_ so that
         // sync() doesn't deadlock. The slab dispatcher in
-        // cots_weight_task_runner.cpp wraps every task in try/catch and stores
-        // the error into CotsWeightTaskRunner state instead of letting it
-        // propagate here.
+        // hybrid_weight_task_runner.cpp wraps every task in try/catch and
+        // stores the error into HybridWeightTaskRunner state instead of letting
+        // it propagate here.
         next->task();
       }
       delete curr;
@@ -97,5 +97,5 @@ void TaskQueue::Worker() {
   }
 }
 
-}  // namespace cots
+}  // namespace hybrid
 }  // namespace vllm

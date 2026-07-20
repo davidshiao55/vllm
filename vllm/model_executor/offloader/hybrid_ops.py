@@ -1,31 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Custom ops for the COTS native weight task runner.
+"""Custom ops for the Hybrid native weight task runner.
 
-Mirrors `prefetch_ops.py`'s pattern: registers COTS ops via
+Mirrors `prefetch_ops.py`'s pattern: registers Hybrid ops via
 `direct_register_custom_op` (which lands them under `torch.ops.vllm.*`).
 The CPU submit/sync ops use `mutates_args` to declare barrier-installing
 dependencies so torch.compile / CUDA graph capture preserve the overlap
 ordering between submit, GPU GEMMs, sync, and UVA copy.
 
-  * vllm.cots_submit_gemm(x_gpu, runner_id, layer_idx, op_kind_code)
+  * vllm.hybrid_submit_gemm(x_gpu, runner_id, layer_idx, op_kind_code)
       mutates_args=["x_gpu"]
       x_gpu mutated → pins submit BEFORE every GPU GEMM that reads
       x_gpu, AND provides the (submit → sync) edge consumed by
-      cots_sync_then_uva's `submit_anchor` read. The C++ impl
+      hybrid_sync_then_uva's `submit_anchor` read. The C++ impl
       resolves the current dispatch bucket from OOG runner state,
       resolves the slab task_id from (layer_idx, bucket, op_kind),
       then bundles `cudaMemcpyAsync(D2H)` from x_gpu to
       slab.x_pinned_ptr with the host-callback enqueue.
 
-  * vllm.cots_sync_then_uva(y_gpu, gpu_anchor_a, gpu_anchor_b,
+  * vllm.hybrid_sync_then_uva(y_gpu, gpu_anchor_a, gpu_anchor_b,
                             submit_anchor, runner_id, layer_idx,
                             op_kind_code)
       mutates_args=["y_gpu", "gpu_anchor_a", "gpu_anchor_b"]
       `gpu_anchor_a/_b` pin sync AFTER each independent GPU GEMM.
       `submit_anchor` (read-only, == x_gpu) pins sync AFTER submit.
       The impl reaches the slab's pinned output via
-      `CotsWeightTaskRunner.y_pinned_view(task_id, bucket)`.
+      `HybridWeightTaskRunner.y_pinned_view(task_id, bucket)`.
 
 These ops accept ONLY CUDA tensors and scalar ids — no CPU tensor
 arguments. Inductor's functionalization on captured graphs
@@ -34,8 +34,8 @@ intermediate + blocking GPU→CPU copy that CUDA Graph capture
 rejects with cudaErrorStreamCaptureUnsupported), so the design
 keeps pinned-buffer addresses entirely on the C++ side.
 
-The registry stores the `CotsWeightTaskRunner` pybind handle directly by
-runner_id, not a `NativeCotsWeightRunner` instance. The compile-visible runner
+The registry stores the `HybridWeightTaskRunner` pybind handle directly by
+runner_id, not a `NativeHybridWeightRunner` instance. The compile-visible runner
 is a thin facade with only pickleable state; the unpicklable C++ handle lives
 here.
 """
@@ -48,30 +48,30 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from vllm.utils.cots_diag import (
-    COUNTERS_ENABLED as _COTS_COUNTERS_ENABLED,
+from vllm.utils.hybrid_diag import (
+    COUNTERS_ENABLED as _HYBRID_COUNTERS_ENABLED,
 )
-from vllm.utils.cots_diag import (
-    NVTX_ENABLED as _COTS_NVTX_ENABLED,
+from vllm.utils.hybrid_diag import (
+    NVTX_ENABLED as _HYBRID_NVTX_ENABLED,
 )
 from vllm.utils.torch_utils import direct_register_custom_op
 
 if TYPE_CHECKING:
-    # Type-only import; avoids forcing _cots_C at module load on
+    # Type-only import; avoids forcing _hybrid_C at module load on
     # non-CUDA builds.
-    from vllm import _cots_C  # noqa: F401
+    from vllm import _hybrid_C  # noqa: F401
 
 # Module-private runner registry. Strong refs (NOT weak) — the registry
-# IS the storage for the `CotsWeightTaskRunner` instance. NativeCotsWeightRunner's
+# IS the storage for the `HybridWeightTaskRunner` instance. NativeHybridWeightRunner's
 # `__del__` / `close()` is the only thing that removes entries; if a
 # runner is GC'd without close() the __del__ unregisters there.
-_COTS_WEIGHT_RUNNERS: dict[int, Any] = {}
-_COTS_WEIGHT_ACTIVE_DISPATCH: dict[int, tuple[int, int]] = {}
-_COTS_WEIGHT_TASK_ID_FOR: dict[int, dict[tuple[int, int, str], int]] = {}
-_COTS_WEIGHT_ROUTE_FOR: dict[int, dict[tuple[int, str], Any]] = {}
+_HYBRID_WEIGHT_RUNNERS: dict[int, Any] = {}
+_HYBRID_WEIGHT_ACTIVE_DISPATCH: dict[int, tuple[int, int]] = {}
+_HYBRID_WEIGHT_TASK_ID_FOR: dict[int, dict[tuple[int, int, str], int]] = {}
+_HYBRID_WEIGHT_ROUTE_FOR: dict[int, dict[tuple[int, str], Any]] = {}
 _NEXT_WEIGHT_RUNNER_ID = itertools.count(1)
-_COTS_PY_COUNTERS: dict[str, int] = {}
-_COTS_PY_COUNTER_LOCK = threading.Lock()
+_HYBRID_PY_COUNTERS: dict[str, int] = {}
+_HYBRID_PY_COUNTER_LOCK = threading.Lock()
 
 _OP_KIND_TO_CODE: dict[str, int] = {
     "qkv": 1,
@@ -86,24 +86,24 @@ def op_kind_code(op_kind: str) -> int:
     try:
         return _OP_KIND_TO_CODE[op_kind]
     except KeyError as e:
-        raise ValueError(f"unknown COTS op_kind {op_kind!r}") from e
+        raise ValueError(f"unknown Hybrid op_kind {op_kind!r}") from e
 
 
 def register_weight_runner(runner: Any) -> int:
-    """Register a `CotsWeightTaskRunner` instance and return a fresh runner_id.
+    """Register a `HybridWeightTaskRunner` instance and return a fresh runner_id.
     The registry takes ownership of the strong reference; the caller
     should retain only the runner_id."""
     rid = next(_NEXT_WEIGHT_RUNNER_ID)
-    _COTS_WEIGHT_RUNNERS[rid] = runner
+    _HYBRID_WEIGHT_RUNNERS[rid] = runner
     return rid
 
 
 def unregister_weight_runner(runner_id: int) -> None:
     """Drop the registry entry for a runner. Idempotent."""
-    _COTS_WEIGHT_RUNNERS.pop(runner_id, None)
-    _COTS_WEIGHT_ACTIVE_DISPATCH.pop(runner_id, None)
-    _COTS_WEIGHT_TASK_ID_FOR.pop(runner_id, None)
-    _COTS_WEIGHT_ROUTE_FOR.pop(runner_id, None)
+    _HYBRID_WEIGHT_RUNNERS.pop(runner_id, None)
+    _HYBRID_WEIGHT_ACTIVE_DISPATCH.pop(runner_id, None)
+    _HYBRID_WEIGHT_TASK_ID_FOR.pop(runner_id, None)
+    _HYBRID_WEIGHT_ROUTE_FOR.pop(runner_id, None)
 
 
 def register_weight_task_id_map(
@@ -111,7 +111,7 @@ def register_weight_task_id_map(
     task_id_for: dict[tuple[int, int, str], int],
 ) -> None:
     """Publish the install-time slab map used by custom op dispatch."""
-    _COTS_WEIGHT_TASK_ID_FOR[int(runner_id)] = dict(task_id_for)
+    _HYBRID_WEIGHT_TASK_ID_FOR[int(runner_id)] = dict(task_id_for)
 
 
 def register_weight_route(
@@ -121,7 +121,7 @@ def register_weight_route(
     op_kind: str,
     route: Any,
 ) -> None:
-    """Publish the existing COTS handle/fused-op route for custom ops.
+    """Publish the existing Hybrid handle/fused-op route for custom ops.
 
     The route object is intentionally the existing Python object owned by the
     offloader. It keeps per-bucket fields such as n_prefetch_by_bucket,
@@ -129,7 +129,7 @@ def register_weight_route(
     boundary without duplicating the routing table in C++.
     """
 
-    _COTS_WEIGHT_ROUTE_FOR.setdefault(int(runner_id), {})[
+    _HYBRID_WEIGHT_ROUTE_FOR.setdefault(int(runner_id), {})[
         (int(layer_idx), str(op_kind))
     ] = route
 
@@ -140,9 +140,9 @@ def set_active_weight_dispatch_state(
     bucket: int,
     live_num_tokens: int,
 ) -> None:
-    """Publish the authoritative per-forward COTS dispatch state.
+    """Publish the authoritative per-forward Hybrid dispatch state.
 
-    Called outside the compiled forward by `CotsOffloader.on_dispatch`.
+    Called outside the compiled forward by `HybridOffloader.on_dispatch`.
     Native custom ops read this state at eager execution / CUDA Graph
     capture time and resolve slab task_ids from it. This keeps bucket
     and task selection out of compile-visible scalar arguments.
@@ -150,21 +150,22 @@ def set_active_weight_dispatch_state(
     bucket = int(bucket)
     live_num_tokens = int(live_num_tokens)
     if bucket <= 0:
-        raise ValueError(f"active COTS dispatch bucket must be > 0, got {bucket}")
+        raise ValueError(f"active Hybrid dispatch bucket must be > 0, got {bucket}")
     if live_num_tokens < 0:
         raise ValueError(
-            f"active COTS dispatch live_num_tokens must be >= 0, got {live_num_tokens}"
+            "active Hybrid dispatch live_num_tokens must be >= 0, "
+            f"got {live_num_tokens}"
         )
-    _COTS_WEIGHT_ACTIVE_DISPATCH[int(runner_id)] = (bucket, live_num_tokens)
+    _HYBRID_WEIGHT_ACTIVE_DISPATCH[int(runner_id)] = (bucket, live_num_tokens)
 
 
 def _active_dispatch_state(runner_id: int, op_name: str) -> tuple[int, int]:
     runner_id = int(runner_id)
-    state = _COTS_WEIGHT_ACTIVE_DISPATCH.get(runner_id)
+    state = _HYBRID_WEIGHT_ACTIVE_DISPATCH.get(runner_id)
     if state is None:
         raise RuntimeError(
-            f"{op_name}: no active COTS dispatch state for runner_id={runner_id}. "
-            "CotsOffloader.on_dispatch must publish the BatchDescriptor bucket "
+            f"{op_name}: no active Hybrid dispatch state for runner_id={runner_id}. "
+            "HybridOffloader.on_dispatch must publish the BatchDescriptor bucket "
             "before native custom ops execute or capture."
         )
     bucket, live_num_tokens = state
@@ -188,7 +189,7 @@ def _lookup_route(
 ) -> tuple[Any | None, str]:
     runner_id = int(runner_id)
     op_kind = _op_kind_from_code(op_kind_code, op_name, runner_id)
-    route_for = _COTS_WEIGHT_ROUTE_FOR.get(runner_id)
+    route_for = _HYBRID_WEIGHT_ROUTE_FOR.get(runner_id)
     if route_for is None:
         return None, op_kind
     return route_for.get((int(layer_idx), op_kind)), op_kind
@@ -225,11 +226,11 @@ def _resolve_task_for_dispatch(
     runner_id = int(runner_id)
     bucket, live_num_tokens = _active_dispatch_state(runner_id, op_name)
     op_kind = _op_kind_from_code(op_kind_code, op_name, runner_id)
-    task_id_for = _COTS_WEIGHT_TASK_ID_FOR.get(runner_id)
+    task_id_for = _HYBRID_WEIGHT_TASK_ID_FOR.get(runner_id)
     if task_id_for is None:
         raise RuntimeError(
             f"{op_name}: runner_id={runner_id} has no task_id map; "
-            "NativeCotsWeightRunner.install() must complete before dispatch."
+            "NativeHybridWeightRunner.install() must complete before dispatch."
         )
     key = (int(layer_idx), int(bucket), op_kind)
     task_id = task_id_for.get(key)
@@ -240,7 +241,7 @@ def _resolve_task_for_dispatch(
             if layer == int(layer_idx) and kind == op_kind
         )
         raise RuntimeError(
-            f"{op_name}: no native COTS slab for key={key}; available buckets "
+            f"{op_name}: no native Hybrid slab for key={key}; available buckets "
             f"for layer={int(layer_idx)}, op_kind={op_kind!r}: {available}. "
             "The resolved task bucket must come from the OOG dispatch state."
         )
@@ -266,14 +267,14 @@ def _bounded_transfer_rows(bucket: int, tensor_rows: int, op_name: str) -> int:
 
 
 def lookup_weight_runner(runner_id: int, op_name: str) -> Any:
-    """Resolve runner_id → `CotsWeightTaskRunner` instance. Raises a clear
+    """Resolve runner_id → `HybridWeightTaskRunner` instance. Raises a clear
     error if the runner was already torn down."""
-    runner = _COTS_WEIGHT_RUNNERS.get(runner_id)
+    runner = _HYBRID_WEIGHT_RUNNERS.get(runner_id)
     if runner is None:
         raise RuntimeError(
             f"{op_name}: runner_id={runner_id} not in registry "
-            f"(known ids: {list(_COTS_WEIGHT_RUNNERS.keys())}). The owning "
-            f"NativeCotsWeightRunner was likely torn down before its "
+            f"(known ids: {list(_HYBRID_WEIGHT_RUNNERS.keys())}). The owning "
+            f"NativeHybridWeightRunner was likely torn down before its "
             f"in-flight ops drained."
         )
     return runner
@@ -314,18 +315,18 @@ def populate_slab_via_spec(
 
 def set_worker_affinity(runner_id: int, mask: int) -> None:
     """Pin the worker thread to a CPU set (uint64 bitmask). One-shot
-    call from `CotsOffloader.post_init` after install."""
+    call from `HybridOffloader.post_init` after install."""
     runner = lookup_weight_runner(runner_id, "set_worker_affinity")
     runner.set_worker_affinity(int(mask))
 
 
 def reset_all_counters() -> None:
-    """Zero every registered CotsWeightTaskRunner counter."""
+    """Zero every registered HybridWeightTaskRunner counter."""
     import contextlib
 
-    with _COTS_PY_COUNTER_LOCK:
-        _COTS_PY_COUNTERS.clear()
-    for runner in _COTS_WEIGHT_RUNNERS.values():
+    with _HYBRID_PY_COUNTER_LOCK:
+        _HYBRID_PY_COUNTERS.clear()
+    for runner in _HYBRID_WEIGHT_RUNNERS.values():
         # Best-effort — a stale runner shouldn't break the reset
         # for the rest.
         with contextlib.suppress(Exception):
@@ -335,10 +336,10 @@ def reset_all_counters() -> None:
 def get_all_counters() -> dict[int, dict[str, int]]:
     """Return diagnostic counters for every registered weight runner."""
     out: dict[int, dict[str, int]] = {}
-    with _COTS_PY_COUNTER_LOCK:
-        if _COTS_PY_COUNTERS:
-            out[-1] = dict(_COTS_PY_COUNTERS)
-    for runner_id, runner in _COTS_WEIGHT_RUNNERS.items():
+    with _HYBRID_PY_COUNTER_LOCK:
+        if _HYBRID_PY_COUNTERS:
+            out[-1] = dict(_HYBRID_PY_COUNTERS)
+    for runner_id, runner in _HYBRID_WEIGHT_RUNNERS.items():
         counters = runner.get_counters()
         out[int(runner_id)] = {str(k): int(v) for k, v in counters.items()}
     return out
@@ -347,30 +348,30 @@ def get_all_counters() -> dict[int, dict[str, int]]:
 def add_python_counter(name: str, value: int = 1) -> None:
     """Add an env-gated Python-side diagnostic counter."""
 
-    if not _COTS_COUNTERS_ENABLED:
+    if not _HYBRID_COUNTERS_ENABLED:
         return
-    with _COTS_PY_COUNTER_LOCK:
-        _COTS_PY_COUNTERS[name] = _COTS_PY_COUNTERS.get(name, 0) + int(value)
+    with _HYBRID_PY_COUNTER_LOCK:
+        _HYBRID_PY_COUNTERS[name] = _HYBRID_PY_COUNTERS.get(name, 0) + int(value)
 
 
 def add_python_timing(name: str, elapsed_ns: int, *, count: int = 1) -> None:
     """Record a Python-side timing sample in nanoseconds."""
 
-    if not _COTS_COUNTERS_ENABLED:
+    if not _HYBRID_COUNTERS_ENABLED:
         return
     add_python_counter(f"{name}_total_ns", int(elapsed_ns))
     add_python_counter(f"{name}_count", int(count))
 
 
 def set_live_num_tokens(runner_id: int, n: int) -> None:
-    """Publish the live-token row cap to the native COTS worker.
+    """Publish the live-token row cap to the native Hybrid worker.
 
     `n` is the number of semantically live rows in the active bucket.
     Slab capacity, graph capture, and buffer sizing stay bucket-based;
     the worker reads this value on the next host-callback fire and
     avoids CPU GEMM work for padded rows.
     """
-    runner = _COTS_WEIGHT_RUNNERS.get(runner_id)
+    runner = _HYBRID_WEIGHT_RUNNERS.get(runner_id)
     if runner is None:
         # Best-effort: a stale runner_id call here shouldn't crash —
         # just skip. The next custom-op call will surface the missing
@@ -381,18 +382,18 @@ def set_live_num_tokens(runner_id: int, n: int) -> None:
 
 def sync_blocking(runner_id: int) -> None:
     """Drain any in-flight worker task synchronously. Called from
-    `NativeCotsWeightRunner.close()`."""
-    runner = _COTS_WEIGHT_RUNNERS.get(runner_id)
+    `NativeHybridWeightRunner.close()`."""
+    runner = _HYBRID_WEIGHT_RUNNERS.get(runner_id)
     if runner is None:
         # Already torn down — nothing to drain.
         return
     runner.sync_blocking()
 
 
-# --- vllm.cots_submit_gemm -------------------------------------------------
+# --- vllm.hybrid_submit_gemm -------------------------------------------------
 
 
-def _cots_submit_gemm_impl(
+def _hybrid_submit_gemm_impl(
     x_gpu: torch.Tensor,
     runner_id: int,
     layer_idx: int,
@@ -415,25 +416,27 @@ def _cots_submit_gemm_impl(
     """
     if not x_gpu.is_cuda:
         raise RuntimeError(
-            f"cots_submit_gemm: x_gpu must be on CUDA, got {x_gpu.device}"
+            f"hybrid_submit_gemm: x_gpu must be on CUDA, got {x_gpu.device}"
         )
     if x_gpu.dtype != torch.bfloat16:
         raise RuntimeError(
-            f"cots_submit_gemm: x_gpu must be bfloat16 (matches slab dtype), "
+            f"hybrid_submit_gemm: x_gpu must be bfloat16 (matches slab dtype), "
             f"got {x_gpu.dtype}"
         )
     if x_gpu.dim() != 2:
         raise RuntimeError(
-            f"cots_submit_gemm: x_gpu must be 2D (num_tokens, in_dim); "
+            f"hybrid_submit_gemm: x_gpu must be 2D (num_tokens, in_dim); "
             f"got shape {tuple(x_gpu.shape)}"
         )
-    if _route_has_zero_cpu_work(runner_id, layer_idx, op_kind_code, "cots_submit_gemm"):
+    if _route_has_zero_cpu_work(
+        runner_id, layer_idx, op_kind_code, "hybrid_submit_gemm"
+    ):
         return
     task_id, bucket, _live_num_tokens = _resolve_task_for_dispatch(
-        runner_id, layer_idx, op_kind_code, "cots_submit_gemm"
+        runner_id, layer_idx, op_kind_code, "hybrid_submit_gemm"
     )
     num_transfer_rows = _bounded_transfer_rows(
-        bucket, int(x_gpu.shape[0]), "cots_submit_gemm"
+        bucket, int(x_gpu.shape[0]), "hybrid_submit_gemm"
     )
     # `stride(1) == 1` is the production contract — feature-dim
     # contiguous, possibly row-strided. The C++ side handles the
@@ -443,20 +446,20 @@ def _cots_submit_gemm_impl(
     # this even when they come from padded / sliced bases.
     if x_gpu.stride(1) != 1:
         raise RuntimeError(
-            f"cots_submit_gemm: x_gpu.stride(1)={x_gpu.stride(1)} (must be 1; "
+            f"hybrid_submit_gemm: x_gpu.stride(1)={x_gpu.stride(1)} (must be 1; "
             f"no transposed-stride layouts in production decode). For "
             f"row-strided inputs (stride(0) > shape[1]) the C++ D2H uses "
             f"cudaMemcpy2DAsync."
         )
-    runner = lookup_weight_runner(runner_id, "cots_submit_gemm")
+    runner = lookup_weight_runner(runner_id, "hybrid_submit_gemm")
     stream = torch.cuda.current_stream().cuda_stream
     # Diagnostic-only NVTX scope for attributing the Python-side dispatch
     # boundary separately from the C++ submit body.
-    if _COTS_NVTX_ENABLED:
-        torch.cuda.nvtx.range_push("cots:py_submit_gemm")
+    if _HYBRID_NVTX_ENABLED:
+        torch.cuda.nvtx.range_push("hybrid:py_submit_gemm")
     try:
         # Pass shape/stride so the C++ D2H can dispatch the right
-        # cudaMemcpy* variant — see CotsWeightTaskRunner::submit_on_stream for
+        # cudaMemcpy* variant — see HybridWeightTaskRunner::submit_on_stream for
         # the 1D-vs-2D branch.
         runner.submit_on_stream(
             task_id,
@@ -468,11 +471,11 @@ def _cots_submit_gemm_impl(
             stream,
         )
     finally:
-        if _COTS_NVTX_ENABLED:
+        if _HYBRID_NVTX_ENABLED:
             torch.cuda.nvtx.range_pop()
 
 
-def _cots_submit_gemm_fake(
+def _hybrid_submit_gemm_fake(
     x_gpu: torch.Tensor,
     runner_id: int,
     layer_idx: int,
@@ -482,10 +485,10 @@ def _cots_submit_gemm_fake(
     return
 
 
-# --- vllm.cots_sync_then_uva -----------------------------------------------
+# --- vllm.hybrid_sync_then_uva -----------------------------------------------
 
 
-def _cots_sync_then_uva_impl(
+def _hybrid_sync_then_uva_impl(
     y_gpu: torch.Tensor,
     gpu_anchor_a: torch.Tensor,
     gpu_anchor_b: torch.Tensor,
@@ -499,7 +502,7 @@ def _cots_sync_then_uva_impl(
     `gpu_anchor_a` / `gpu_anchor_b` are CUDA tensors that the GPU
     GEMMs produced; mutating them pins this op AFTER both independent
     GEMMs (out_perm, out_pref). `submit_anchor` is `x_gpu` from the
-    matching `cots_submit_gemm`; reading it pins this op AFTER submit.
+    matching `hybrid_submit_gemm`; reading it pins this op AFTER submit.
 
     `y_pinned` is intentionally not a parameter. The slab pointer the worker
     wrote to is the source of truth; we reach it through the C++-side
@@ -509,33 +512,33 @@ def _cots_sync_then_uva_impl(
     validated there.
     """
     if _route_has_zero_cpu_work(
-        runner_id, layer_idx, op_kind_code, "cots_sync_then_uva"
+        runner_id, layer_idx, op_kind_code, "hybrid_sync_then_uva"
     ):
         return
     task_id, bucket, _live_num_tokens = _resolve_task_for_dispatch(
-        runner_id, layer_idx, op_kind_code, "cots_sync_then_uva"
+        runner_id, layer_idx, op_kind_code, "hybrid_sync_then_uva"
     )
     num_transfer_rows = _bounded_transfer_rows(
-        bucket, int(submit_anchor.shape[0]), "cots_sync_then_uva"
+        bucket, int(submit_anchor.shape[0]), "hybrid_sync_then_uva"
     )
-    runner = lookup_weight_runner(runner_id, "cots_sync_then_uva")
+    runner = lookup_weight_runner(runner_id, "hybrid_sync_then_uva")
     stream = torch.cuda.current_stream().cuda_stream
-    if _COTS_NVTX_ENABLED:
-        torch.cuda.nvtx.range_push("cots:py_sync_then_uva")
+    if _HYBRID_NVTX_ENABLED:
+        torch.cuda.nvtx.range_push("hybrid:py_sync_then_uva")
     try:
         runner.sync_on_stream(stream)
         # Build the CPU view over the slab pointer locally — never escapes
         # back to Python in a way Inductor would see.
         y_pinned = runner.y_pinned_view(task_id, num_transfer_rows)
         runner.note_uva_request(num_transfer_rows, y_pinned.shape[1])
-        # Lazy import to avoid a top-level circular import (cots.py imports
-        # this module via cots_ops and we'd loop on `from .cots import ...`).
-        from vllm.model_executor.offloader.cots import (
+        # Lazy import to avoid a top-level circular import (hybrid.py imports
+        # this module via hybrid_ops and we'd loop on `from .hybrid import ...`).
+        from vllm.model_executor.offloader.hybrid import (
             _uva_copy_trusted_host_into_gpu,
         )
 
-        if _COTS_NVTX_ENABLED:
-            torch.cuda.nvtx.range_push("cots:py_uva_copy")
+        if _HYBRID_NVTX_ENABLED:
+            torch.cuda.nvtx.range_push("hybrid:py_uva_copy")
         try:
             if y_gpu.dim() == 1:
                 dst_gpu = y_gpu.narrow(0, 0, y_pinned.numel())
@@ -545,14 +548,14 @@ def _cots_sync_then_uva_impl(
                 src_pinned = y_pinned
             _uva_copy_trusted_host_into_gpu(src_pinned, dst_gpu)
         finally:
-            if _COTS_NVTX_ENABLED:
+            if _HYBRID_NVTX_ENABLED:
                 torch.cuda.nvtx.range_pop()
     finally:
-        if _COTS_NVTX_ENABLED:
+        if _HYBRID_NVTX_ENABLED:
             torch.cuda.nvtx.range_pop()
 
 
-def _cots_sync_then_uva_fake(
+def _hybrid_sync_then_uva_fake(
     y_gpu: torch.Tensor,
     gpu_anchor_a: torch.Tensor,
     gpu_anchor_b: torch.Tensor,
@@ -603,7 +606,7 @@ def _check_prefetch_slot_ready(handle: Any, required_rows: int, op_name: str) ->
         )
 
 
-def _cots_prefetch_linear_impl(
+def _hybrid_prefetch_linear_impl(
     x_gpu: torch.Tensor,
     runner_id: int,
     layer_idx: int,
@@ -614,16 +617,16 @@ def _cots_prefetch_linear_impl(
     if not enabled:
         return x_gpu.new_empty((x_gpu.shape[0], int(max_n_prefetch)))
     handle, op_kind, bucket = _require_route(
-        runner_id, layer_idx, op_kind_code, "cots_prefetch_linear"
+        runner_id, layer_idx, op_kind_code, "hybrid_prefetch_linear"
     )
     if op_kind == "mlp_block":
-        raise RuntimeError("cots_prefetch_linear does not handle mlp_block routes")
+        raise RuntimeError("hybrid_prefetch_linear does not handle mlp_block routes")
     n_pref = int(handle.n_prefetch_by_bucket.get(bucket, 0))
     max_n_prefetch = int(max_n_prefetch)
     out = x_gpu.new_empty((x_gpu.shape[0], max_n_prefetch))
     if n_pref <= 0:
         return out
-    _check_prefetch_slot_ready(handle, n_pref, "cots_prefetch_linear")
+    _check_prefetch_slot_ready(handle, n_pref, "hybrid_prefetch_linear")
     slot_view = handle.w_prefetch_slots[handle.slot_idx].narrow(0, 0, n_pref)
     active = torch.nn.functional.linear(x_gpu, slot_view, None)
     if n_pref == max_n_prefetch:
@@ -632,7 +635,7 @@ def _cots_prefetch_linear_impl(
     return out
 
 
-def _cots_prefetch_linear_fake(
+def _hybrid_prefetch_linear_fake(
     x_gpu: torch.Tensor,
     runner_id: int,
     layer_idx: int,
@@ -644,7 +647,7 @@ def _cots_prefetch_linear_fake(
     return x_gpu.new_empty((x_gpu.shape[0], int(max_n_prefetch)))
 
 
-def _cots_scatter_col_outputs_impl(
+def _hybrid_scatter_col_outputs_impl(
     out_perm: torch.Tensor,
     out_pref: torch.Tensor,
     out_cpu_flat: torch.Tensor,
@@ -656,19 +659,21 @@ def _cots_scatter_col_outputs_impl(
     enable_cpu: bool,
 ) -> torch.Tensor:
     route, op_kind = _lookup_route(
-        runner_id, layer_idx, op_kind_code, "cots_scatter_col_outputs"
+        runner_id, layer_idx, op_kind_code, "hybrid_scatter_col_outputs"
     )
     if route is None:
         raise RuntimeError(
-            f"cots_scatter_col_outputs: runner_id={int(runner_id)} has no "
+            f"hybrid_scatter_col_outputs: runner_id={int(runner_id)} has no "
             f"registered route for layer_idx={int(layer_idx)}, op_kind={op_kind!r}"
         )
     handle = route
     if op_kind == "mlp_block":
-        raise RuntimeError("cots_scatter_col_outputs does not handle mlp_block routes")
+        raise RuntimeError(
+            "hybrid_scatter_col_outputs does not handle mlp_block routes"
+        )
     bucket = None
     if enable_prefetch or enable_cpu:
-        bucket, _ = _active_dispatch_state(runner_id, "cots_scatter_col_outputs")
+        bucket, _ = _active_dispatch_state(runner_id, "hybrid_scatter_col_outputs")
     assert handle.gpu_indices_cuda is not None
     out = torch.empty(
         (out_perm.shape[0], int(out_dim)),
@@ -695,7 +700,7 @@ def _cots_scatter_col_outputs_impl(
     return out
 
 
-def _cots_scatter_col_outputs_fake(
+def _hybrid_scatter_col_outputs_fake(
     out_perm: torch.Tensor,
     out_pref: torch.Tensor,
     out_cpu_flat: torch.Tensor,
@@ -711,7 +716,7 @@ def _cots_scatter_col_outputs_fake(
     return out_perm.new_empty((out_perm.shape[0], int(out_dim)))
 
 
-def _cots_mlp_prefetch_add_impl(
+def _hybrid_mlp_prefetch_add_impl(
     x_gpu: torch.Tensor,
     out_base: torch.Tensor,
     runner_id: int,
@@ -725,18 +730,18 @@ def _cots_mlp_prefetch_add_impl(
     if not enabled:
         return out_base.clone()
     fused_op, op_kind, bucket = _require_route(
-        runner_id, layer_idx, op_kind_code, "cots_mlp_prefetch_add"
+        runner_id, layer_idx, op_kind_code, "hybrid_mlp_prefetch_add"
     )
     if op_kind != "mlp_block":
-        raise RuntimeError("cots_mlp_prefetch_add requires an mlp_block route")
+        raise RuntimeError("hybrid_mlp_prefetch_add requires an mlp_block route")
     gu_h = fused_op._gate_up
     dn_h = fused_op._down
     gu_n_pref = int(gu_h.n_prefetch_by_bucket.get(bucket, 0))
     dn_n_pref = int(dn_h.n_prefetch_by_bucket.get(bucket, 0))
     if gu_n_pref <= 0 or dn_n_pref <= 0:
         return out_base.clone()
-    _check_prefetch_slot_ready(gu_h, gu_n_pref // 2, "cots_mlp_prefetch_add")
-    _check_prefetch_slot_ready(dn_h, dn_n_pref, "cots_mlp_prefetch_add")
+    _check_prefetch_slot_ready(gu_h, gu_n_pref // 2, "hybrid_mlp_prefetch_add")
+    _check_prefetch_slot_ready(dn_h, dn_n_pref, "hybrid_mlp_prefetch_add")
     gu_slot = gu_h.w_prefetch_slots[gu_h.slot_idx]
     dn_slot = dn_h.w_prefetch_slots[dn_h.slot_idx]
     pref_mlp1 = torch.nn.functional.linear(x_gpu, gu_slot.narrow(0, 0, gu_n_pref), None)
@@ -747,7 +752,7 @@ def _cots_mlp_prefetch_add_impl(
     return partial
 
 
-def _cots_mlp_prefetch_add_fake(
+def _hybrid_mlp_prefetch_add_fake(
     x_gpu: torch.Tensor,
     out_base: torch.Tensor,
     runner_id: int,
@@ -760,7 +765,7 @@ def _cots_mlp_prefetch_add_fake(
     return torch.empty_like(out_base)
 
 
-def _cots_mlp_merge_cpu_impl(
+def _hybrid_mlp_merge_cpu_impl(
     out_gpu: torch.Tensor,
     out_cpu_flat: torch.Tensor,
     runner_id: int,
@@ -774,10 +779,10 @@ def _cots_mlp_merge_cpu_impl(
     if not enable_cpu:
         return out_gpu.clone()
     fused_op, op_kind, bucket = _require_route(
-        runner_id, layer_idx, op_kind_code, "cots_mlp_merge_cpu"
+        runner_id, layer_idx, op_kind_code, "hybrid_mlp_merge_cpu"
     )
     if op_kind != "mlp_block":
-        raise RuntimeError("cots_mlp_merge_cpu requires an mlp_block route")
+        raise RuntimeError("hybrid_mlp_merge_cpu requires an mlp_block route")
     dn_h = fused_op._down
     n_cpu = int(dn_h.n_cpu_compute_by_bucket.get(bucket, dn_h.n_cpu))
     if n_cpu <= 0:
@@ -792,7 +797,7 @@ def _cots_mlp_merge_cpu_impl(
     return cpu_src.clone()
 
 
-def _cots_mlp_merge_cpu_fake(
+def _hybrid_mlp_merge_cpu_fake(
     out_gpu: torch.Tensor,
     out_cpu_flat: torch.Tensor,
     runner_id: int,
@@ -810,24 +815,24 @@ def _cots_mlp_merge_cpu_fake(
 # --- registration ----------------------------------------------------------
 
 
-def register_cots_offloader_ops() -> None:
-    """Register the COTS custom ops. Idempotent at import time."""
+def register_hybrid_offloader_ops() -> None:
+    """Register the Hybrid custom ops. Idempotent at import time."""
     direct_register_custom_op(
-        op_name="cots_submit_gemm",
-        op_func=_cots_submit_gemm_impl,
+        op_name="hybrid_submit_gemm",
+        op_func=_hybrid_submit_gemm_impl,
         # x_gpu is the CUDA dispatch anchor and ordering pin: mutating it forces
         # every subsequent GPU GEMM that reads x_gpu (F.linear
         # permanent / prefetched) to be ordered after submit, AND
-        # `cots_sync_then_uva` reads x_gpu as `submit_anchor` to
+        # `hybrid_sync_then_uva` reads x_gpu as `submit_anchor` to
         # stay ordered after submit. NEITHER `x_pinned` NOR
         # `y_pinned` appears in the op signature; both pinned
         # buffers are reached via slab pointers in C++.
         mutates_args=["x_gpu"],
-        fake_impl=_cots_submit_gemm_fake,
+        fake_impl=_hybrid_submit_gemm_fake,
     )
     direct_register_custom_op(
-        op_name="cots_sync_then_uva",
-        op_func=_cots_sync_then_uva_impl,
+        op_name="hybrid_sync_then_uva",
+        op_func=_hybrid_sync_then_uva_impl,
         # y_gpu is the CUDA dispatch anchor + downstream-scatter dep.
         # gpu_anchor_a / gpu_anchor_b pin sync AFTER each independent
         # GPU GEMM (in QKV, out_perm and out_pref are independent
@@ -835,30 +840,30 @@ def register_cots_offloader_ops() -> None:
         # passes two DISTINCT dummy CUDA tensors when an anchor is
         # absent — never alias.
         mutates_args=["y_gpu", "gpu_anchor_a", "gpu_anchor_b"],
-        fake_impl=_cots_sync_then_uva_fake,
+        fake_impl=_hybrid_sync_then_uva_fake,
     )
     direct_register_custom_op(
-        op_name="cots_prefetch_linear",
-        op_func=_cots_prefetch_linear_impl,
-        fake_impl=_cots_prefetch_linear_fake,
+        op_name="hybrid_prefetch_linear",
+        op_func=_hybrid_prefetch_linear_impl,
+        fake_impl=_hybrid_prefetch_linear_fake,
     )
     direct_register_custom_op(
-        op_name="cots_scatter_col_outputs",
-        op_func=_cots_scatter_col_outputs_impl,
-        fake_impl=_cots_scatter_col_outputs_fake,
+        op_name="hybrid_scatter_col_outputs",
+        op_func=_hybrid_scatter_col_outputs_impl,
+        fake_impl=_hybrid_scatter_col_outputs_fake,
     )
     direct_register_custom_op(
-        op_name="cots_mlp_prefetch_add",
-        op_func=_cots_mlp_prefetch_add_impl,
-        fake_impl=_cots_mlp_prefetch_add_fake,
+        op_name="hybrid_mlp_prefetch_add",
+        op_func=_hybrid_mlp_prefetch_add_impl,
+        fake_impl=_hybrid_mlp_prefetch_add_fake,
     )
     direct_register_custom_op(
-        op_name="cots_mlp_merge_cpu",
-        op_func=_cots_mlp_merge_cpu_impl,
-        fake_impl=_cots_mlp_merge_cpu_fake,
+        op_name="hybrid_mlp_merge_cpu",
+        op_func=_hybrid_mlp_merge_cpu_impl,
+        fake_impl=_hybrid_mlp_merge_cpu_fake,
     )
 
 
-# Register at module import time so `torch.ops.vllm.cots_*` exist as
-# soon as cots.py imports this module.
-register_cots_offloader_ops()
+# Register at module import time so `torch.ops.vllm.hybrid_*` exist as
+# soon as hybrid.py imports this module.
+register_hybrid_offloader_ops()

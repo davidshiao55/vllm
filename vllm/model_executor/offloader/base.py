@@ -136,10 +136,10 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
 
     Uses the explicit ``offload_backend`` selector.  When set to ``"auto"``,
     selects prefetch if ``offload_group_size > 0``, UVA if
-    ``cpu_offload_gb > 0``, otherwise noop. ``"cots"`` is never auto-selected
+    ``cpu_offload_gb > 0``, otherwise noop. ``"hybrid"`` is never auto-selected
     and must be requested explicitly.
     """
-    from vllm.model_executor.offloader.cots import CotsOffloader
+    from vllm.model_executor.offloader.hybrid import HybridOffloader
     from vllm.model_executor.offloader.prefetch import PrefetchOffloader
     from vllm.model_executor.offloader.prefetch_defer import PrefetchDeferOffloader
     from vllm.model_executor.offloader.uva import UVAOffloader
@@ -147,7 +147,7 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
     backend = offload_config.offload_backend
     uva = offload_config.uva
     prefetch = offload_config.prefetch
-    cots = offload_config.cots
+    hybrid = offload_config.hybrid
 
     if backend == "auto":
         if prefetch.offload_group_size > 0:
@@ -179,33 +179,33 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
             cpu_offload_max_bytes=int(uva.cpu_offload_gb * 1024**3),
             cpu_offload_params=uva.cpu_offload_params,
         )
-    elif backend == "cots":
-        # With zero weight placement there is no COTS weight work to install or
+    elif backend == "hybrid":
+        # With zero weight placement there is no Hybrid weight work to install or
         # dispatch. Keep that path as a true no-op so every forward does not pay
-        # CotsOffloader bucket bookkeeping.
-        if cots.f_cpu_store == 0.0 and cots.f_prefetch == 0.0:
+        # HybridOffloader bucket bookkeeping.
+        if hybrid.f_cpu_store == 0.0 and hybrid.f_prefetch == 0.0:
             return NoopOffloader()
 
         dispatch_table_factory = None
-        if cots.dispatch_table is not None:
+        if hybrid.dispatch_table is not None:
             configured_table = {
                 int(bucket): (float(pair[0]), float(pair[1]))
-                for bucket, pair in cots.dispatch_table.items()
+                for bucket, pair in hybrid.dispatch_table.items()
             }
 
             def dispatch_table_factory(dispatch_buckets):
                 missing = sorted(set(dispatch_buckets) - set(configured_table))
                 if missing:
                     raise ValueError(
-                        f"cots.dispatch_table is missing dispatch buckets: {missing}"
+                        f"hybrid.dispatch_table is missing dispatch buckets: {missing}"
                     )
                 return {
                     int(bucket): configured_table[int(bucket)]
                     for bucket in dispatch_buckets
                 }
 
-        return CotsOffloader(
-            config=cots,
+        return HybridOffloader(
+            config=hybrid,
             dispatch_table_factory=dispatch_table_factory,
         )
     else:

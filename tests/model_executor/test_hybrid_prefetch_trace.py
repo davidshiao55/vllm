@@ -4,14 +4,14 @@
 import pytest
 import torch
 
-from vllm.model_executor.offloader.cots_offloader import (
+from vllm.model_executor.offloader.hybrid_offloader import (
     _hidden_states_arg_position,
     _resolve_hidden_states_arg,
 )
-from vllm.model_executor.offloader.cots_operators import (
+from vllm.model_executor.offloader.hybrid_operators import (
     _assert_prefetch_slot_ready,
 )
-from vllm.model_executor.offloader.cots_storage import CotsLinearHandle
+from vllm.model_executor.offloader.hybrid_storage import HybridLinearHandle
 
 
 class _QwenStyleDecoderLayer(torch.nn.Module):
@@ -33,7 +33,7 @@ class _UnnamedHiddenStatesLayer(torch.nn.Module):
         return activations
 
 
-def test_cots_prefetch_anchor_resolves_qwen_hidden_states() -> None:
+def test_hybrid_prefetch_anchor_resolves_qwen_hidden_states() -> None:
     layer = _QwenStyleDecoderLayer()
     positions = torch.arange(4)
     hidden_states = torch.randn(4, 8)
@@ -49,15 +49,15 @@ def test_cots_prefetch_anchor_resolves_qwen_hidden_states() -> None:
     assert anchor is not positions
 
 
-def test_cots_prefetch_anchor_requires_named_hidden_states() -> None:
+def test_hybrid_prefetch_anchor_requires_named_hidden_states() -> None:
     layer = _UnnamedHiddenStatesLayer()
 
     with pytest.raises(ValueError, match="expose a hidden_states argument"):
         _hidden_states_arg_position(layer.forward)
 
 
-def _stale_prefetch_handle() -> CotsLinearHandle:
-    handle = CotsLinearHandle(
+def _stale_prefetch_handle() -> HybridLinearHandle:
+    handle = HybridLinearHandle(
         role="mlp_down",
         linear=torch.nn.Linear(2, 2, bias=False),
         qualified_name="test.row",
@@ -74,14 +74,14 @@ def _stale_prefetch_handle() -> CotsLinearHandle:
     return handle
 
 
-def test_cots_prefetch_slot_check_rejects_stale_owner_in_eager() -> None:
+def test_hybrid_prefetch_slot_check_rejects_stale_owner_in_eager() -> None:
     handle = _stale_prefetch_handle()
 
     with pytest.raises(AssertionError, match="slot owner mismatch"):
         _assert_prefetch_slot_ready(handle, 1, underfilled_name="slot")
 
 
-def test_cots_prefetch_slot_check_allows_dynamo_trace() -> None:
+def test_hybrid_prefetch_slot_check_allows_dynamo_trace() -> None:
     handle = _stale_prefetch_handle()
 
     def fn(x: torch.Tensor) -> torch.Tensor:

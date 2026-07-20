@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Shared helpers for the COTS offloader."""
+"""Shared helpers for the Hybrid offloader."""
 
 from __future__ import annotations
 
@@ -45,8 +45,8 @@ def _has_pinned_host_storage(t: torch.Tensor) -> bool:
     allocates a FRESH pageable CPU buffer rather than just dropping
     the metadata bit, so this helper alone does not unblock the
     captured path — that fix is the schema change (§1c.20: drop
-    `y_pinned` from `cots_submit_gemm.mutates_args`, anchor
-    `cots_sync_then_uva` on `x_gpu` instead). This helper is the
+    `y_pinned` from `hybrid_submit_gemm.mutates_args`, anchor
+    `hybrid_sync_then_uva` on `x_gpu` instead). This helper is the
     safety belt for direct callers that still legitimately pass pinned
     tensors and views thereof.
     """
@@ -65,8 +65,8 @@ def _uva_copy_trusted_host_into_gpu(
     dst_gpu: torch.Tensor,
 ) -> None:
     """§1c.20: same as `uva_copy_into_gpu` minus the page-locked
-    storage assertion. Used ONLY by `cots_sync_then_uva`'s impl —
-    the source tensor came from `CotsWeightTaskRunner::y_pinned_view`, which
+    storage assertion. Used ONLY by `hybrid_sync_then_uva`'s impl —
+    the source tensor came from `HybridWeightTaskRunner::y_pinned_view`, which
     builds an `at::from_blob` view over a slab pointer that was
     populated at install time from a real `torch.empty(...,
     pin_memory=True)` allocation. The storage IS page-locked by
@@ -106,7 +106,9 @@ def _uva_copy_trusted_host_into_gpu(
             "_uva_copy_trusted_host_into_gpu requires contiguous tensors"
         )
     if not HAS_TRITON:
-        raise RuntimeError("cots requires Triton for the UVA activation-return kernel")
+        raise RuntimeError(
+            "hybrid requires Triton for the UVA activation-return kernel"
+        )
     n = src_pinned.numel()
     if n == 0:
         return
@@ -126,7 +128,7 @@ def uva_copy_into_gpu(
     it. **Loss of CE0-bypass is unacceptable** (Phase 1b's measured
     1.85× PCIe BW recovery on row-prefetch depends on it), so the
     captured-forward path also routes through this helper via the
-    `cots_sync_then_uva` custom op — but the §1c.20 schema fix
+    `hybrid_sync_then_uva` custom op — but the §1c.20 schema fix
     ensures the input arrives as a real pinned-storage view, not an
     Inductor-cloned pageable buffer.
     """
@@ -150,7 +152,9 @@ def uva_copy_into_gpu(
     if not (src_pinned.is_contiguous() and dst_gpu.is_contiguous()):
         raise RuntimeError("uva_copy_into_gpu requires contiguous tensors")
     if not HAS_TRITON:
-        raise RuntimeError("cots requires Triton for the UVA activation-return kernel")
+        raise RuntimeError(
+            "hybrid requires Triton for the UVA activation-return kernel"
+        )
     n = src_pinned.numel()
     if n == 0:
         return
@@ -172,10 +176,10 @@ def _complement(idx: torch.Tensor, n: int) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
-# Storage layer: CotsLinearHandle
+# Storage layer: HybridLinearHandle
 #
 # One handle per offloaded Linear. Owns the GPU weight slice (replaces
 # param.data), the CPU weight slice (`w_cpu`, pinned), the CUDA index
 # tensors, and the wrapped weight_loader closure. No execution — operators
-# read state from the handle and submit work via a COTS runner.
+# read state from the handle and submit work via a Hybrid runner.
 # ---------------------------------------------------------------------------

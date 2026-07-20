@@ -14,8 +14,8 @@ from vllm.compilation.passes.utility.fix_functionalization import (
 )
 from vllm.config import (
     CompilationConfig,
-    CotsOffloadConfig,
     CUDAGraphMode,
+    HybridOffloadConfig,
     OffloadConfig,
     ParallelConfig,
     SchedulerConfig,
@@ -271,11 +271,11 @@ def test_splitting_ops_dynamic():
     assert config.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
 
 
-def test_cots_uses_vllm_default_graph_policy():
+def test_hybrid_uses_vllm_default_graph_policy():
     config = VllmConfig(
         offload_config=OffloadConfig(
-            offload_backend="cots",
-            cots=CotsOffloadConfig(f_cpu_store=0.05),
+            offload_backend="hybrid",
+            hybrid=HybridOffloadConfig(f_cpu_store=0.05),
         ),
         compilation_config=CompilationConfig(
             mode=CompilationMode.VLLM_COMPILE,
@@ -286,15 +286,15 @@ def test_cots_uses_vllm_default_graph_policy():
     assert config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
     assert "vllm::unified_attention" in config.compilation_config.splitting_ops
     assert "vllm::unified_kv_cache_update" in config.compilation_config.splitting_ops
-    assert "vllm::cots_submit_gemm" not in config.compilation_config.splitting_ops
-    assert "vllm::cots_sync_then_uva" not in config.compilation_config.splitting_ops
+    assert "vllm::hybrid_submit_gemm" not in config.compilation_config.splitting_ops
+    assert "vllm::hybrid_sync_then_uva" not in config.compilation_config.splitting_ops
 
 
-def test_cots_full_graph_cpu_compute_has_no_cots_aot_policy():
+def test_hybrid_full_graph_cpu_compute_has_no_hybrid_aot_policy():
     config = VllmConfig(
         offload_config=OffloadConfig(
-            offload_backend="cots",
-            cots=CotsOffloadConfig(f_cpu_store=0.05),
+            offload_backend="hybrid",
+            hybrid=HybridOffloadConfig(f_cpu_store=0.05),
         ),
         compilation_config=CompilationConfig(
             mode=CompilationMode.VLLM_COMPILE,
@@ -305,14 +305,14 @@ def test_cots_full_graph_cpu_compute_has_no_cots_aot_policy():
     import vllm.compilation.decorators as decorators
 
     assert config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
-    assert not hasattr(decorators, "_uses_native_cots_weight_graph")
+    assert not hasattr(decorators, "_uses_native_hybrid_weight_graph")
 
 
-def test_cots_pure_prefetch_keeps_vllm_default_graph_policy():
+def test_hybrid_pure_prefetch_keeps_vllm_default_graph_policy():
     config = VllmConfig(
         offload_config=OffloadConfig(
-            offload_backend="cots",
-            cots=CotsOffloadConfig(
+            offload_backend="hybrid",
+            hybrid=HybridOffloadConfig(
                 f_cpu_store=0.05,
                 f_prefetch=0.05,
             ),
@@ -324,8 +324,8 @@ def test_cots_pure_prefetch_keeps_vllm_default_graph_policy():
     )
 
     assert config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
-    assert "vllm::cots_submit_gemm" not in config.compilation_config.splitting_ops
-    assert "vllm::cots_sync_then_uva" not in config.compilation_config.splitting_ops
+    assert "vllm::hybrid_submit_gemm" not in config.compilation_config.splitting_ops
+    assert "vllm::hybrid_sync_then_uva" not in config.compilation_config.splitting_ops
 
 
 def test_moe_splitting_ops_deepep_ht_inductor_partition():

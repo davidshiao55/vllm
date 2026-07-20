@@ -3,11 +3,11 @@
 //
 // Direct port of KTransformers `kt-kernel/cpu_backend/task_queue.h`
 // (commit reference in /TTC/Reference_Frameworks/ktransformers/), adapted
-// into the vllm::cots namespace. See docs/implementation_roadmap.md
+// into the vllm::hybrid namespace. See docs/implementation_roadmap.md
 // Phase 1c and docs/phase1c_findings.md for the design rationale.
 
-#ifndef VLLM_COTS_TASK_QUEUE_H_
-#define VLLM_COTS_TASK_QUEUE_H_
+#ifndef VLLM_HYBRID_TASK_QUEUE_H_
+#define VLLM_HYBRID_TASK_QUEUE_H_
 
 #include <atomic>
 #include <condition_variable>
@@ -17,7 +17,7 @@
 #include <utility>
 
 namespace vllm {
-namespace cots {
+namespace hybrid {
 
 // Michael-Scott style MPSC queue with a single worker thread. Tasks are
 // std::function<void()> so any captured lambda is fine. `sync(N)` blocks
@@ -39,7 +39,7 @@ class TaskQueue {
 
   // Block calling thread until `pending` <= allow_n_pending, OR queue is
   // shutting down. Used both by Python `runner.sync()` (no stream) and by
-  // the CUDA host callback in CotsWeightTaskRunner::sync() (CUDA driver
+  // the CUDA host callback in HybridWeightTaskRunner::sync() (CUDA driver
   // thread).
   void sync(size_t allow_n_pending);
 
@@ -63,7 +63,7 @@ class TaskQueue {
   void Worker();
 };
 
-}  // namespace cots
+}  // namespace hybrid
 }  // namespace vllm
 
-#endif  // VLLM_COTS_TASK_QUEUE_H_
+#endif  // VLLM_HYBRID_TASK_QUEUE_H_

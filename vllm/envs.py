@@ -45,9 +45,9 @@ if TYPE_CHECKING:
     NO_COLOR: bool = False
     VLLM_LOG_STATS_INTERVAL: float = 10.0
     VLLM_TRACE_FUNCTION: int = 0
-    VLLM_COTS_COUNTERS: bool = False
-    VLLM_COTS_NVTX: bool = False
-    VLLM_COTS_DUMP_COUNTERS_ON_SHUTDOWN: bool = False
+    VLLM_HYBRID_COUNTERS: bool = False
+    VLLM_HYBRID_NVTX: bool = False
+    VLLM_HYBRID_DUMP_COUNTERS_ON_SHUTDOWN: bool = False
     VLLM_USE_FLASHINFER_SAMPLER: bool | None = None
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
@@ -699,13 +699,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set to 1, vllm will trace function calls
     # Useful for debugging
     "VLLM_TRACE_FUNCTION": lambda: int(os.getenv("VLLM_TRACE_FUNCTION", "0")),
-    # COTS thesis diagnostics. Most COTS hot paths read these directly from
+    # Hybrid thesis diagnostics. Most Hybrid hot paths read these directly from
     # getenv() in C++ to keep the production path independent of Python env
     # plumbing; registering them here prevents unknown-env warnings.
-    "VLLM_COTS_COUNTERS": lambda: os.getenv("VLLM_COTS_COUNTERS", "0") == "1",
-    "VLLM_COTS_NVTX": lambda: os.getenv("VLLM_COTS_NVTX", "0") == "1",
-    "VLLM_COTS_DUMP_COUNTERS_ON_SHUTDOWN": lambda: os.getenv(
-        "VLLM_COTS_DUMP_COUNTERS_ON_SHUTDOWN", "0"
+    "VLLM_HYBRID_COUNTERS": lambda: os.getenv("VLLM_HYBRID_COUNTERS", "0") == "1",
+    "VLLM_HYBRID_NVTX": lambda: os.getenv("VLLM_HYBRID_NVTX", "0") == "1",
+    "VLLM_HYBRID_DUMP_COUNTERS_ON_SHUTDOWN": lambda: os.getenv(
+        "VLLM_HYBRID_DUMP_COUNTERS_ON_SHUTDOWN", "0"
     )
     == "1",
     # If set, vllm will use flashinfer sampler

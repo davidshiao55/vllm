@@ -9,13 +9,13 @@ from vllm.model_executor.offloader.base import (
     get_offloader,
     set_offloader,
 )
-from vllm.model_executor.offloader.cots import CotsOffloader
+from vllm.model_executor.offloader.hybrid import HybridOffloader
 from vllm.model_executor.offloader.prefetch import PrefetchOffloader
 from vllm.model_executor.offloader.uva import UVAOffloader
 
 __all__ = [
     "BaseOffloader",
-    "CotsOffloader",
+    "HybridOffloader",
     "NoopOffloader",
     "UVAOffloader",
     "PrefetchOffloader",

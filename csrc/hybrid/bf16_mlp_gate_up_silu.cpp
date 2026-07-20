@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
-// COTS CPU MLP block for decode/small-batch CPU compute.
+// Hybrid CPU MLP block for decode/small-batch CPU compute.
 //
 // Computes:
 //
@@ -23,7 +23,7 @@
 #include <cstdint>
 
 namespace vllm {
-namespace cots {
+namespace hybrid {
 
 namespace {
 
@@ -89,5 +89,5 @@ void bf16_mlp_gate_up_silu_down(const uint16_t* x, const uint16_t* w_gate,
   bf16_gemm_transposed(z_scratch, w_down, y, M, O, I);
 }
 
-}  // namespace cots
+}  // namespace hybrid
 }  // namespace vllm

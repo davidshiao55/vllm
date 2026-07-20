@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Public COTS offloader lifecycle and model patching logic."""
+"""Public Hybrid offloader lifecycle and model patching logic."""
 
 from __future__ import annotations
 
@@ -15,43 +15,43 @@ import torch.nn as nn
 from cots.dispatch_buckets import cots_default_dispatch_buckets
 from cots.snap import COTS_SNAP_MODEL, qkvo_output_granularity
 
-# Register prefetch custom ops; COTS reuses generic wait/start prefetch ops.
-import vllm.model_executor.offloader.cots_ops  # noqa: F401
+# Register prefetch custom ops; Hybrid reuses generic wait/start prefetch ops.
+import vllm.model_executor.offloader.hybrid_ops  # noqa: F401
 import vllm.model_executor.offloader.prefetch_ops  # noqa: F401
-from vllm.config.cots import (
-    cots_weight_module_for_name,
-    normalize_cots_weight_modules,
+from vllm.config.hybrid import (
+    hybrid_weight_module_for_name,
+    normalize_hybrid_weight_modules,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.offloader.base import BaseOffloader
-from vllm.model_executor.offloader.cots_operators import (
-    CotsQKVOp,
-    CotsSwiGLUMLPOp,
-    CotsWOOp,
+from vllm.model_executor.offloader.hybrid_operators import (
+    HybridQKVOp,
+    HybridSwiGLUMLPOp,
+    HybridWOOp,
     _RaiseOnDirectCall,
 )
-from vllm.model_executor.offloader.cots_runners import (
-    NativeCotsWeightRunner,
+from vllm.model_executor.offloader.hybrid_runners import (
+    NativeHybridWeightRunner,
     NativeWeightSlabSpec,
     _NativeWeightSlabSpecLinear,
     _NativeWeightSlabSpecMlp,
 )
-from vllm.model_executor.offloader.cots_storage import (
+from vllm.model_executor.offloader.hybrid_storage import (
     DEFAULT_QKVO_HEAD_DIM,
     INPUT_SPLIT_AXIS,
     MLP_DOWN_ROLE,
     MLP_GATE_UP_ROLE,
     QKV_ROLE,
     WO_ROLE,
-    CotsLinearHandle,
-    CotsPrefetchBufferPool,
+    HybridLinearHandle,
+    HybridPrefetchBufferPool,
     WeightPrefetchStreamer,
 )
 from vllm.utils.platform_utils import is_pin_memory_available
 
 if TYPE_CHECKING:
-    from vllm.config import CotsOffloadConfig
+    from vllm.config import HybridOffloadConfig
     from vllm.forward_context import BatchDescriptor
 
 logger = init_logger(__name__)
@@ -66,7 +66,7 @@ def _hidden_states_arg_position(forward: Callable[..., object]) -> int | None:
     )
     if hidden_states is None:
         raise ValueError(
-            "COTS requires decoder layer forward to expose a hidden_states argument"
+            "Hybrid requires decoder layer forward to expose a hidden_states argument"
         )
     if hidden_states.kind == inspect.Parameter.KEYWORD_ONLY:
         return None
@@ -75,7 +75,7 @@ def _hidden_states_arg_position(forward: Callable[..., object]) -> int | None:
         inspect.Parameter.POSITIONAL_OR_KEYWORD,
     ):
         raise ValueError(
-            "COTS requires hidden_states to be a positional or keyword argument"
+            "Hybrid requires hidden_states to be a positional or keyword argument"
         )
     positional_names = [
         parameter.name
@@ -100,7 +100,7 @@ def _resolve_hidden_states_arg(
         hidden_states = args[position]
     if not isinstance(hidden_states, torch.Tensor):
         raise RuntimeError(
-            "COTS prefetch could not resolve tensor argument 'hidden_states' "
+            "Hybrid prefetch could not resolve tensor argument 'hidden_states' "
             f"for {type(layer).__name__}.forward"
         )
     return hidden_states
@@ -112,22 +112,22 @@ LINEAR_OP_KIND_BY_ROLE = {
 }
 
 
-class CotsOffloader(BaseOffloader):
+class HybridOffloader(BaseOffloader):
     """Collaborative CPU-GPU weight offloader (thesis Phase 1a).
 
     Three-pass per layer in `wrap_modules`:
       1. Build & install handles for each offloadable Linear.
-      2. Install operator adapters: `CotsQKVOp` per QKV linear,
-         `CotsSwiGLUMLPOp` per recognized MLP block (replaces parent.forward,
+      2. Install operator adapters: `HybridQKVOp` per QKV linear,
+         `HybridSwiGLUMLPOp` per recognized MLP block (replaces parent.forward,
          installs `_RaiseOnDirectCall` guards on the MLP linears), and
-         `CotsWOOp` per opt-in WO linear.
+         `HybridWOOp` per opt-in WO linear.
       3. Reject orphan MLP gate/up/down handles loudly: MergedCol/Row offload
          requires an MLP block parent.
     """
 
     def __init__(
         self,
-        config: CotsOffloadConfig,
+        config: HybridOffloadConfig,
         dispatch_table_factory: Callable[
             [Sequence[int]], dict[int, tuple[float, float]]
         ]
@@ -137,7 +137,7 @@ class CotsOffloader(BaseOffloader):
         self.f_cpu_store = float(config.f_cpu_store)
         self.f_prefetch = float(config.f_prefetch)
         self.weight_modules = frozenset(
-            normalize_cots_weight_modules(getattr(config, "weight_modules", None))
+            normalize_hybrid_weight_modules(getattr(config, "weight_modules", None))
         )
         self.dry_run = bool(config.dry_run)
         # Optional injection point for the Planner. None → uniform fill
@@ -154,15 +154,15 @@ class CotsOffloader(BaseOffloader):
         # offloaded linears (in insertion order); _fused_ops tracks installed
         # MLP-block ops (one per recognized parent), and _wo_ops tracks
         # opt-in output-split WO adapters.
-        self._handles: list[CotsLinearHandle] = []
-        self._fused_ops: list[CotsSwiGLUMLPOp] = []
-        self._wo_ops: list[CotsWOOp] = []
+        self._handles: list[HybridLinearHandle] = []
+        self._fused_ops: list[HybridSwiGLUMLPOp] = []
+        self._wo_ops: list[HybridWOOp] = []
 
         # Per-layer tracking for prefetch hook installation. `_layer_modules[i]`
         # is the i-th offloaded decoder layer; `_layer_handles[i]` is its
         # handle list. Indices align with the streamer's per-layer events.
         self._layer_modules: list[nn.Module] = []
-        self._layer_handles: list[list[CotsLinearHandle]] = []
+        self._layer_handles: list[list[HybridLinearHandle]] = []
 
         # Shared activation I/O buffers — allocated at the end of
         # wrap_modules (so vLLM's DeviceMemoryProfiler sees them in
@@ -177,7 +177,7 @@ class CotsOffloader(BaseOffloader):
         self._dispatch_table: dict[int, tuple[float, float]] = {}
         # CUDA graph capture buckets and Planner dispatch buckets are related
         # but distinct. Graph buckets describe replay shapes. Dispatch buckets
-        # describe the COTS route selected from BatchDescriptor.num_tokens and
+        # describe the Hybrid route selected from BatchDescriptor.num_tokens and
         # must exist even in eager mode, where CUDA graph buckets are empty.
         self._graph_capture_buckets: tuple[int, ...] = ()
         self._dispatch_buckets: tuple[int, ...] = ()
@@ -188,19 +188,19 @@ class CotsOffloader(BaseOffloader):
         # Prefetch infrastructure — allocated in wrap_modules when the
         # dispatch table reserves any prefetch capacity. Active buckets may
         # still have zero prefetched rows after runtime snapping.
-        self._prefetch_buffer_pool: CotsPrefetchBufferPool | None = None
+        self._prefetch_buffer_pool: HybridPrefetchBufferPool | None = None
         self._streamer: WeightPrefetchStreamer | None = None
 
         # One offloader-owned runner is shared across all operator call sites.
         # The no-offload path leaves it unset to avoid starting a worker thread.
-        self._runner: NativeCotsWeightRunner | None = None
+        self._runner: NativeHybridWeightRunner | None = None
         if self.f_cpu_store > 0.0:
-            self._runner = NativeCotsWeightRunner(dry_run=bool(config.dry_run))
+            self._runner = NativeHybridWeightRunner(dry_run=bool(config.dry_run))
 
         # Active bucket is set out-of-graph by `on_dispatch` before operators
         # run. This stays valid even when prefetch is disabled.
         self._current_bucket: int | None = None
-        # Two distinct dummy CUDA anchors for the cots_sync_then_uva
+        # Two distinct dummy CUDA anchors for the hybrid_sync_then_uva
         # custom op's mutates_args=["y_gpu", "gpu_anchor_a",
         # "gpu_anchor_b"]. Operators pass these when out_perm/out_pref
         # are absent so the two anchor slots never alias (aliasing
@@ -254,7 +254,7 @@ class CotsOffloader(BaseOffloader):
 
         if self.f_cpu_store == 0.0:
             logger.info_once(
-                "CotsOffloader: f_cpu_store=0, no offloading.", scope="local"
+                "HybridOffloader: f_cpu_store=0, no offloading.", scope="local"
             )
             return modules
 
@@ -279,7 +279,7 @@ class CotsOffloader(BaseOffloader):
         if any(h.max_n_prefetch > 0 for h in self._handles):
             self._install_prefetch_machinery()
         logger.debug(
-            "CotsOffloader: wrapped %d linear modules, %d fused MLP blocks, "
+            "HybridOffloader: wrapped %d linear modules, %d fused MLP blocks, "
             "and %d WO ops (modules=%s, f_cpu_store=%.4f, f_prefetch=%.4f, "
             "cpu_num_threads=%d, dry_run=%s).",
             len(self._handles),
@@ -295,7 +295,7 @@ class CotsOffloader(BaseOffloader):
 
     # --- Pass 1: build handles ---
 
-    def _build_handles(self, layer: nn.Module) -> list[CotsLinearHandle]:
+    def _build_handles(self, layer: nn.Module) -> list[HybridLinearHandle]:
         """Discover offloadable linears in `layer`, build & install handles."""
         from vllm.model_executor.layers.linear import (
             MergedColumnParallelLinear,
@@ -304,7 +304,7 @@ class CotsOffloader(BaseOffloader):
             UnquantizedLinearMethod,
         )
 
-        layer_handles: list[CotsLinearHandle] = []
+        layer_handles: list[HybridLinearHandle] = []
         qkvo_head_dim = self._qkvo_head_dim_for_layer(layer, QKVParallelLinear)
         for qualified_name, child in layer.named_modules():
             module = self._module_for_qualified_name(qualified_name)
@@ -312,32 +312,32 @@ class CotsOffloader(BaseOffloader):
                 continue
             if not isinstance(child.quant_method, UnquantizedLinearMethod):
                 raise RuntimeError(
-                    f"CotsOffloader only supports unquantized "
+                    f"HybridOffloader only supports unquantized "
                     f"linear layers, got {type(child.quant_method).__name__} "
                     f"on {qualified_name}."
                 )
             self._check_dtype_is_bfloat16(child, qualified_name)
             if module == "qkv" and isinstance(child, QKVParallelLinear):
-                handle = CotsLinearHandle.for_qkv(
+                handle = HybridLinearHandle.for_qkv(
                     child,
                     qualified_name,
                     head_dim=int(child.head_size),
                     f_cpu_store=self.f_cpu_store,
                 )
             elif module == "mlp" and isinstance(child, MergedColumnParallelLinear):
-                handle = CotsLinearHandle.for_mlp_gate_up(
+                handle = HybridLinearHandle.for_mlp_gate_up(
                     child,
                     qualified_name,
                     f_cpu_store=self.f_cpu_store,
                 )
             elif module == "mlp" and isinstance(child, RowParallelLinear):
-                handle = CotsLinearHandle.for_mlp_down(
+                handle = HybridLinearHandle.for_mlp_down(
                     child,
                     qualified_name,
                     f_cpu_store=self.f_cpu_store,
                 )
             elif module == "wo" and isinstance(child, RowParallelLinear):
-                handle = CotsLinearHandle.for_wo(
+                handle = HybridLinearHandle.for_wo(
                     child,
                     qualified_name,
                     f_cpu_store=self.f_cpu_store,
@@ -345,7 +345,7 @@ class CotsOffloader(BaseOffloader):
                 )
             else:
                 raise RuntimeError(
-                    f"CotsOffloader: {qualified_name} matched enabled COTS "
+                    f"HybridOffloader: {qualified_name} matched enabled Hybrid "
                     f"module {module!r} but has unsupported linear type "
                     f"(got {type(child).__name__})"
                 )
@@ -357,8 +357,8 @@ class CotsOffloader(BaseOffloader):
         return layer_handles
 
     def _module_for_qualified_name(self, qualified_name: str) -> str | None:
-        """Return the enabled semantic COTS module for a linear name."""
-        return cots_weight_module_for_name(self.weight_modules, qualified_name)
+        """Return the enabled semantic Hybrid module for a linear name."""
+        return hybrid_weight_module_for_name(self.weight_modules, qualified_name)
 
     @staticmethod
     def _qkvo_head_dim_for_layer(
@@ -379,7 +379,7 @@ class CotsOffloader(BaseOffloader):
 
     # --- Pass 2a: QKV operator install ---
 
-    def _install_qkv_ops(self, handles: list[CotsLinearHandle]) -> None:
+    def _install_qkv_ops(self, handles: list[HybridLinearHandle]) -> None:
         # Operators share the offloader-owned runner constructed in __init__.
         assert self._runner is not None, (
             "_install_qkv_ops called with f_cpu_store=0 — runner not constructed"
@@ -387,7 +387,7 @@ class CotsOffloader(BaseOffloader):
         for h in handles:
             if h.role != QKV_ROLE:
                 continue
-            h.linear.quant_method = CotsQKVOp(
+            h.linear.quant_method = HybridQKVOp(
                 handle=h,
                 runner=self._runner,
                 offloader=self,
@@ -396,14 +396,14 @@ class CotsOffloader(BaseOffloader):
 
     # --- Pass 2a-2: WO operator install ---
 
-    def _install_wo_ops(self, handles: list[CotsLinearHandle]) -> None:
+    def _install_wo_ops(self, handles: list[HybridLinearHandle]) -> None:
         assert self._runner is not None, (
             "_install_wo_ops called with f_cpu_store=0 — runner not constructed"
         )
         for h in handles:
             if h.role != WO_ROLE:
                 continue
-            h.linear.quant_method = CotsWOOp(
+            h.linear.quant_method = HybridWOOp(
                 handle=h,
                 runner=self._runner,
                 offloader=self,
@@ -414,9 +414,9 @@ class CotsOffloader(BaseOffloader):
     # --- Pass 2b: MLP block operator install ---
 
     def _install_mlp_ops(
-        self, layer: nn.Module, layer_handles: list[CotsLinearHandle]
+        self, layer: nn.Module, layer_handles: list[HybridLinearHandle]
     ) -> None:
-        """Recognize Qwen2MLP-style parents and install `CotsSwiGLUMLPOp` on
+        """Recognize Qwen2MLP-style parents and install `HybridSwiGLUMLPOp` on
         their `forward`. Strict checks: SiluAndMul-only act_fn, no biases,
         no skip_bias_add. Reject mismatches loudly.
         """
@@ -426,8 +426,8 @@ class CotsOffloader(BaseOffloader):
             af = getattr(parent, "act_fn", None)
             if gu is None or dp is None or af is None:
                 continue
-            gu_h = getattr(gu, "_cots_handle", None)
-            dp_h = getattr(dp, "_cots_handle", None)
+            gu_h = getattr(gu, "_hybrid_handle", None)
+            dp_h = getattr(dp, "_hybrid_handle", None)
             if gu_h is None or dp_h is None:
                 continue
             qualified_name = parent_name or "<root>"
@@ -436,7 +436,7 @@ class CotsOffloader(BaseOffloader):
             # ignores biases / skip_bias_add. Reject loudly.
             if not isinstance(af, SiluAndMul):
                 raise RuntimeError(
-                    f"cots: {qualified_name}.act_fn is "
+                    f"hybrid: {qualified_name}.act_fn is "
                     f"{type(af).__name__}, expected SiluAndMul (the fused "
                     f"CPU path is hard-coded to silu(gate)*up)."
                 )
@@ -445,14 +445,15 @@ class CotsOffloader(BaseOffloader):
                 or getattr(dp, "bias", None) is not None
             ):
                 raise RuntimeError(
-                    f"cots: {qualified_name} MLP has bias on gate_up or down; "
+                    f"hybrid: {qualified_name} MLP has bias on gate_up or down; "
                     f"the fused path doesn't handle MLP biases."
                 )
             if getattr(gu, "skip_bias_add", False) or getattr(
                 dp, "skip_bias_add", False
             ):
                 raise RuntimeError(
-                    f"cots: {qualified_name} MLP has skip_bias_add=True; not supported."
+                    f"hybrid: {qualified_name} MLP has skip_bias_add=True; "
+                    "not supported."
                 )
 
             # Installer refactor: shared offloader runner (see
@@ -460,7 +461,7 @@ class CotsOffloader(BaseOffloader):
             assert self._runner is not None, (
                 "_install_mlp_ops called with f_cpu_store=0 — runner not constructed"
             )
-            mlp_op = CotsSwiGLUMLPOp(
+            mlp_op = HybridSwiGLUMLPOp(
                 gate_up_layer=gu,
                 down_layer=dp,
                 gate_up_handle=gu_h,
@@ -488,7 +489,7 @@ class CotsOffloader(BaseOffloader):
 
     @staticmethod
     def _check_tensor_parallel_size_one() -> None:
-        """Current COTS contract: TP=1 only. The loader closures assert full
+        """Current Hybrid contract: TP=1 only. The loader closures assert full
         unsharded `loaded_weight` shapes (no per-rank narrow); native vLLM
         loaders narrow by TP rank before copying. Cleanly fail at wrap time
         rather than mismatch in a loader closure later.
@@ -499,7 +500,7 @@ class CotsOffloader(BaseOffloader):
         tp_size = int(vllm_config.parallel_config.tensor_parallel_size)
         if tp_size != 1:
             raise RuntimeError(
-                f"CotsOffloader requires tensor_parallel_size=1; "
+                f"HybridOffloader requires tensor_parallel_size=1; "
                 f"got tp_size={tp_size}. Multi-rank TP is out of scope for "
                 f"the current implementation (loader closures assume full "
                 f"unsharded weights)."
@@ -512,31 +513,31 @@ class CotsOffloader(BaseOffloader):
         """
         if not is_pin_memory_available():
             raise RuntimeError(
-                "CotsOffloader requires pinned host memory; "
+                "HybridOffloader requires pinned host memory; "
                 "is_pin_memory_available() returned False. Pinned memory is "
                 "unavailable on this host (e.g., container cgroup limits)."
             )
 
     @staticmethod
     def _check_dtype_is_bfloat16(linear: nn.Module, qualified_name: str) -> None:
-        """Current COTS contract: BF16-only (`offload.py` `cpu_dtype`).
+        """Current Hybrid contract: BF16-only (`offload.py` `cpu_dtype`).
         oneDNN BF16 is the fast CPU path measured in Phase 0; FP16/FP32
         is not part of the production path.
         """
         if linear.weight.dtype != torch.bfloat16:
             raise RuntimeError(
-                f"CotsOffloader requires bfloat16; "
+                f"HybridOffloader requires bfloat16; "
                 f"{qualified_name} has dtype={linear.weight.dtype}. "
                 f"Launch with --dtype bfloat16."
             )
 
     @staticmethod
-    def _check_no_orphan_mlp_handles(handles: list[CotsLinearHandle]) -> None:
+    def _check_no_orphan_mlp_handles(handles: list[HybridLinearHandle]) -> None:
         """Every MLP split handle must be in a fused MLP block."""
         for h in handles:
             if h.role in (MLP_GATE_UP_ROLE, MLP_DOWN_ROLE) and not h.in_block:
                 raise RuntimeError(
-                    f"cots: {h.qualified_name} is offloaded but not "
+                    f"hybrid: {h.qualified_name} is offloaded but not "
                     f"part of a recognized MLP block (gate_up_proj + act_fn "
                     f"+ down_proj structure). Add the structural parent or "
                     f"exclude this linear from offload."
@@ -556,10 +557,10 @@ class CotsOffloader(BaseOffloader):
     def _install_prefetch_machinery(self) -> None:
         """Allocate prefetch buffers and install layer-level prefetch hooks."""
         device = torch.device("cuda")
-        self._prefetch_buffer_pool = CotsPrefetchBufferPool(self._handles, device)
+        self._prefetch_buffer_pool = HybridPrefetchBufferPool(self._handles, device)
         for h in self._handles:
             if h.layer_idx >= 0:
-                h.slot_idx = h.layer_idx % CotsPrefetchBufferPool.K
+                h.slot_idx = h.layer_idx % HybridPrefetchBufferPool.K
 
         n_layers = len(self._layer_modules)
         self._streamer = WeightPrefetchStreamer(
@@ -599,15 +600,15 @@ class CotsOffloader(BaseOffloader):
         unknown = set(per_bucket.keys()) - set(self._dispatch_buckets)
         if unknown:
             raise ValueError(
-                f"cots: cpu_num_threads_by_bucket has keys "
-                f"{sorted(unknown)} that are not in COTS dispatch buckets "
+                f"hybrid: cpu_num_threads_by_bucket has keys "
+                f"{sorted(unknown)} that are not in Hybrid dispatch buckets "
                 f"({self._dispatch_buckets}). Per-bucket thread policy must "
                 f"only reference dispatch buckets."
             )
         for b, n in per_bucket.items():
             if n < 1:
                 raise ValueError(
-                    f"cots: cpu_num_threads_by_bucket[{b}] = {n}, must be >= 1"
+                    f"hybrid: cpu_num_threads_by_bucket[{b}] = {n}, must be >= 1"
                 )
 
     def _compute_has_cpu_compute_work(self) -> bool:
@@ -620,7 +621,7 @@ class CotsOffloader(BaseOffloader):
 
     def _build_native_slab_specs(self) -> list[NativeWeightSlabSpec]:
         """Build the per-(layer, bucket, op_kind) slab specs that
-        NativeCotsWeightRunner.install populates into the C++ slab pool. All
+        NativeHybridWeightRunner.install populates into the C++ slab pool. All
         weight pointers are POST-narrow `data_ptr()`s; the down-proj
         slabs additionally carry strides reflecting the source tensor.
         Each slab's `n_threads` is per-bucket via `_n_threads_for` so
@@ -714,35 +715,35 @@ class CotsOffloader(BaseOffloader):
         # "no opinion" and leaves the kernel default unchanged.
         cpu_affinity = getattr(self.config, "cpu_worker_affinity", None)
         if cpu_affinity:
-            from vllm.model_executor.offloader import cots_ops
+            from vllm.model_executor.offloader import hybrid_ops
 
             mask = 0
             for cpu_id in cpu_affinity:
                 if not (0 <= int(cpu_id) < 64):
                     raise ValueError(
-                        f"cots: cpu_worker_affinity contains cpu_id "
+                        f"hybrid: cpu_worker_affinity contains cpu_id "
                         f"{cpu_id}; must be in [0, 64)"
                     )
                 mask |= 1 << int(cpu_id)
-            cots_ops.set_worker_affinity(self._runner._runner_id, mask)
+            hybrid_ops.set_worker_affinity(self._runner._runner_id, mask)
 
     def _register_runner_routes(self) -> None:
-        """Publish existing handle objects for opaque COTS operator routing."""
+        """Publish existing handle objects for opaque Hybrid operator routing."""
         if self._runner is None or not self._handles:
             return
-        from vllm.model_executor.offloader import cots_ops
+        from vllm.model_executor.offloader import hybrid_ops
 
         for h in self._handles:
             if h.role not in (QKV_ROLE, WO_ROLE):
                 continue
-            cots_ops.register_weight_route(
+            hybrid_ops.register_weight_route(
                 self._runner._runner_id,
                 layer_idx=h.layer_idx,
                 op_kind=LINEAR_OP_KIND_BY_ROLE[h.role],
                 route=h,
             )
         for fop in self._fused_ops:
-            cots_ops.register_weight_route(
+            hybrid_ops.register_weight_route(
                 self._runner._runner_id,
                 layer_idx=fop._gate_up.layer_idx,
                 op_kind="mlp_block",
@@ -872,7 +873,7 @@ class CotsOffloader(BaseOffloader):
     def _dispatch_bucket_for(self, num_tokens: int) -> int:
         """Round-up lookup on `_dispatch_buckets`.
 
-        Returns the Planner/COTS dispatch bucket key that should select routing
+        Returns the Planner/Hybrid dispatch bucket key that should select routing
         geometry and native runner slabs. Out-of-range returns the largest
         dispatch bucket.
 
@@ -914,9 +915,9 @@ class CotsOffloader(BaseOffloader):
         assert self._runner is not None
         if int(live_num_tokens) <= 0:
             return
-        from vllm.model_executor.offloader import cots_ops
+        from vllm.model_executor.offloader import hybrid_ops
 
-        cots_ops.set_live_num_tokens(self._runner._runner_id, int(live_num_tokens))
+        hybrid_ops.set_live_num_tokens(self._runner._runner_id, int(live_num_tokens))
 
     def on_dispatch(
         self,
@@ -937,7 +938,7 @@ class CotsOffloader(BaseOffloader):
             slot repair (issues H2D on copy_stream). H2D is OOG so it
             isn't captured; each replay gets fresh repair.
         2. `set_active_dispatch(bucket, live)` — publishes the
-            authoritative vLLM dispatch bucket to COTS custom ops.
+            authoritative vLLM dispatch bucket to Hybrid custom ops.
             CPU ops use it to resolve `(layer_idx, bucket, op_kind) -> task_id`;
             prefetch/scatter ops use it to resolve existing handle route tables.
         3. `_set_live_num_tokens(num_tokens_unpadded)` — live-row cap
@@ -960,16 +961,16 @@ class CotsOffloader(BaseOffloader):
         """Drain and release the shared CPU runner at worker shutdown."""
         if self._runner is None:
             return
-        if os.environ.get("VLLM_COTS_DUMP_COUNTERS_ON_SHUTDOWN", "0") == "1":
-            from vllm.model_executor.offloader import cots_ops
+        if os.environ.get("VLLM_HYBRID_DUMP_COUNTERS_ON_SHUTDOWN", "0") == "1":
+            from vllm.model_executor.offloader import hybrid_ops
 
             if torch.cuda.is_available() and torch.cuda.is_initialized():
                 assert self._runner is not None
                 torch.cuda.current_stream().synchronize()
-                cots_ops.sync_blocking(self._runner._runner_id)
-            counters = cots_ops.get_all_counters()
+                hybrid_ops.sync_blocking(self._runner._runner_id)
+            counters = hybrid_ops.get_all_counters()
             logger.info(
-                "[CotsOffloader] counters: %s",
+                "[HybridOffloader] counters: %s",
                 json.dumps(counters, sort_keys=True),
             )
         self._runner.close()
@@ -1020,10 +1021,10 @@ class CotsOffloader(BaseOffloader):
         return sorted(keys)
 
     def _default_dispatch_buckets(self, vllm_config) -> list[int]:
-        """Default Planner bucket grid for COTS dispatch.
+        """Default Planner bucket grid for Hybrid dispatch.
 
         In graph mode this starts from vLLM's actual CUDA graph capture sizes.
-        In eager mode vLLM intentionally clears those sizes, so COTS rebuilds
+        In eager mode vLLM intentionally clears those sizes, so Hybrid rebuilds
         the same would-have-been decode grid. Both modes add a small set of
         larger fallback buckets for non-captured prefill/mixed forwards.
         """
@@ -1050,7 +1051,7 @@ class CotsOffloader(BaseOffloader):
         missing = sorted(set(self._graph_capture_buckets) - set(self._dispatch_buckets))
         if missing:
             raise ValueError(
-                "CotsOffloader: COTS dispatch buckets are missing CUDA graph "
+                "HybridOffloader: Hybrid dispatch buckets are missing CUDA graph "
                 f"capture buckets: {missing}. Captured graph buckets must map "
                 "1:1 to dispatch rows so graph replay cannot use a different "
                 "routing policy from capture."
@@ -1084,7 +1085,7 @@ class CotsOffloader(BaseOffloader):
         )
         self._y_gpu = torch.empty(y_capacity, dtype=dtype, device=device)
 
-        # Two distinct dummy CUDA tensors for cots_sync_then_uva's anchor
+        # Two distinct dummy CUDA tensors for hybrid_sync_then_uva's anchor
         # mutates_args. Operators pass these when a GPU GEMM output is absent,
         # so torch.compile / functionalization sees distinct mutation slots.
         # Allocate here because __init__ can predate CUDA device setup.
@@ -1094,7 +1095,7 @@ class CotsOffloader(BaseOffloader):
     # --- post_init: bookkeeping only ---
 
     def post_init(self) -> None:
-        """Finalize native COTS weight bookkeeping.
+        """Finalize native Hybrid weight bookkeeping.
 
         The dispatch table and per-bucket geometry are built in
         `wrap_modules` before the prefetch buffer pool is sized inside the
@@ -1110,14 +1111,14 @@ class CotsOffloader(BaseOffloader):
         # (`GPUModelRunner._publish_forward_dispatch` →
         # `BaseOffloader.set_live_num_tokens`)
         # currently sets ONE global value per scheduler batch. Under
-        # ubatching, a COTS operator runs on a per-ubatch slice but
+        # ubatching, a Hybrid operator runs on a per-ubatch slice but
         # sees the cap as the FULL batch token count, which can
         # over-compute (the worker would read past the per-ubatch
         # x_pinned slice into stale data). Hard-fail until per-ubatch live
         # counts are plumbed.
         if self._has_cpu_compute_work and vllm_config.parallel_config.use_ubatching:
             raise RuntimeError(
-                "CotsOffloader is currently incompatible with vLLM "
+                "HybridOffloader is currently incompatible with vLLM "
                 "microbatching/ubatching "
                 "(`enable_dbo` or `ubatch_size > 1`). The live-token "
                 "cap sets one global live_num_tokens value per scheduler "
@@ -1133,7 +1134,7 @@ class CotsOffloader(BaseOffloader):
             for bucket, (f_cpu, f_prefetch) in sorted(self._dispatch_table.items())
         }
         logger.info(
-            "[CotsOffloader] dispatch policy: f_cpu_store=%.6f, dispatch_table=%s",
+            "[HybridOffloader] dispatch policy: f_cpu_store=%.6f, dispatch_table=%s",
             self.f_cpu_store,
             dispatch_policy,
         )
@@ -1180,7 +1181,7 @@ class CotsOffloader(BaseOffloader):
 
         qkvo_granularity_channels = self._qkvo_granularity_channels()
         logger.info(
-            "[CotsOffloader] ready: runner=%s, sync=%s, modules=%s, "
+            "[HybridOffloader] ready: runner=%s, sync=%s, modules=%s, "
             "qkvo_granularity_channels=%d, "
             "linears=%d, mlp_blocks=%d, wo_ops=%d, weights_saved=%.4f GB, "
             "buffers=%.4f GB "
@@ -1202,7 +1203,7 @@ class CotsOffloader(BaseOffloader):
             self._dispatch_buckets,
         )
         logger.info(
-            "[CotsOffloader] cots_snap: %s",
+            "[HybridOffloader] cots_snap: %s",
             json.dumps(
                 self._cots_snap_payload(
                     cpu_weight_bytes=total_offloaded,
@@ -1236,7 +1237,7 @@ class CotsOffloader(BaseOffloader):
         total_pref = sum(per_role_pref.values())
         total_cpu = sum(per_role_cpu.values())
         logger.debug(
-            "[CotsOffloader] Effective routing @ bucket=%d:\n"
+            "[HybridOffloader] Effective routing @ bucket=%d:\n"
             "  qkv:     prefetched=%.4f GiB, cpu-computed=%.4f GiB\n"
             "  mlp_col: prefetched=%.4f GiB, cpu-computed=%.4f GiB\n"
             "  mlp_row: prefetched=%.4f GiB, cpu-computed=%.4f GiB\n"
@@ -1258,7 +1259,7 @@ class CotsOffloader(BaseOffloader):
     # --- Runtime: dispatch lookup ---
 
     def lookup_dispatch(self, num_tokens: int) -> tuple[float, float]:
-        """Round `num_tokens` up to the nearest COTS dispatch bucket."""
+        """Round `num_tokens` up to the nearest Hybrid dispatch bucket."""
         if num_tokens > self._dispatch_buckets[-1]:
             return self._eager_fallback_entry
         return self._dispatch_table[self._dispatch_bucket_for(num_tokens)]

@@ -3,10 +3,10 @@
 //
 // Phase 1c — native weight task runner implementation.
 
-#include "cots_weight_task_runner.h"
+#include "hybrid_weight_task_runner.h"
 
 #include "bf16_kernels.h"
-#include "cots_common.h"
+#include "hybrid_common.h"
 
 #include <ATen/ops/linear.h>
 #include <c10/core/InferenceMode.h>
@@ -20,7 +20,7 @@
 #include <utility>
 
 namespace vllm {
-namespace cots {
+namespace hybrid {
 
 namespace {
 
@@ -28,14 +28,16 @@ constexpr int kMaxCpus = 64;
 
 // Instrumentation gates. Counters and NVTX are controlled independently so
 // benchmark runs can collect cheap counters without emitting NVTX ranges.
-// NVTX is shared across COTS runners via NvtxScope in cots_common.h.
-namespace cots_diag {
+// NVTX is shared across Hybrid runners via NvtxScope in hybrid_common.h.
+namespace hybrid_diag {
 inline bool counters_enabled() {
-  static const bool enabled = []() { return env_flag("VLLM_COTS_COUNTERS"); }();
+  static const bool enabled = []() {
+    return env_flag("VLLM_HYBRID_COUNTERS");
+  }();
   return enabled;
 }
 
-}  // namespace cots_diag
+}  // namespace hybrid_diag
 
 // Phase 1c is bfloat16-locked (see header comment + cpu_dtype literal in
 // `vllm/config/offload.py`). Centralizing the dtype here keeps the slab
@@ -51,24 +53,25 @@ at::Tensor ContigCpuViewFromBlob(void* ptr, int64_t rows, int64_t cols) {
 
 }  // namespace
 
-CotsWeightTaskRunner::CotsWeightTaskRunner()
+HybridWeightTaskRunner::HybridWeightTaskRunner()
     : task_queue_(std::make_unique<TaskQueue>()) {
   sync_args_.runner = static_cast<void*>(this);
   sync_args_.allow_n_pending = 0;
 }
 
-CotsWeightTaskRunner::~CotsWeightTaskRunner() {
+HybridWeightTaskRunner::~HybridWeightTaskRunner() {
   // Drain before destructing the queue so any in-flight task completes.
   if (task_queue_) {
     task_queue_->sync(0);
   }
 }
 
-void CotsWeightTaskRunner::install(int64_t n_slabs, int64_t max_num_tokens) {
+void HybridWeightTaskRunner::install(int64_t n_slabs, int64_t max_num_tokens) {
   TORCH_CHECK(n_slabs >= 0, "install: n_slabs must be >= 0, got ", n_slabs);
-  TORCH_CHECK(!slabs_,
-              "install: CotsWeightTaskRunner already installed; call once per "
-              "CotsWeightTaskRunner instance");
+  TORCH_CHECK(
+      !slabs_,
+      "install: HybridWeightTaskRunner already installed; call once per "
+      "HybridWeightTaskRunner instance");
 
   // Sized-once heap array. Address-stable for the lifetime of *this so
   // captured CUDA graphs can record &slabs_[id] as host-callback userData.
@@ -83,7 +86,7 @@ void CotsWeightTaskRunner::install(int64_t n_slabs, int64_t max_num_tokens) {
   max_num_tokens_ = max_num_tokens;
 }
 
-void CotsWeightTaskRunner::check_error() {
+void HybridWeightTaskRunner::check_error() {
   if (!has_error_.load(std::memory_order_acquire)) return;
   std::lock_guard<std::mutex> lock(error_mtx_);
   std::string msg = std::move(last_error_msg_);
@@ -95,7 +98,7 @@ void CotsWeightTaskRunner::check_error() {
   throw std::runtime_error(msg);
 }
 
-int32_t CotsWeightTaskRunner::slab_bucket_capacity_tokens(
+int32_t HybridWeightTaskRunner::slab_bucket_capacity_tokens(
     int64_t task_id) const {
   TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
               "slab_bucket_capacity_tokens: task_id ", task_id,
@@ -103,13 +106,13 @@ int32_t CotsWeightTaskRunner::slab_bucket_capacity_tokens(
   return slabs_[task_id].bucket_capacity_tokens;
 }
 
-int32_t CotsWeightTaskRunner::slab_num_tokens(int64_t task_id) const {
+int32_t HybridWeightTaskRunner::slab_num_tokens(int64_t task_id) const {
   TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
               "slab_num_tokens: task_id ", task_id, " out of range");
   return slabs_[task_id].num_tokens.load(std::memory_order_acquire);
 }
 
-void CotsWeightTaskRunner::populate_slab_qkv(
+void HybridWeightTaskRunner::populate_slab_qkv(
     int64_t task_id, int32_t n_threads, int32_t bucket_capacity_tokens,
     uintptr_t x_pinned_ptr, int32_t in_dim, uintptr_t y_pinned_ptr,
     int32_t cpu_out_dim, uintptr_t w_cpu_ptr, int32_t w_cpu_rows) {
@@ -131,7 +134,7 @@ void CotsWeightTaskRunner::populate_slab_qkv(
   s.w_cpu_rows = w_cpu_rows;
 }
 
-void CotsWeightTaskRunner::populate_slab_mlp(
+void HybridWeightTaskRunner::populate_slab_mlp(
     int64_t task_id, int32_t n_threads, int32_t bucket_capacity_tokens,
     uintptr_t x_pinned_ptr, int32_t in_dim, uintptr_t y_pinned_ptr,
     int32_t cpu_out_dim, uintptr_t w_gate_ptr, int32_t w_gate_rows,
@@ -160,7 +163,7 @@ void CotsWeightTaskRunner::populate_slab_mlp(
   s.w_down_cols = w_down_cols;
 }
 
-void CotsWeightTaskRunner::populate_slab_dryrun(
+void HybridWeightTaskRunner::populate_slab_dryrun(
     int64_t task_id, int32_t bucket_capacity_tokens, uintptr_t x_pinned_ptr,
     int32_t in_dim, uintptr_t y_pinned_ptr, int32_t cpu_out_dim) {
   check_error();
@@ -180,12 +183,10 @@ void CotsWeightTaskRunner::populate_slab_dryrun(
   s.cpu_out_dim = cpu_out_dim;
 }
 
-void CotsWeightTaskRunner::submit_on_stream(int64_t task_id, int32_t num_tokens,
-                                            uintptr_t x_gpu_ptr, int64_t x_cols,
-                                            int64_t x_stride0,
-                                            int64_t x_stride1,
-                                            uintptr_t cuda_stream) {
-  NvtxScope nvtx_scope("cots:submit_on_stream");
+void HybridWeightTaskRunner::submit_on_stream(
+    int64_t task_id, int32_t num_tokens, uintptr_t x_gpu_ptr, int64_t x_cols,
+    int64_t x_stride0, int64_t x_stride1, uintptr_t cuda_stream) {
+  NvtxScope nvtx_scope("hybrid:submit_on_stream");
   // Surface any prior worker error BEFORE queueing more work.
   check_error();
   TORCH_CHECK(task_id >= 0 && task_id < slab_count_,
@@ -220,7 +221,7 @@ void CotsWeightTaskRunner::submit_on_stream(int64_t task_id, int32_t num_tokens,
   // §1c.21 counters: bump submit_count + num_tokens histogram for
   // this op kind. Diag-gated (§1c.34 cleanup C) — production-default
   // path skips the atomic adds entirely.
-  if (cots_diag::counters_enabled()) {
+  if (hybrid_diag::counters_enabled()) {
     int hist_bin;
     if (num_tokens <= 1)
       hist_bin = 0;
@@ -278,10 +279,10 @@ void CotsWeightTaskRunner::submit_on_stream(int64_t task_id, int32_t num_tokens,
     const size_t width_bytes =
         static_cast<size_t>(slab->in_dim) * sizeof(at::BFloat16);
     cudaError_t copy_err;
-    NvtxScope d2h_scope("cots:d2h_record");
+    NvtxScope d2h_scope("hybrid:d2h_record");
     // §1c.34 cleanup C: D2H byte/count counters are diagnostic only;
     // diag-gate them so the hot path skips the atomic adds.
-    const bool d2h_diag = cots_diag::counters_enabled();
+    const bool d2h_diag = hybrid_diag::counters_enabled();
     if (x_stride0 == x_cols) {
       // Contiguous row layout — single 1D copy is fastest.
       const size_t bytes = static_cast<size_t>(num_tokens) * width_bytes;
@@ -316,34 +317,34 @@ void CotsWeightTaskRunner::submit_on_stream(int64_t task_id, int32_t num_tokens,
                 (x_stride0 == x_cols ? "1D" : "2D"),
                 "): ", cudaGetErrorString(copy_err));
   }
-  NvtxScope launch_scope("cots:launch_dispatch_cb");
+  NvtxScope launch_scope("hybrid:launch_dispatch_cb");
   cudaError_t err =
-      cudaLaunchHostFunc(stream, &CotsWeightTaskRunner::DispatchCallback,
+      cudaLaunchHostFunc(stream, &HybridWeightTaskRunner::DispatchCallback,
                          static_cast<void*>(slab));
   TORCH_CHECK(
       err == cudaSuccess,
       "cudaLaunchHostFunc(DispatchCallback) failed: ", cudaGetErrorString(err));
 }
 
-void CotsWeightTaskRunner::sync_on_stream(uintptr_t cuda_stream) {
-  NvtxScope nvtx_scope("cots:sync_on_stream");
+void HybridWeightTaskRunner::sync_on_stream(uintptr_t cuda_stream) {
+  NvtxScope nvtx_scope("hybrid:sync_on_stream");
   check_error();
   // sync_args_ is a stable member of *this; safe to take its address as
   // userData for cudaLaunchHostFunc, including across CUDA graph replays.
   cudaError_t err = cudaLaunchHostFunc(
       reinterpret_cast<cudaStream_t>(cuda_stream),
-      &CotsWeightTaskRunner::SyncCallback, static_cast<void*>(&sync_args_));
+      &HybridWeightTaskRunner::SyncCallback, static_cast<void*>(&sync_args_));
   TORCH_CHECK(err == cudaSuccess, "cudaLaunchHostFunc(SyncCallback) failed: ",
               cudaGetErrorString(err));
 }
 
-void CotsWeightTaskRunner::sync_blocking() {
+void HybridWeightTaskRunner::sync_blocking() {
   task_queue_->sync(0);
   // Surface any worker error that fired while we were waiting.
   check_error();
 }
 
-void CotsWeightTaskRunner::set_worker_affinity(uint64_t cpu_set) {
+void HybridWeightTaskRunner::set_worker_affinity(uint64_t cpu_set) {
   if (cpu_set == 0) {
     return;  // No-op; leave kernel default. (Stage 4 fills this out.)
   }
@@ -379,7 +380,7 @@ void CotsWeightTaskRunner::set_worker_affinity(uint64_t cpu_set) {
   });
 }
 
-std::string CotsWeightTaskRunner::take_error() {
+std::string HybridWeightTaskRunner::take_error() {
   std::lock_guard<std::mutex> lock(error_mtx_);
   std::string msg = std::move(last_error_msg_);
   last_error_msg_.clear();
@@ -387,8 +388,8 @@ std::string CotsWeightTaskRunner::take_error() {
   return msg;
 }
 
-void CotsWeightTaskRunner::run_at_linear_inline(at::Tensor x, at::Tensor w,
-                                                at::Tensor y_out) {
+void HybridWeightTaskRunner::run_at_linear_inline(at::Tensor x, at::Tensor w,
+                                                  at::Tensor y_out) {
   // Stage 1 microbench helper: directly drive `at::linear` from C++.
   // No TaskQueue, no host callback. Lets the test compare wall-clock
   // against Python `F.linear` on bit-identical tensors and catch the
@@ -399,24 +400,25 @@ void CotsWeightTaskRunner::run_at_linear_inline(at::Tensor x, at::Tensor w,
   y_out.copy_(at::linear(x, w));
 }
 
-void CotsWeightTaskRunner::run_bf16_gemm_transposed_inline(at::Tensor x,
-                                                           at::Tensor w,
-                                                           at::Tensor y_out) {
+void HybridWeightTaskRunner::run_bf16_gemm_transposed_inline(at::Tensor x,
+                                                             at::Tensor w,
+                                                             at::Tensor y_out) {
   c10::InferenceMode g;
   bf16_gemm_transposed_at(x, w, y_out);
 }
 
-void CotsWeightTaskRunner::run_bf16_gemm_natural_inline(at::Tensor x,
-                                                        at::Tensor w,
-                                                        at::Tensor y_out) {
+void HybridWeightTaskRunner::run_bf16_gemm_natural_inline(at::Tensor x,
+                                                          at::Tensor w,
+                                                          at::Tensor y_out) {
   c10::InferenceMode g;
   bf16_gemm_natural_at(x, w, y_out);
 }
 
-void CotsWeightTaskRunner::run_bf16_mlp_inline(at::Tensor x, at::Tensor w_gate,
-                                               at::Tensor w_up,
-                                               at::Tensor w_down,
-                                               at::Tensor y_out) {
+void HybridWeightTaskRunner::run_bf16_mlp_inline(at::Tensor x,
+                                                 at::Tensor w_gate,
+                                                 at::Tensor w_up,
+                                                 at::Tensor w_down,
+                                                 at::Tensor y_out) {
   c10::InferenceMode g;
   TORCH_CHECK(x.device().is_cpu() && w_gate.device().is_cpu() &&
                   w_up.device().is_cpu() && w_down.device().is_cpu() &&
@@ -460,32 +462,32 @@ void CotsWeightTaskRunner::run_bf16_mlp_inline(at::Tensor x, at::Tensor w_gate,
       M, H, I, O);
 }
 
-at::Tensor CotsWeightTaskRunner::y_pinned_view(int64_t task_id,
-                                               int32_t num_tokens) const {
+at::Tensor HybridWeightTaskRunner::y_pinned_view(int64_t task_id,
+                                                 int32_t num_tokens) const {
   // §1c.20: build an `at::from_blob` CPU tensor view over the slab's
-  // pinned output buffer. Used by `cots_sync_then_uva`'s impl on the
+  // pinned output buffer. Used by `hybrid_sync_then_uva`'s impl on the
   // captured-graph hot path so the CPU output tensor is NEVER a
   // custom-op argument visible to Inductor.
   if (task_id < 0 || task_id >= slab_count_) {
-    throw std::out_of_range("CotsWeightTaskRunner::y_pinned_view: task_id=" +
+    throw std::out_of_range("HybridWeightTaskRunner::y_pinned_view: task_id=" +
                             std::to_string(task_id) + " out of range [0, " +
                             std::to_string(slab_count_) + ")");
   }
   const TaskSlab& slab = slabs_[task_id];
   if (slab.y_pinned_ptr == nullptr) {
     throw std::runtime_error(
-        "CotsWeightTaskRunner::y_pinned_view: slab.y_pinned_ptr is null at "
+        "HybridWeightTaskRunner::y_pinned_view: slab.y_pinned_ptr is null at "
         "task_id=" +
         std::to_string(task_id) + " (slab not populated?)");
   }
   if (num_tokens < 0) {
     throw std::invalid_argument(
-        "CotsWeightTaskRunner::y_pinned_view: num_tokens=" +
+        "HybridWeightTaskRunner::y_pinned_view: num_tokens=" +
         std::to_string(num_tokens) + " < 0");
   }
   if (max_num_tokens_ != 0 && num_tokens > max_num_tokens_) {
     throw std::invalid_argument(
-        "CotsWeightTaskRunner::y_pinned_view: num_tokens=" +
+        "HybridWeightTaskRunner::y_pinned_view: num_tokens=" +
         std::to_string(num_tokens) +
         " exceeds max_num_tokens=" + std::to_string(max_num_tokens_) +
         " (would read past the pinned buffer's tail)");
@@ -516,17 +518,18 @@ at::Tensor CotsWeightTaskRunner::y_pinned_view(int64_t task_id,
 // Submit-side host callback. Runs on the CUDA driver thread; must NOT
 // block (CUDA stream is paused while we run). Just enqueues to the
 // TaskQueue worker.
-void CotsWeightTaskRunner::DispatchCallback(void* user_data) {
-  NvtxScope nvtx_scope("cots:dispatch_cb");
+void HybridWeightTaskRunner::DispatchCallback(void* user_data) {
+  NvtxScope nvtx_scope("hybrid:dispatch_cb");
   TaskSlab* slab = static_cast<TaskSlab*>(user_data);
-  CotsWeightTaskRunner* self = static_cast<CotsWeightTaskRunner*>(slab->self);
+  HybridWeightTaskRunner* self =
+      static_cast<HybridWeightTaskRunner*>(slab->self);
   // §1c.24 attribution: stamp enqueue time so the worker can later
   // compute queue_wait = worker_start - enqueue_time. Gated by
-  // VLLM_COTS_COUNTERS=1; in production-default mode neither now_ns()
+  // VLLM_HYBRID_COUNTERS=1; in production-default mode neither now_ns()
   // nor the atomic write fires. Worker reads enqueue_time_ns
   // conditionally on the same flag, so a counter-disabled run leaves it
   // at its initial value (0).
-  if (cots_diag::counters_enabled()) {
+  if (hybrid_diag::counters_enabled()) {
     slab->enqueue_time_ns.store(now_ns(), std::memory_order_release);
     self->dispatch_cb_count_.fetch_add(1, std::memory_order_relaxed);
   }
@@ -535,16 +538,17 @@ void CotsWeightTaskRunner::DispatchCallback(void* user_data) {
 
 // Sync-side host callback. Blocks the CUDA driver thread until the
 // TaskQueue drains. The user_data is `&self->sync_args_` (stable member).
-void CotsWeightTaskRunner::SyncCallback(void* user_data) {
-  NvtxScope nvtx_scope("cots:sync_cb_wait");
+void HybridWeightTaskRunner::SyncCallback(void* user_data) {
+  NvtxScope nvtx_scope("hybrid:sync_cb_wait");
   SyncArgs* args = static_cast<SyncArgs*>(user_data);
-  CotsWeightTaskRunner* self = static_cast<CotsWeightTaskRunner*>(args->runner);
+  HybridWeightTaskRunner* self =
+      static_cast<HybridWeightTaskRunner*>(args->runner);
   // §1c.24 attribution: time the sync wait — distinguishes "driver
   // blocked waiting for the worker" from "driver doing other work
-  // then unblocking immediately". Same VLLM_COTS_COUNTERS gate as the
+  // then unblocking immediately". Same VLLM_HYBRID_COUNTERS gate as the
   // dispatch counter; in production-default mode the timestamps
   // and atomic adds are skipped.
-  if (cots_diag::counters_enabled()) {
+  if (hybrid_diag::counters_enabled()) {
     const int64_t t0 = now_ns();
     self->task_queue_->sync(args->allow_n_pending);
     const int64_t t1 = now_ns();
@@ -557,12 +561,12 @@ void CotsWeightTaskRunner::SyncCallback(void* user_data) {
 
 // --- worker-thread task body ----------------------------------------------
 
-void CotsWeightTaskRunner::RunSlabOnWorker(TaskSlab* slab) {
+void HybridWeightTaskRunner::RunSlabOnWorker(TaskSlab* slab) {
   // §1c.24 attribution: stamp worker start + queue wait, gated by
-  // VLLM_COTS_COUNTERS. Production-default leaves worker_t0 at 0 (the
+  // VLLM_HYBRID_COUNTERS. Production-default leaves worker_t0 at 0 (the
   // worker_busy_total_ns add at the end is also gated). NVTX scope
   // is independently gated inside NvtxScope's ctor.
-  const bool diag = cots_diag::counters_enabled();
+  const bool diag = hybrid_diag::counters_enabled();
   const int64_t worker_t0 = diag ? now_ns() : 0;
   if (diag) {
     const int64_t enq = slab->enqueue_time_ns.load(std::memory_order_acquire);
@@ -571,16 +575,16 @@ void CotsWeightTaskRunner::RunSlabOnWorker(TaskSlab* slab) {
                                             std::memory_order_relaxed);
     }
   }
-  const char* nvtx_name = "cots:worker";
+  const char* nvtx_name = "hybrid:worker";
   switch (slab->op_kind) {
     case TaskSlab::kQkv:
-      nvtx_name = "cots:worker_qkv";
+      nvtx_name = "hybrid:worker_qkv";
       break;
     case TaskSlab::kMlpBlock:
-      nvtx_name = "cots:worker_mlp";
+      nvtx_name = "hybrid:worker_mlp";
       break;
     case TaskSlab::kDryrunNoop:
-      nvtx_name = "cots:worker_dryrun";
+      nvtx_name = "hybrid:worker_dryrun";
       break;
   }
   NvtxScope nvtx_scope(nvtx_name);
@@ -743,11 +747,11 @@ void CotsWeightTaskRunner::RunSlabOnWorker(TaskSlab* slab) {
     }
   } catch (const std::exception& e) {
     std::lock_guard<std::mutex> lock(error_mtx_);
-    last_error_msg_ = std::string("[cots worker] ") + e.what();
+    last_error_msg_ = std::string("[hybrid worker] ") + e.what();
     has_error_.store(true, std::memory_order_release);
   } catch (...) {
     std::lock_guard<std::mutex> lock(error_mtx_);
-    last_error_msg_ = "[cots worker] unknown exception";
+    last_error_msg_ = "[hybrid worker] unknown exception";
     has_error_.store(true, std::memory_order_release);
   }
   // §1c.24: worker compute duration (NVTX scope ends when the
@@ -762,12 +766,12 @@ void CotsWeightTaskRunner::RunSlabOnWorker(TaskSlab* slab) {
 
 // --- §1c.21 live-token override ---------------------------------------
 
-void CotsWeightTaskRunner::note_uva_request(int32_t num_tokens,
-                                            int32_t cpu_out_dim) {
+void HybridWeightTaskRunner::note_uva_request(int32_t num_tokens,
+                                              int32_t cpu_out_dim) {
   // §1c.22 bookkeeping. Diag-gated (§1c.34 cleanup C) —
   // measurement-only path; no functional dependency.
   if (num_tokens <= 0 || cpu_out_dim <= 0) return;
-  if (!cots_diag::counters_enabled()) return;
+  if (!hybrid_diag::counters_enabled()) return;
   const int64_t bytes = static_cast<int64_t>(num_tokens) *
                         static_cast<int64_t>(cpu_out_dim) *
                         static_cast<int64_t>(sizeof(at::BFloat16));
@@ -775,18 +779,18 @@ void CotsWeightTaskRunner::note_uva_request(int32_t num_tokens,
   uva_record_count_.fetch_add(1, std::memory_order_relaxed);
 }
 
-void CotsWeightTaskRunner::set_live_num_tokens(int32_t n) {
+void HybridWeightTaskRunner::set_live_num_tokens(int32_t n) {
   TORCH_CHECK(n >= 0, "set_live_num_tokens: n=", n,
               " < 0; pass 0 to clear the override.");
   // Release store: the worker's acquire load in RunSlabOnWorker pairs
   // with this. The caller's responsibility is to set this BEFORE the
-  // captured graph replay begins (i.e., from CotsOffloader.on_dispatch
+  // captured graph replay begins (i.e., from HybridOffloader.on_dispatch
   // outside the captured region). This store
   // is FUNCTIONAL (drives the worker's effective_n) and must stay
   // always-on; the live_set_calls / live_last_value counters
   // alongside are diagnostic only and diag-gated (§1c.34 cleanup C).
   runtime_num_tokens_.store(n, std::memory_order_release);
-  if (cots_diag::counters_enabled()) {
+  if (hybrid_diag::counters_enabled()) {
     live_set_calls_.fetch_add(1, std::memory_order_relaxed);
     live_last_value_.store(n, std::memory_order_relaxed);
   }
@@ -795,7 +799,7 @@ void CotsWeightTaskRunner::set_live_num_tokens(int32_t n) {
 // --- §1c.21 perf-investigation counters --------------------------------
 
 std::vector<std::pair<std::string, int64_t>>
-CotsWeightTaskRunner::get_counters() const {
+HybridWeightTaskRunner::get_counters() const {
   std::vector<std::pair<std::string, int64_t>> out;
   out.reserve(40);
   auto load = [](const std::atomic<int64_t>& a) {
@@ -855,7 +859,7 @@ CotsWeightTaskRunner::get_counters() const {
   return out;
 }
 
-void CotsWeightTaskRunner::reset_counters() {
+void HybridWeightTaskRunner::reset_counters() {
   submit_count_qkv_.store(0, std::memory_order_relaxed);
   submit_count_mlp_.store(0, std::memory_order_relaxed);
   submit_count_dryrun_.store(0, std::memory_order_relaxed);
@@ -889,5 +893,5 @@ void CotsWeightTaskRunner::reset_counters() {
   worker_clamp_override_count_.store(0, std::memory_order_relaxed);
 }
 
-}  // namespace cots
+}  // namespace hybrid
 }  // namespace vllm

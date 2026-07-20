@@ -16,7 +16,7 @@ from vllm.benchmarks.lib.utils import convert_to_pytorch_benchmark_format, write
 from vllm.engine.arg_utils import EngineArgs
 from vllm.inputs import PromptType
 from vllm.sampling_params import BeamSearchParams
-from vllm.utils.cots_diag import COUNTERS_ENABLED, NVTX_ENABLED
+from vllm.utils.hybrid_diag import COUNTERS_ENABLED, NVTX_ENABLED
 
 
 def save_to_pytorch_benchmark_format(
@@ -125,19 +125,19 @@ def main(args: argparse.Namespace):
     # §1c.24: env-gated marker/counter reset around each non-profile run. Each
     # call to `run_to_completion(do_profile=False)` (warmup AND
     # measured iters) gets its own NVTX marker pair when
-    # VLLM_COTS_NVTX=1. Counter reset is independently controlled by
-    # VLLM_COTS_COUNTERS=1 so counter-only runs do not emit NVTX ranges.
+    # VLLM_HYBRID_NVTX=1. Counter reset is independently controlled by
+    # VLLM_HYBRID_COUNTERS=1 so counter-only runs do not emit NVTX ranges.
 
     def _diag_pre():
         if COUNTERS_ENABLED:
             try:
-                from vllm.model_executor.offloader import cots_ops as _cots_ops
+                from vllm.model_executor.offloader import hybrid_ops as _hybrid_ops
 
-                _cots_ops.reset_all_counters()
+                _hybrid_ops.reset_all_counters()
             except Exception:
                 pass
         if NVTX_ENABLED:
-            torch.cuda.nvtx.range_push("cots:bench_iter")
+            torch.cuda.nvtx.range_push("hybrid:bench_iter")
 
     def _diag_post():
         if NVTX_ENABLED:

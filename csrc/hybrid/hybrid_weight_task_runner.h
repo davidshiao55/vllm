@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
-// Phase 1c native weight task runner for COTS. Adapted from the KTransformers
+// Phase 1c native weight task runner for Hybrid. Adapted from the KTransformers
 // CPU backend with WorkerPool removed (oneDNN/ATen own intra-op threading) and
 // a slab-based task dispatch added.
 //
 // See docs/implementation_roadmap.md Phase 1c and
 // docs/phase1a_findings.md §1.14 for the substrate motivation.
 
-#ifndef VLLM_COTS_WEIGHT_TASK_RUNNER_H_
-#define VLLM_COTS_WEIGHT_TASK_RUNNER_H_
+#ifndef VLLM_HYBRID_WEIGHT_TASK_RUNNER_H_
+#define VLLM_HYBRID_WEIGHT_TASK_RUNNER_H_
 
 #include <ATen/ATen.h>
 #include <c10/core/ScalarType.h>
@@ -26,11 +26,11 @@
 #include "task_queue.h"
 
 namespace vllm {
-namespace cots {
+namespace hybrid {
 
 // Per-(layer, bucket, op_kind) task slab. Address-stable for the lifetime
-// of CotsWeightTaskRunner (slabs_ is reserve()'d once at install time and never
-// resized) so that captured CUDA graphs can record &slabs_[id] as their
+// of HybridWeightTaskRunner (slabs_ is reserve()'d once at install time and
+// never resized) so that captured CUDA graphs can record &slabs_[id] as their
 // host-callback userData.
 //
 // Layout / population rules:
@@ -48,8 +48,8 @@ struct alignas(64) TaskSlab {
 
   // Self-pointer pattern preserved from kt-kernel (the host callback writes
   // it before calling into the dispatcher, which lets the static dispatcher
-  // recover the owning CotsWeightTaskRunner*). For our reserve-once design the
-  // pointer is in fact set once at install time and never rewritten, but we
+  // recover the owning HybridWeightTaskRunner*). For our reserve-once design
+  // the pointer is in fact set once at install time and never rewritten, but we
   // keep the field at the original KTransformers self-pointer offset for parity
   // with debug tooling.
   void* self = nullptr;
@@ -63,7 +63,7 @@ struct alignas(64) TaskSlab {
   std::atomic<int32_t> num_tokens{0};
 
   // §1c.24 diagnostic-only: written in DispatchCallback when
-  // VLLM_COTS_COUNTERS=1 so the worker can attribute (worker_start -
+  // VLLM_HYBRID_COUNTERS=1 so the worker can attribute (worker_start -
   // enqueue_time) as TaskQueue wait. 0 = unset (production-default
   // mode never writes this).
   std::atomic<int64_t> enqueue_time_ns{0};
@@ -93,7 +93,7 @@ struct alignas(64) TaskSlab {
   void* y_pinned_ptr = nullptr;
   int32_t cpu_out_dim = 0;
   // dtype is hard-coded BFloat16 by the .cpp view builders (the
-  // `CotsOffloadConfig.cpu_dtype` literal locks this for Phase 1c).
+  // `HybridOffloadConfig.cpu_dtype` literal locks this for Phase 1c).
 
   // QKV (op_kind == kQkv): contiguous row-major weight slice.
   void* w_cpu_ptr = nullptr;
@@ -114,22 +114,22 @@ struct alignas(64) TaskSlab {
 };
 
 // Static sync-callback userData — owned as a stable member of
-// CotsWeightTaskRunner so its address is valid across CUDA graph replays.
+// HybridWeightTaskRunner so its address is valid across CUDA graph replays.
 struct SyncArgs {
   void* runner = nullptr;
   size_t allow_n_pending = 0;
 };
 
-class CotsWeightTaskRunner {
+class HybridWeightTaskRunner {
  public:
-  CotsWeightTaskRunner();
-  ~CotsWeightTaskRunner();
+  HybridWeightTaskRunner();
+  ~HybridWeightTaskRunner();
 
-  CotsWeightTaskRunner(const CotsWeightTaskRunner&) = delete;
-  CotsWeightTaskRunner& operator=(const CotsWeightTaskRunner&) = delete;
+  HybridWeightTaskRunner(const HybridWeightTaskRunner&) = delete;
+  HybridWeightTaskRunner& operator=(const HybridWeightTaskRunner&) = delete;
 
   // Reserves N slabs, sized once. After install(), slabs_.size() ==
-  // n_slabs is invariant for the lifetime of this CotsWeightTaskRunner.
+  // n_slabs is invariant for the lifetime of this HybridWeightTaskRunner.
   // `max_num_tokens` is the upper bound on per-call num_tokens; it
   // gates submit/run-side bounds checks against the pinned x/y
   // buffers. Subsequent populate_slab calls only mutate the
@@ -141,7 +141,7 @@ class CotsWeightTaskRunner {
 
   // Populate a previously-reserved slab. All pointers must be POST-narrow
   // data_ptr()s (see TaskSlab doc above). Idempotent. dtype is hard-coded
-  // to bfloat16 — `CotsOffloadConfig.cpu_dtype` is `Literal["bfloat16"]`
+  // to bfloat16 — `HybridOffloadConfig.cpu_dtype` is `Literal["bfloat16"]`
   // (per phase0 §0.3.2 oneDNN BF16 is the only fast CPU GEMM path on
   // AVX2 hardware), so passing `torch.dtype` over pybind would just be
   // a brittle int-enum dance. If we ever support fp16/fp32, take dtype
@@ -186,7 +186,7 @@ class CotsWeightTaskRunner {
   // is strictly ordered behind the copy. `x_stride1 == 1` is
   // required (no transposed-stride layouts in production decode).
   //
-  // The Python custom-op `vllm.cots_submit_gemm` passes layer/op routing
+  // The Python custom-op `vllm.hybrid_submit_gemm` passes layer/op routing
   // scalars plus tensor shape/stride metadata. Inductor only sees CUDA
   // tensors and scalar ids; this method receives the resolved native task id.
   void submit_on_stream(int64_t task_id, int32_t num_tokens,
@@ -264,12 +264,12 @@ class CotsWeightTaskRunner {
   // pinned output buffer for the given task. Trusted: the y_pinned_ptr
   // came from `_y_pinned`, which was allocated with `pin_memory=True`
   // and validated at install time — re-checking `is_pinned()` here
-  // would duplicate work. Used by `cots_sync_then_uva`'s impl to
+  // would duplicate work. Used by `hybrid_sync_then_uva`'s impl to
   // reach the worker's output WITHOUT exposing the CPU tensor as a
   // graph input that Inductor would materialize via a CPU↔GPU
   // shuffle. Shape: {num_tokens, slab.cpu_out_dim}, dtype bfloat16,
   // contiguous. Caller must NOT outlive the slab (i.e., this
-  // CotsWeightTaskRunner instance).
+  // HybridWeightTaskRunner instance).
   at::Tensor y_pinned_view(int64_t task_id, int32_t num_tokens) const;
 
   // §1c.21 fix — live unpadded token count plumbed through OUT OF
@@ -279,7 +279,7 @@ class CotsWeightTaskRunner {
   // ~17 ms/GEMM × 7000 calls = ~120 s/generate wasted (see
   // phase1c_findings.md §1c.21 counter-driven diagnosis).
   //
-  // Caller (CotsOffloader.prepare_before_forward, called by
+  // Caller (HybridOffloader.prepare_before_forward, called by
   // cudagraph_utils.py before each captured replay) sets this to the
   // live unpadded token count from
   // `scheduler_output.total_num_scheduled_tokens`. The worker reads it via the
@@ -302,7 +302,7 @@ class CotsWeightTaskRunner {
   // this fix collapses.
   void set_live_num_tokens(int32_t n);
 
-  // §1c.22: invoked from `cots_sync_then_uva`'s Python impl to
+  // §1c.22: invoked from `hybrid_sync_then_uva`'s Python impl to
   // record the captured Triton kernel's bucket-sized H2D request
   // (bytes = num_tokens × cpu_out_dim × bf16_size). Pure
   // bookkeeping — no side effect on the kernel.
@@ -315,7 +315,7 @@ class CotsWeightTaskRunner {
   // `memory_order_relaxed` — observational, not load-bearing for
   // correctness.
   //
-  // Hypothesis being tested: under vLLM full CUDA graph replay, COTS
+  // Hypothesis being tested: under vLLM full CUDA graph replay, Hybrid
   // sees `x_gpu.shape[0]` == captured graph-bucket size (e.g., 256)
   // even at B=1 decode, so the worker does CPU GEMMs for ~256 tokens
   // every step. The histogram pins this immediately — if
@@ -453,7 +453,7 @@ class CotsWeightTaskRunner {
   // §1c.22: bucket-sized UVA H2D transfer requested at GRAPH
   // RECORD time (captured Triton grid sized for bucket ×
   // cpu_out_dim). Bumped by `note_uva_request(num_tokens,
-  // cpu_out_dim)` from `cots_sync_then_uva`'s Python impl, which
+  // cpu_out_dim)` from `hybrid_sync_then_uva`'s Python impl, which
   // runs once during graph capture, NOT at replay. For per-replay
   // UVA bytes use `uva_replay_bucket_bytes_` above.
   std::atomic<int64_t> uva_record_bytes_{0};
@@ -461,12 +461,12 @@ class CotsWeightTaskRunner {
 
   // §1c.24 diagnostic attribution counters. Wall-clock totals
   // (steady_clock ns) and invocation counts that let the bench
-  // summary split a generate's COTS time into worker compute,
+  // summary split a generate's Hybrid time into worker compute,
   // queue wait, sync wait, and dispatch_cb fires — without nsys.
   // Useful as a quick check when nsys is unavailable; nsys NVTX
-  // markers (gated by VLLM_COTS_NVTX=1) are the primary tool
+  // markers (gated by VLLM_HYBRID_NVTX=1) are the primary tool
   // for full timeline attribution. All increments are gated on
-  // `cots_diag::counters_enabled()` in the .cpp so this is purely
+  // `hybrid_diag::counters_enabled()` in the .cpp so this is purely
   // diagnostic — the production-default hot path skips the
   // timestamp + atomic-add work entirely.
   std::atomic<int64_t> dispatch_cb_count_{0};
@@ -490,7 +490,7 @@ class CotsWeightTaskRunner {
   std::atomic<int64_t> worker_clamp_override_count_{0};
 };
 
-}  // namespace cots
+}  // namespace hybrid
 }  // namespace vllm
 
-#endif  // VLLM_COTS_WEIGHT_TASK_RUNNER_H_
+#endif  // VLLM_HYBRID_WEIGHT_TASK_RUNNER_H_

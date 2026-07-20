@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Storage, partition, and prefetch-buffer helpers for COTS."""
+"""Storage, partition, and prefetch-buffer helpers for Hybrid."""
 
 from __future__ import annotations
 
@@ -19,23 +19,23 @@ from cots.snap import (
     snap_qkvo_output_channels as _snap_qkvo_output_channels,
 )
 
-from vllm.model_executor.offloader.cots_utils import (
+from vllm.model_executor.offloader.hybrid_utils import (
     _complement,
 )
 from vllm.utils.platform_utils import is_pin_memory_available
 
 SplitAxis = Literal["output", "input"]
-CotsLinearRole = Literal["qkv", "mlp_gate_up", "mlp_down", "wo"]
+HybridLinearRole = Literal["qkv", "mlp_gate_up", "mlp_down", "wo"]
 
 OUTPUT_SPLIT_AXIS: SplitAxis = "output"
 INPUT_SPLIT_AXIS: SplitAxis = "input"
 
-QKV_ROLE: CotsLinearRole = "qkv"
-MLP_GATE_UP_ROLE: CotsLinearRole = "mlp_gate_up"
-MLP_DOWN_ROLE: CotsLinearRole = "mlp_down"
-WO_ROLE: CotsLinearRole = "wo"
+QKV_ROLE: HybridLinearRole = "qkv"
+MLP_GATE_UP_ROLE: HybridLinearRole = "mlp_gate_up"
+MLP_DOWN_ROLE: HybridLinearRole = "mlp_down"
+WO_ROLE: HybridLinearRole = "wo"
 
-ROLE_SPLIT_AXIS: dict[CotsLinearRole, SplitAxis] = {
+ROLE_SPLIT_AXIS: dict[HybridLinearRole, SplitAxis] = {
     QKV_ROLE: OUTPUT_SPLIT_AXIS,
     MLP_GATE_UP_ROLE: OUTPUT_SPLIT_AXIS,
     MLP_DOWN_ROLE: INPUT_SPLIT_AXIS,
@@ -65,7 +65,7 @@ def _qkv_dense_tail_counts(
     return n_q_tail, n_k, n_v
 
 
-class CotsLinearHandle:
+class HybridLinearHandle:
     """Per-Linear partition primitive: storage + load. No execution.
 
     Role decides module-specific splitting:
@@ -86,7 +86,7 @@ class CotsLinearHandle:
     def __init__(
         self,
         *,
-        role: CotsLinearRole,
+        role: HybridLinearRole,
         linear: nn.Module,
         qualified_name: str,
         in_dim: int,
@@ -176,7 +176,7 @@ class CotsLinearHandle:
         # Decoder-layer index. Set by the offloader after `_build_handles`.
         # Phase 1b uses it for prefetch slot rotation (`layer_idx % K`).
         self.layer_idx: int = -1
-        # Prefetch slot index = `layer_idx % CotsPrefetchBufferPool.K`. Set
+        # Prefetch slot index = `layer_idx % HybridPrefetchBufferPool.K`. Set
         # by the offloader when constructing the buffer pool.
         self.slot_idx: int = -1
         # Per-bucket prefetch geometry — populated by
@@ -203,7 +203,7 @@ class CotsLinearHandle:
         #   rows of the slot are valid. Per-half row count for MLP gate/up
         #   (`gate[:a]` AND `up[:a]` valid → available_rows == a); total
         #   prefix rows for qkv/wo/mlp_down. 0 = empty.
-        self.prefetch_owner_in_slot: list[CotsLinearHandle | None] = []
+        self.prefetch_owner_in_slot: list[HybridLinearHandle | None] = []
         self.prefetch_available_rows_in_slot: list[int] = []
         # Stage 7-C: row-handle `w_cpu` is stored in transposed
         # `(n_cpu, out_dim)` layout (see install()); its first
@@ -216,14 +216,14 @@ class CotsLinearHandle:
     @staticmethod
     def _dense_output_tail_handle(
         *,
-        role: CotsLinearRole,
+        role: HybridLinearRole,
         linear: nn.Module,
         qualified_name: str,
         f_cpu_store: float,
         qkvo_head_dim: int,
         q_size: int | None = None,
         kv_size: int | None = None,
-    ) -> CotsLinearHandle | None:
+    ) -> HybridLinearHandle | None:
         out_dim, in_dim = tuple(linear.weight.shape)
         n_cpu = _snap_qkvo_output_channels(
             f_cpu_store * out_dim,
@@ -235,7 +235,7 @@ class CotsLinearHandle:
         cpu_indices = torch.arange(
             out_dim - n_cpu, out_dim, dtype=torch.long, device="cpu"
         )
-        return CotsLinearHandle(
+        return HybridLinearHandle(
             role=role,
             linear=linear,
             qualified_name=qualified_name,
@@ -259,7 +259,7 @@ class CotsLinearHandle:
         *,
         head_dim: int,
         f_cpu_store: float,
-    ) -> CotsLinearHandle | None:
+    ) -> HybridLinearHandle | None:
         parts = linear.output_partition_sizes
         assert len(parts) == 3, f"QKV expected 3 partitions, got {parts}"
         q_part, k_part, v_part = parts
@@ -286,7 +286,7 @@ class CotsLinearHandle:
         qualified_name: str,
         *,
         f_cpu_store: float,
-    ) -> CotsLinearHandle | None:
+    ) -> HybridLinearHandle | None:
         out_dim, in_dim = tuple(linear.weight.shape)
         parts = linear.output_partition_sizes
         assert len(parts) == 2 and parts[0] == parts[1], (
@@ -321,7 +321,7 @@ class CotsLinearHandle:
         qualified_name: str,
         *,
         f_cpu_store: float,
-    ) -> CotsLinearHandle | None:
+    ) -> HybridLinearHandle | None:
         out_dim, in_dim = tuple(linear.weight.shape)
         n_cpu = _snap_mlp_channels(f_cpu_store * in_dim, in_dim)
         if n_cpu == 0:
@@ -351,7 +351,7 @@ class CotsLinearHandle:
         *,
         f_cpu_store: float,
         qkvo_head_dim: int = DEFAULT_QKVO_HEAD_DIM,
-    ) -> CotsLinearHandle | None:
+    ) -> HybridLinearHandle | None:
         """WO dense output-row split.
 
         MLP gate/up is also output-axis split, but it uses a merged two-half
@@ -375,7 +375,7 @@ class CotsLinearHandle:
 
         After this returns, `linear.weight.data` is at slice shape; the loader
         closure is responsible for splitting incoming `loaded_weight` into
-        the GPU and CPU portions at load time. Tags `linear._cots_handle`.
+        the GPU and CPU portions at load time. Tags `linear._hybrid_handle`.
         """
         weight_param = linear_weight = self.linear.weight
         if self.split_axis == OUTPUT_SPLIT_AXIS:
@@ -407,7 +407,7 @@ class CotsLinearHandle:
         self.linear.weight_loader = wrapped
         linear_weight.weight_loader = wrapped
         # Tag the linear so operators / tests can look up the handle.
-        self.linear._cots_handle = self  # type: ignore[attr-defined]
+        self.linear._hybrid_handle = self  # type: ignore[attr-defined]
 
     def _build_weight_loader(self) -> Callable:
         """Return the role-specific weight_loader closure."""
@@ -419,7 +419,7 @@ class CotsLinearHandle:
             return self._wo_weight_loader
         if self.role == QKV_ROLE:
             return self._qkv_weight_loader
-        raise ValueError(f"unknown COTS linear role: {self.role}")
+        raise ValueError(f"unknown Hybrid linear role: {self.role}")
 
     # ------------------------------------------------------------------
     # Per-bucket prefetch geometry. Populated after install. Loader closures
@@ -507,7 +507,7 @@ class CotsLinearHandle:
                 cap,
             )
         else:
-            raise ValueError(f"unknown COTS linear role: {self.role}")
+            raise ValueError(f"unknown Hybrid linear role: {self.role}")
 
         # Index extraction is per role and depends on `cpu_indices`'s layout.
         if self.role == MLP_GATE_UP_ROLE:
@@ -588,7 +588,7 @@ class CotsLinearHandle:
             self.w_cpu[n_cpu_per_half:, :].copy_(cpu_view, non_blocking=False)
         else:
             raise ValueError(
-                f"cots merged col loader: expected loaded_shard_id in {{0, 1}}, "
+                f"hybrid merged col loader: expected loaded_shard_id in {{0, 1}}, "
                 f"got {loaded_shard_id!r}"
             )
 
@@ -653,13 +653,13 @@ class CotsLinearHandle:
                 )
         else:
             raise ValueError(
-                f"cots qkv loader: expected loaded_shard_id in {{'q','k','v'}}, "
+                f"hybrid qkv loader: expected loaded_shard_id in {{'q','k','v'}}, "
                 f"got {loaded_shard_id!r}"
             )
 
 
 # ---------------------------------------------------------------------------
-# Execution layer: CotsPrefetchBufferPool
+# Execution layer: HybridPrefetchBufferPool
 #
 # Layer-ahead weight-prefetch destination. Allocates K=2 GPU slot views per
 # offloaded handle so prefetch for layer i+1 can overlap with layer i's
@@ -673,7 +673,7 @@ class CotsLinearHandle:
 # Sized to the full CPU-stored slice (`max_n_prefetch == n_cpu`);
 # per-forward H2D narrows to the active bucket's `n_prefetch_by_bucket[b]`.
 # ---------------------------------------------------------------------------
-class CotsPrefetchBufferPool:
+class HybridPrefetchBufferPool:
     """K=2 slot rotation. K slots PER UNIQUE shape, SHARED across layers.
 
     Mirrors `prefetch.py`'s `StaticBufferPool`: at G=1 (every layer
@@ -695,7 +695,7 @@ class CotsPrefetchBufferPool:
 
     def __init__(
         self,
-        handles: list[CotsLinearHandle],
+        handles: list[HybridLinearHandle],
         device: torch.device,
     ):
         self.total_bytes = 0
@@ -703,7 +703,7 @@ class CotsPrefetchBufferPool:
 
         # Group handles by (role, slot_shape). Within a group, all handles
         # share K slots, rotated at runtime by `handle.slot_idx`.
-        groups: dict[tuple, list[CotsLinearHandle]] = {}
+        groups: dict[tuple, list[HybridLinearHandle]] = {}
         for h in handles:
             if h.max_n_prefetch == 0:
                 h.w_prefetch_slots = []
@@ -741,7 +741,7 @@ class CotsPrefetchBufferPool:
             # owner / available-rows lists are also shared (same Python
             # list object bound to every handle), so start() writes from
             # one handle are visible to all sharers of the physical slot.
-            shared_owners: list[CotsLinearHandle | None] = [None] * self.K
+            shared_owners: list[HybridLinearHandle | None] = [None] * self.K
             shared_avail: list[int] = [0] * self.K
             for h in group_handles:
                 h.w_prefetch_slots = shared_slots
@@ -753,7 +753,7 @@ class CotsPrefetchBufferPool:
 # Execution layer: WeightPrefetchStreamer
 #
 # Layer-ahead H2D streamer. Owns the copy stream, per-layer copy-done events,
-# and the slot-rotation policy. `CotsOffloader`'s four `BaseOffloader`
+# and the slot-rotation policy. `HybridOffloader`'s four `BaseOffloader`
 # lifecycle methods delegate to this class. No model knowledge — operates on
 # opaque handles.
 # Phase 1c does not touch this class; cudaLaunchHostFunc is the runner's
@@ -764,9 +764,9 @@ class WeightPrefetchStreamer:
 
     Methods are 1:1 ports of `prefetch.py`'s lifecycle (copy stream, fork
     event, per-layer copy-done event, capture-vs-eager wait branching) but
-    operate on `CotsLinearHandle` directly — no module forward hooks or
+    operate on `HybridLinearHandle` directly — no module forward hooks or
     `_ModuleOffloader` indirection. Layer ordering and hooks are owned by
-    `CotsOffloader`.
+    `HybridOffloader`.
     """
 
     def __init__(
@@ -780,7 +780,7 @@ class WeightPrefetchStreamer:
         ]
         self._event_valid_for_eager: list[bool] = [False] * n_layers
         self._prefetch_in_capture: list[bool] = [False] * n_layers
-        # Public COTS dry-run is a control-plane diagnostic. The streamer
+        # Public Hybrid dry-run is a control-plane diagnostic. The streamer
         # skips H2D copies while preserving event ordering and slot metadata;
         # operators skip the prefetched-slice GPU compute contribution.
         self._dry_run = dry_run
@@ -788,14 +788,14 @@ class WeightPrefetchStreamer:
         # pre-hook. Read by `start` to size the bucket-specific H2D.
         self.current_bucket: int = 0
         # Owned externally; offloader sets after constructing the pool.
-        self.buffer_pool: CotsPrefetchBufferPool | None = None
+        self.buffer_pool: HybridPrefetchBufferPool | None = None
 
     def set_current_bucket(
         self, num_tokens: int, bucket_for: Callable[[int], int]
     ) -> None:
         self.current_bucket = bucket_for(num_tokens)
 
-    def start(self, layer_idx: int, handles: list[CotsLinearHandle]) -> None:
+    def start(self, layer_idx: int, handles: list[HybridLinearHandle]) -> None:
         """Issue H2D for this layer's handles using `current_bucket`. One
         memcpy per non-zero handle on `copy_stream`; single event records
         at layer end so `wait(layer_idx)` is one event-sync."""
@@ -884,7 +884,7 @@ class WeightPrefetchStreamer:
         self._event_valid_for_eager[layer_idx] = not in_capture
 
     def prepare_for_forward_bucket(
-        self, layer_idx: int, handles: list[CotsLinearHandle]
+        self, layer_idx: int, handles: list[HybridLinearHandle]
     ) -> None:
         """Idempotent boundary repair for `layer_idx` at `current_bucket`.
         Repairs the layer-0 slot relative to the active bucket. For qkv, wo,

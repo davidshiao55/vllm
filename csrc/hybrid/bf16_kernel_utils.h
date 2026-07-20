@@ -4,7 +4,7 @@
 #pragma once
 
 #if !defined(__AVX2__) || !defined(__FMA__)
-  #error "COTS BF16 kernels require AVX2 and FMA"
+  #error "Hybrid BF16 kernels require AVX2 and FMA"
 #endif
 
 #include <immintrin.h>
@@ -13,7 +13,7 @@
 #include <cstring>
 
 namespace vllm {
-namespace cots {
+namespace hybrid {
 namespace detail {
 
 inline float bf16_to_float(uint16_t value) {
@@ -98,5 +98,5 @@ inline void dot_two_rows(const uint16_t* x, const uint16_t* w0,
 }
 
 }  // namespace detail
-}  // namespace cots
+}  // namespace hybrid
 }  // namespace vllm

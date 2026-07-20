@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Output-split linear, MLP, scatter, and UVA-facing operators for COTS."""
+"""Output-split linear, MLP, scatter, and UVA-facing operators for Hybrid."""
 
 from __future__ import annotations
 
@@ -10,24 +10,24 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from vllm.model_executor.offloader.cots_runners import (
-    NativeCotsWeightRunner,
+from vllm.model_executor.offloader.hybrid_runners import (
+    NativeHybridWeightRunner,
 )
-from vllm.model_executor.offloader.cots_storage import (
+from vllm.model_executor.offloader.hybrid_storage import (
     MLP_DOWN_ROLE,
     MLP_GATE_UP_ROLE,
     OUTPUT_SPLIT_AXIS,
     QKV_ROLE,
     WO_ROLE,
-    CotsLinearHandle,
+    HybridLinearHandle,
 )
 
 if TYPE_CHECKING:
-    from vllm.model_executor.offloader.cots_offloader import CotsOffloader
+    from vllm.model_executor.offloader.hybrid_offloader import HybridOffloader
 
 
 def _assert_prefetch_slot_ready(
-    h: CotsLinearHandle,
+    h: HybridLinearHandle,
     required_rows: int,
     *,
     underfilled_name: str,
@@ -51,7 +51,7 @@ def _assert_prefetch_slot_ready(
     )
 
 
-class CotsOutputSplitLinearOp:
+class HybridOutputSplitLinearOp:
     """Patched `quant_method.apply` for output-split linears.
 
     GPU computes its permanent output slice; CPU computes its slice via the
@@ -63,9 +63,9 @@ class CotsOutputSplitLinearOp:
 
     def __init__(
         self,
-        handle: CotsLinearHandle,
-        runner: NativeCotsWeightRunner,
-        offloader: CotsOffloader,
+        handle: HybridLinearHandle,
+        runner: NativeHybridWeightRunner,
+        offloader: HybridOffloader,
         original_quant_method,
         *,
         op_kind: str = "qkv",
@@ -99,13 +99,13 @@ class CotsOutputSplitLinearOp:
         # live token count. So `num_tokens` here is really the
         # activation buffer's row capacity (max-sized), not the
         # number of live tokens. Bucket-specific routing is resolved behind
-        # COTS custom-op boundaries from the active dispatch state published
+        # Hybrid custom-op boundaries from the active dispatch state published
         # out of graph.
         num_tokens = x.shape[0]
         enable_cpu = not dry_run and offloader._y_gpu is not None
         enable_prefetch = not dry_run
         runner_id = self._runner._runner_id
-        from vllm.model_executor.offloader import cots_ops
+        from vllm.model_executor.offloader import hybrid_ops
 
         y_dst: torch.Tensor
         if enable_cpu:
@@ -130,11 +130,11 @@ class CotsOutputSplitLinearOp:
         # GPU prefetched slice — runs concurrently on the same compute stream
         # after `wait_prefetch` (issued by the layer-forward hook) has joined
         # the copy stream's H2D.
-        out_pref = torch.ops.vllm.cots_prefetch_linear(
+        out_pref = torch.ops.vllm.hybrid_prefetch_linear(
             x,
             runner_id,
             int(h.layer_idx),
-            cots_ops.op_kind_code(self._op_kind),
+            hybrid_ops.op_kind_code(self._op_kind),
             int(h.max_n_prefetch),
             bool(enable_prefetch),
         )
@@ -161,13 +161,13 @@ class CotsOutputSplitLinearOp:
                 y_dst, gpu_a, gpu_b, x, h.layer_idx, self._op_kind
             )
 
-        out = torch.ops.vllm.cots_scatter_col_outputs(
+        out = torch.ops.vllm.hybrid_scatter_col_outputs(
             out_perm,
             out_pref,
             y_dst,
             runner_id,
             int(h.layer_idx),
-            cots_ops.op_kind_code(self._op_kind),
+            hybrid_ops.op_kind_code(self._op_kind),
             int(h.out_dim),
             bool(enable_prefetch),
             bool(enable_cpu),
@@ -177,14 +177,14 @@ class CotsOutputSplitLinearOp:
         return out
 
 
-class CotsQKVOp(CotsOutputSplitLinearOp):
+class HybridQKVOp(HybridOutputSplitLinearOp):
     """Output-split operator for QKVParallelLinear."""
 
     def __init__(
         self,
-        handle: CotsLinearHandle,
-        runner: NativeCotsWeightRunner,
-        offloader: CotsOffloader,
+        handle: HybridLinearHandle,
+        runner: NativeHybridWeightRunner,
+        offloader: HybridOffloader,
         original_quant_method,
     ):
         super().__init__(
@@ -197,7 +197,7 @@ class CotsQKVOp(CotsOutputSplitLinearOp):
         )
 
 
-class CotsWOOp(CotsOutputSplitLinearOp):
+class HybridWOOp(HybridOutputSplitLinearOp):
     """Patched `quant_method.apply` for WO (`o_proj`) output-column split.
 
     WO uses a dense output split: GPU, prefetched-GPU, and CPU slices produce
@@ -207,9 +207,9 @@ class CotsWOOp(CotsOutputSplitLinearOp):
 
     def __init__(
         self,
-        handle: CotsLinearHandle,
-        runner: NativeCotsWeightRunner,
-        offloader: CotsOffloader,
+        handle: HybridLinearHandle,
+        runner: NativeHybridWeightRunner,
+        offloader: HybridOffloader,
         original_quant_method,
     ):
         super().__init__(
@@ -222,7 +222,7 @@ class CotsWOOp(CotsOutputSplitLinearOp):
         )
 
 
-class CotsSwiGLUMLPOp:
+class HybridSwiGLUMLPOp:
     """Block-level operator for fused MLP1 + SwiGLU + MLP2. Installed by
     replacing the parent module's `forward` (e.g., `Qwen2MLP.forward`).
 
@@ -236,11 +236,11 @@ class CotsSwiGLUMLPOp:
         self,
         gate_up_layer: nn.Module,
         down_layer: nn.Module,
-        gate_up_handle: CotsLinearHandle,
-        down_handle: CotsLinearHandle,
+        gate_up_handle: HybridLinearHandle,
+        down_handle: HybridLinearHandle,
         act_fn: nn.Module,
-        runner: NativeCotsWeightRunner,
-        offloader: CotsOffloader,
+        runner: NativeHybridWeightRunner,
+        offloader: HybridOffloader,
         qualified_name: str,
     ):
         assert gate_up_handle.role == MLP_GATE_UP_ROLE
@@ -275,13 +275,13 @@ class CotsSwiGLUMLPOp:
         assert dn_h.w_cpu is not None
         # NOTE: under torch.compile + BACKED dynamic shapes, this is
         # really the activation buffer's row capacity (= max_num_batched_tokens),
-        # not the live token count. See CotsOutputSplitLinearOp.apply for the full
+        # not the live token count. See HybridOutputSplitLinearOp.apply for the full
         # comment. Used only for shape-consistent buffer slicing.
         num_tokens = x.shape[0]
         enable_cpu = not dry_run and offloader._y_gpu is not None
         enable_prefetch = not dry_run
         runner_id = self._runner._runner_id
-        from vllm.model_executor.offloader import cots_ops
+        from vllm.model_executor.offloader import hybrid_ops
 
         y2_gpu: torch.Tensor
         if enable_cpu:
@@ -289,7 +289,7 @@ class CotsSwiGLUMLPOp:
             assert offloader._y_gpu is not None
             # §1c.20: do not construct CPU pinned views in the operator.
             # Inductor materializes any CPU view it sees in the captured graph;
-            # native COTS reaches pinned buffers through install-time slabs.
+            # native Hybrid reaches pinned buffers through install-time slabs.
             y2_gpu = offloader._y_gpu
             self._runner.submit_with_d2h(x, gu_h.layer_idx, "mlp_block")
         else:
@@ -314,12 +314,12 @@ class CotsSwiGLUMLPOp:
         # [gate_active | up_active], so MLP1 can use one fused [gate|up] GEMM
         # even when f_prefetch < f_cpu_store. MLP2/down slot uses the unified
         # transposed storage layout: shape (dn_n_pref, out_dim).
-        out_gpu = torch.ops.vllm.cots_mlp_prefetch_add(
+        out_gpu = torch.ops.vllm.hybrid_mlp_prefetch_add(
             x,
             out_gpu,
             runner_id,
             int(gu_h.layer_idx),
-            cots_ops.op_kind_code("mlp_block"),
+            hybrid_ops.op_kind_code("mlp_block"),
             bool(has_base_gpu),
             bool(enable_prefetch),
         )
@@ -344,12 +344,12 @@ class CotsSwiGLUMLPOp:
         # activation buffer and would be clobbered by the next layer. Keep the
         # mixed GPU+CPU merge out-of-place for the same captured-graph ordering
         # reason as the earlier Python branch.
-        out_gpu = torch.ops.vllm.cots_mlp_merge_cpu(
+        out_gpu = torch.ops.vllm.hybrid_mlp_merge_cpu(
             out_gpu,
             y2_gpu,
             runner_id,
             int(gu_h.layer_idx),
-            cots_ops.op_kind_code("mlp_block"),
+            hybrid_ops.op_kind_code("mlp_block"),
             bool(has_base_gpu),
             bool(enable_prefetch),
             bool(enable_cpu),
@@ -359,7 +359,7 @@ class CotsSwiGLUMLPOp:
 
 class _RaiseOnDirectCall:
     """Defensive `quant_method` wrapper for MLP linears whose parent's
-    forward we replaced with `CotsSwiGLUMLPOp`. Calling the linear directly
+    forward we replaced with `HybridSwiGLUMLPOp`. Calling the linear directly
     (`mlp.gate_up_proj(x)` instead of `mlp(x)`) would silently use the
     GPU-slice weight and produce wrong-sized output; this raises instead.
     """
@@ -374,7 +374,7 @@ class _RaiseOnDirectCall:
     def apply(self, layer, x, bias=None):
         del layer, x, bias
         raise RuntimeError(
-            f"cots: {self._qualified_name} is fused into its parent MLP "
+            f"hybrid: {self._qualified_name} is fused into its parent MLP "
             f"block. Call the parent module's forward(x), not the linear "
             f"directly."
         )

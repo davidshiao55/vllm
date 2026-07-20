@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Runtime runners and native slab specs for COTS."""
+"""Runtime runners and native slab specs for Hybrid."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import torch
 class NativeWeightSlabSpec:
     """Builder record for one C++ TaskSlab. The offloader builds a list
     of these at `post_init` (one per (layer_idx, bucket, op_kind) with
-    n_cpu_compute > 0); `NativeCotsWeightRunner.install` walks the list and
+    n_cpu_compute > 0); `NativeHybridWeightRunner.install` walks the list and
     calls the right `populate_slab_*` per record.
 
     All weight pointers passed to populate_slab_* must be POST-narrow
@@ -154,28 +154,28 @@ class _NativeWeightSlabSpecMlp(NativeWeightSlabSpec):
         )
 
 
-class NativeCotsWeightRunner:
-    """Production COTS weight runner. Wraps the C++ `CotsWeightTaskRunner` via the
-    `vllm._cots_C` extension; dispatches CPU work through
+class NativeHybridWeightRunner:
+    """Production Hybrid weight runner. Wraps the C++ `HybridWeightTaskRunner` via the
+    `vllm._hybrid_C` extension; dispatches CPU work through
     `cudaLaunchHostFunc` so the forward pass is graph-capturable.
 
     Operator-facing API carries only stable call-site identity:
     `(layer_idx, op_kind)`. Active bucket and live-token state are
-    published out of graph by `CotsOffloader.on_dispatch`, then resolved
-    inside the `vllm.cots_submit_gemm` / `vllm.cots_sync_then_uva`
+    published out of graph by `HybridOffloader.on_dispatch`, then resolved
+    inside the `vllm.hybrid_submit_gemm` / `vllm.hybrid_sync_then_uva`
     custom-op impls at eager execution / CUDA Graph capture time. This
     keeps native task selection out of compile-visible scalar arguments
     while preserving the barrier-installing `mutates_args` declarations
     on `x_gpu` and `gpu_anchor_a/_b`.
 
     Multi-engine safety: each instance allocates a `runner_id` and
-    the underlying `CotsWeightTaskRunner` pybind handle is owned by the
-    `cots_ops._COTS_WEIGHT_RUNNERS` strong-ref registry. The runner facade
+    the underlying `HybridWeightTaskRunner` pybind handle is owned by the
+    `hybrid_ops._HYBRID_WEIGHT_RUNNERS` strong-ref registry. The runner facade
     itself only holds the integer id + picklable state, so PyTorch's AOT compile
     guard cache can serialize it. Two offloaders coexist with independent slab
     pools. `close()` drains the worker then unregisters.
 
-    Two row counts are first-class in native COTS:
+    Two row counts are first-class in native Hybrid:
 
       * `slab.num_tokens` — the **dispatched graph bucket** selected by
         vLLM's `BatchDescriptor.num_tokens`. It is pushed out of graph
@@ -198,30 +198,30 @@ class NativeCotsWeightRunner:
     kind = "native"
 
     def __init__(self, dry_run: bool = False) -> None:
-        # Lazy import: _cots_C is built only on CUDA. Users on CPU-only
+        # Lazy import: _hybrid_C is built only on CUDA. Users on CPU-only
         # / ROCm builds shouldn't hit ImportError just by importing this
-        # module — the runner type is constructed only when COTS weight
+        # module — the runner type is constructed only when Hybrid weight
         # offload is active. Any reference we hold
-        # to the pybind handle is on the cots_ops registry, NOT on this
+        # to the pybind handle is on the hybrid_ops registry, NOT on this
         # runner's `__dict__`: if the handle were stored on `self`, Dynamo's
-        # guard serialization would try to pickle a `CotsWeightTaskRunner`,
+        # guard serialization would try to pickle a `HybridWeightTaskRunner`,
         # which is unpicklable.
         try:
-            from vllm import _cots_C
+            from vllm import _hybrid_C
         except ImportError as e:
             raise RuntimeError(
-                "NativeCotsWeightRunner requires the `vllm._cots_C` extension, "
+                "NativeHybridWeightRunner requires the `vllm._hybrid_C` extension, "
                 "which builds only on CUDA targets. Rebuild vLLM with CUDA "
-                "support before enabling COTS weight offload."
+                "support before enabling Hybrid weight offload."
             ) from e
-        from vllm.model_executor.offloader import cots_ops
+        from vllm.model_executor.offloader import hybrid_ops
 
         # Hand the freshly-constructed handle to the registry; the
         # registry's strong reference is now the SOLE owner. The local
         # variable goes out of scope at the end of __init__, so nothing
         # in `self.__dict__` references it.
-        self._runner_id: int = cots_ops.register_weight_runner(
-            _cots_C.CotsWeightTaskRunner()
+        self._runner_id: int = hybrid_ops.register_weight_runner(
+            _hybrid_C.HybridWeightTaskRunner()
         )
         self._dry_run: bool = bool(dry_run)
         # Format: {(layer_idx, bucket, op_kind): task_id}.
@@ -250,34 +250,34 @@ class NativeCotsWeightRunner:
         skips real GEMM.
 
         Native operators do not pass descriptor buckets at runtime. They pass
-        stable call-site identity, and cots_ops resolves the bucket/task from
+        stable call-site identity, and hybrid_ops resolves the bucket/task from
         OOG dispatch state plus this install-time map.
         """
-        from vllm.model_executor.offloader import cots_ops
+        from vllm.model_executor.offloader import hybrid_ops
 
         if self._installed:
             raise RuntimeError(
-                "NativeCotsWeightRunner.install() called twice on the same instance"
+                "NativeHybridWeightRunner.install() called twice on the same instance"
             )
         n_slabs = len(slab_specs)
-        cots_ops.install_weight_runner(
+        hybrid_ops.install_weight_runner(
             self._runner_id,
             n_slabs=n_slabs,
             max_num_tokens=max_num_tokens,
         )
         for tid, spec in enumerate(slab_specs):
             self._task_id_for[spec.op_descriptor] = tid
-            cots_ops.populate_slab_via_spec(
+            hybrid_ops.populate_slab_via_spec(
                 self._runner_id, spec, tid, dry_run=self._dry_run
             )
-        cots_ops.register_weight_task_id_map(self._runner_id, self._task_id_for)
+        hybrid_ops.register_weight_task_id_map(self._runner_id, self._task_id_for)
         self._installed = True
 
     def set_active_dispatch(self, bucket: int, live_num_tokens: int) -> None:
         """Publish OOG dispatch state for native custom-op resolution."""
-        from vllm.model_executor.offloader import cots_ops
+        from vllm.model_executor.offloader import hybrid_ops
 
-        cots_ops.set_active_weight_dispatch_state(
+        hybrid_ops.set_active_weight_dispatch_state(
             self._runner_id,
             bucket=int(bucket),
             live_num_tokens=int(live_num_tokens),
@@ -296,13 +296,13 @@ class NativeCotsWeightRunner:
         both directions. Bucket/task selection is also resolved from OOG
         dispatch state inside the custom-op impl.
         """
-        from vllm.model_executor.offloader import cots_ops
+        from vllm.model_executor.offloader import hybrid_ops
 
-        torch.ops.vllm.cots_submit_gemm(
+        torch.ops.vllm.hybrid_submit_gemm(
             x_gpu,
             self._runner_id,
             int(layer_idx),
-            cots_ops.op_kind_code(op_kind),
+            hybrid_ops.op_kind_code(op_kind),
         )
 
     def wait_and_uva(
@@ -314,7 +314,7 @@ class NativeCotsWeightRunner:
         layer_idx: int,
         op_kind: str,
     ) -> None:
-        """Routes through `torch.ops.vllm.cots_sync_then_uva` so the
+        """Routes through `torch.ops.vllm.hybrid_sync_then_uva` so the
         cudaLaunchHostFunc-based stream sync + the Triton UVA copy
         bundle into one graph-recorded entry.
 
@@ -323,21 +323,21 @@ class NativeCotsWeightRunner:
           AFTER each independent GPU GEMM (`out_perm`, `out_pref`).
           Operators pass two distinct CUDA tensors, never aliased.
         - `submit_anchor` is read-only — the same `x_gpu` that
-          `cots_submit_gemm` mutated. Reading it pins sync AFTER submit.
+          `hybrid_submit_gemm` mutated. Reading it pins sync AFTER submit.
 
         `y_pinned` is intentionally absent from the custom op and this facade;
         the impl reaches the worker's pinned output through the resolved slab.
         """
-        from vllm.model_executor.offloader import cots_ops
+        from vllm.model_executor.offloader import hybrid_ops
 
-        torch.ops.vllm.cots_sync_then_uva(
+        torch.ops.vllm.hybrid_sync_then_uva(
             y_gpu,
             gpu_anchor_a,
             gpu_anchor_b,
             submit_anchor,
             self._runner_id,
             int(layer_idx),
-            cots_ops.op_kind_code(op_kind),
+            hybrid_ops.op_kind_code(op_kind),
         )
 
     def __getstate__(self) -> dict:
@@ -360,7 +360,7 @@ class NativeCotsWeightRunner:
     def close(self) -> None:
         """Drain any in-flight worker task and drop the registry entry.
         Idempotent; safe to call from teardown. Both the drain and the
-        unregister go through cots_ops helpers so this runner facade
+        unregister go through hybrid_ops helpers so this runner facade
         never has to dereference the pybind handle directly.
 
         No-ops for non-owning copies (`_owns_runner_registry_entry` is
@@ -369,17 +369,17 @@ class NativeCotsWeightRunner:
         """
         if not getattr(self, "_owns_runner_registry_entry", False):
             return
-        from vllm.model_executor.offloader import cots_ops
+        from vllm.model_executor.offloader import hybrid_ops
 
         try:
-            # The CPU task queue can be idle while stream-ordered COTS custom
+            # The CPU task queue can be idle while stream-ordered Hybrid custom
             # ops are still unwinding. Drain CUDA first so callbacks/UVA glue
             # cannot race with dropping the pybind runner handle from the registry.
             if torch.cuda.is_available() and torch.cuda.is_initialized():
                 torch.cuda.current_stream().synchronize()
-            cots_ops.sync_blocking(self._runner_id)
+            hybrid_ops.sync_blocking(self._runner_id)
         finally:
-            cots_ops.unregister_weight_runner(self._runner_id)
+            hybrid_ops.unregister_weight_runner(self._runner_id)
             self._owns_runner_registry_entry = False
 
     def __del__(self) -> None:
@@ -397,9 +397,9 @@ class NativeCotsWeightRunner:
         # cleared it.
         try:  # noqa: SIM105
             if getattr(self, "_owns_runner_registry_entry", False):
-                from vllm.model_executor.offloader import cots_ops
+                from vllm.model_executor.offloader import hybrid_ops
 
-                cots_ops.unregister_weight_runner(self._runner_id)
+                hybrid_ops.unregister_weight_runner(self._runner_id)
                 self._owns_runner_registry_entry = False
         except Exception:  # noqa: BLE001
             pass
@@ -409,6 +409,6 @@ class NativeCotsWeightRunner:
 # Operator layer
 #
 # Operators encapsulate the forward semantics for each block of the model
-# we offload. They consume `CotsLinearHandle`s for storage and the native
-# COTS weight runner for execution.
+# we offload. They consume `HybridLinearHandle`s for storage and the native
+# Hybrid weight runner for execution.
 # ---------------------------------------------------------------------------

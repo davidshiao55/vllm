@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
-// Shared host-side helpers for COTS native task runners.
+// Shared host-side helpers for Hybrid native task runners.
 
-#ifndef VLLM_COTS_COMMON_H_
-#define VLLM_COTS_COMMON_H_
+#ifndef VLLM_HYBRID_COMMON_H_
+#define VLLM_HYBRID_COMMON_H_
 
 #include <nvtx3/nvToolsExt.h>
 
@@ -13,20 +13,20 @@
 #include <cstdlib>
 
 namespace vllm {
-namespace cots {
+namespace hybrid {
 
 inline bool env_flag(const char* name) {
   const char* v = std::getenv(name);
   return v != nullptr && v[0] == '1' && v[1] == '\0';
 }
 
-inline bool cots_nvtx_enabled() {
-  static const bool enabled = []() { return env_flag("VLLM_COTS_NVTX"); }();
+inline bool hybrid_nvtx_enabled() {
+  static const bool enabled = []() { return env_flag("VLLM_HYBRID_NVTX"); }();
   return enabled;
 }
 
 struct NvtxScope {
-  explicit NvtxScope(const char* name) : active_(cots_nvtx_enabled()) {
+  explicit NvtxScope(const char* name) : active_(hybrid_nvtx_enabled()) {
     if (active_) nvtxRangePushA(name);
   }
   ~NvtxScope() {
@@ -45,7 +45,7 @@ inline int64_t now_ns() {
       .count();
 }
 
-}  // namespace cots
+}  // namespace hybrid
 }  // namespace vllm
 
-#endif  // VLLM_COTS_COMMON_H_
+#endif  // VLLM_HYBRID_COMMON_H_

@@ -7,14 +7,14 @@ from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from vllm.config.cots import (
-    DEFAULT_COTS_WEIGHT_MODULES,
-    CotsWeightModule,
-    normalize_cots_weight_modules,
+from vllm.config.hybrid import (
+    DEFAULT_HYBRID_WEIGHT_MODULES,
+    HybridWeightModule,
+    normalize_hybrid_weight_modules,
 )
 from vllm.config.utils import config
 
-OffloadBackend = Literal["auto", "uva", "prefetch", "prefetch_defer", "cots"]
+OffloadBackend = Literal["auto", "uva", "prefetch", "prefetch_defer", "hybrid"]
 
 
 @config
@@ -88,10 +88,10 @@ class PrefetchOffloadConfig:
 
 
 @config
-class CotsOffloadConfig:
-    """Configuration for COTS collaborative CPU-GPU offloading (thesis backend).
+class HybridOffloadConfig:
+    """Configuration for Hybrid collaborative CPU-GPU offloading (thesis backend).
 
-    Splits selected decoder sub-modules along their COTS policy axis so a
+    Splits selected decoder sub-modules along their Hybrid policy axis so a
     fraction `f_cpu_store` of the bytes lives in pinned CPU memory and is
     GEMM'd on the CPU each forward pass, in parallel with the GPU's compute on
     the GPU-resident slice. Activation returns from CPU use an SM-issued UVA
@@ -104,7 +104,7 @@ class CotsOffloadConfig:
     """
 
     f_cpu_store: float = Field(default=0.0, ge=0.0, le=1.0)
-    """Fraction of enabled COTS weight bytes resident on CPU. Single uniform
+    """Fraction of enabled Hybrid weight bytes resident on CPU. Single uniform
     scalar applied to the selected module set (default WQKV / MLP1 / MLP2 /
     WO). The matched-index invariant between MLP1 col-parallel and
     MLP2 row-parallel is automatic under uniform dispatch. Default 0.0 means no
@@ -120,11 +120,11 @@ class CotsOffloadConfig:
     CPU-computed). Default 0.0 keeps the CPU-stored slice CPU-computed."""
 
     dispatch_table: dict[int, tuple[float, float]] | None = Field(default=None)
-    """Optional engine-local COTS compute dispatch table emitted by the
+    """Optional engine-local Hybrid compute dispatch table emitted by the
     Planner. Keys are vLLM `BatchDescriptor.num_tokens` bucket values. Values
     are `(f_cpu_compute, f_prefetch_compute)` for that bucket. When set, this
     table overrides the uniform `f_prefetch` fallback above. Runtime validates
-    that all COTS dispatch buckets are present before installing slabs. In
+    that all Hybrid dispatch buckets are present before installing slabs. In
     graph mode, every CUDA graph capture bucket must also have a matching
     dispatch row.
 
@@ -132,10 +132,10 @@ class CotsOffloadConfig:
     storage budget and may provide a table; vLLM still owns snapping, bucket
     validation, and tensor geometry."""
 
-    weight_modules: set[CotsWeightModule | str] = Field(
-        default_factory=lambda: set(DEFAULT_COTS_WEIGHT_MODULES)
+    weight_modules: set[HybridWeightModule | str] = Field(
+        default_factory=lambda: set(DEFAULT_HYBRID_WEIGHT_MODULES)
     )
-    """COTS weight sub-modules to offload. Valid entries:
+    """Hybrid weight sub-modules to offload. Valid entries:
     * `"qkv"`: WQKV output split using the WQKV-specific KV-biased picker.
     * `"mlp"`: fused MLP block (`gate_up_proj` col split + `down_proj` row
       split) with matched intermediate indices.
@@ -155,7 +155,7 @@ class CotsOffloadConfig:
 
     cpu_num_threads_by_bucket: dict[int, int] | None = Field(default=None)
     """Per-`BatchDescriptor` thread count for the native CPU
-    GEMM worker. Keys are COTS dispatch bucket values; values are >= 1. When
+    GEMM worker. Keys are Hybrid dispatch bucket values; values are >= 1. When
     unset, every bucket uses the scalar `cpu_num_threads`.
 
     This is a runtime policy hook, not an additional Planner search axis.
@@ -165,7 +165,7 @@ class CotsOffloadConfig:
     this policy is applied rather than sweep thread count independently.
 
     The native C++ worker applies this per slab, so thread policy stays local
-    to COTS weight work instead of mutating process-wide PyTorch state."""
+    to Hybrid weight work instead of mutating process-wide PyTorch state."""
 
     cpu_worker_affinity: list[int] | None = Field(default=None)
     """Optional CPU affinity mask for the native
@@ -179,28 +179,28 @@ class CotsOffloadConfig:
     dispatch / kernel tend to land. Hardware-specific; left as None by
     default so we don't bake i9-14900KF assumptions into the config.
 
-    Consulted by the native COTS worker."""
+    Consulted by the native Hybrid worker."""
 
     dry_run: bool = Field(default=False)
-    """Diagnostic: install COTS wrappers and preserve bucket/slot/graph
+    """Diagnostic: install Hybrid wrappers and preserve bucket/slot/graph
     control flow, but skip active offloaded work from both paths. CPU-compute
     contribution is omitted; prefetch H2D and prefetched-slice GPU compute are
     omitted. Token output is garbage; tensor shapes remain valid. Permanent
-    diagnostic for measuring the COTS control-plane floor."""
+    diagnostic for measuring the Hybrid control-plane floor."""
 
     @field_validator("weight_modules", mode="before")
     @classmethod
     def normalize_weight_modules_field(cls, value: object) -> set[str]:
-        return normalize_cots_weight_modules(value)
+        return normalize_hybrid_weight_modules(value)
 
     @model_validator(mode="after")
-    def validate_cots_config(self) -> "CotsOffloadConfig":
-        """Validate COTS storage/dispatch invariants."""
-        self.weight_modules = normalize_cots_weight_modules(self.weight_modules)
+    def validate_hybrid_config(self) -> "HybridOffloadConfig":
+        """Validate Hybrid storage/dispatch invariants."""
+        self.weight_modules = normalize_hybrid_weight_modules(self.weight_modules)
         if self.f_prefetch > self.f_cpu_store:
             raise ValueError(
-                f"cots.f_prefetch ({self.f_prefetch}) must be <= "
-                f"cots.f_cpu_store ({self.f_cpu_store}); prefetch consumes "
+                f"hybrid.f_prefetch ({self.f_prefetch}) must be <= "
+                f"hybrid.f_cpu_store ({self.f_cpu_store}); prefetch consumes "
                 "CPU-stored bytes."
             )
 
@@ -235,7 +235,7 @@ class CotsOffloadConfig:
                     )
 
         if self.dispatch_table is not None:
-            validate_table("cots.dispatch_table", self.dispatch_table)
+            validate_table("hybrid.dispatch_table", self.dispatch_table)
 
         return self
 
@@ -252,8 +252,8 @@ class OffloadConfig:
     - "prefetch": Stock async prefetch with group-based layer offloading.
     - "prefetch_defer": Thesis native-prefetch baseline with deferred
       wrap-around scheduling.
-    - "cots": Collaborative CPU-GPU offloading (thesis backend). Must be set
-      explicitly; "auto" never selects "cots".
+    - "hybrid": Collaborative CPU-GPU offloading (thesis backend). Must be set
+      explicitly; "auto" never selects "hybrid".
     """
 
     uva: UVAOffloadConfig = Field(default_factory=UVAOffloadConfig)
@@ -262,8 +262,8 @@ class OffloadConfig:
     prefetch: PrefetchOffloadConfig = Field(default_factory=PrefetchOffloadConfig)
     """Parameters for prefetch offloading backend."""
 
-    cots: CotsOffloadConfig = Field(default_factory=CotsOffloadConfig)
-    """Parameters for COTS collaborative CPU-GPU offloading backend."""
+    hybrid: HybridOffloadConfig = Field(default_factory=HybridOffloadConfig)
+    """Parameters for Hybrid collaborative CPU-GPU offloading backend."""
 
     @model_validator(mode="after")
     def validate_offload_config(self) -> "OffloadConfig":
@@ -287,7 +287,7 @@ class OffloadConfig:
         # Warn if both backends have non-default values
         uva_active = self.uva.cpu_offload_gb > 0
         prefetch_active = self.prefetch.offload_group_size > 0
-        cots_active = self.cots.f_cpu_store > 0
+        hybrid_active = self.hybrid.f_cpu_store > 0
         if self.offload_backend == "uva" and prefetch_active:
             warnings.warn(
                 "Prefetch offload fields are set but offload_backend='uva'. "
@@ -324,29 +324,29 @@ class OffloadConfig:
                 stacklevel=2,
             )
 
-        if self.offload_backend == "cots":
+        if self.offload_backend == "hybrid":
             if uva_active:
                 raise ValueError(
-                    "offload_backend='cots' is incompatible with non-zero "
-                    "uva.cpu_offload_gb. Disable UVA when using cots."
+                    "offload_backend='hybrid' is incompatible with non-zero "
+                    "uva.cpu_offload_gb. Disable UVA when using hybrid."
                 )
             if prefetch_active:
                 raise ValueError(
-                    "offload_backend='cots' is incompatible with non-zero "
+                    "offload_backend='hybrid' is incompatible with non-zero "
                     "prefetch.offload_group_size. Disable prefetch offload "
-                    "when using cots."
+                    "when using hybrid."
                 )
-            if self.cots.f_prefetch > self.cots.f_cpu_store:
+            if self.hybrid.f_prefetch > self.hybrid.f_cpu_store:
                 raise ValueError(
-                    f"cots.f_prefetch ({self.cots.f_prefetch}) must be <= "
-                    f"cots.f_cpu_store ({self.cots.f_cpu_store}); prefetch "
+                    f"hybrid.f_prefetch ({self.hybrid.f_prefetch}) must be <= "
+                    f"hybrid.f_cpu_store ({self.hybrid.f_cpu_store}); prefetch "
                     f"consumes CPU-stored bytes."
                 )
-        elif cots_active and self.offload_backend != "cots":
+        elif hybrid_active and self.offload_backend != "hybrid":
             warnings.warn(
-                "COTS settings are set but offload_backend is "
-                f"'{self.offload_backend}', not 'cots'. cots settings will "
-                "be ignored. Pass --offload-backend cots to enable.",
+                "Hybrid settings are set but offload_backend is "
+                f"'{self.offload_backend}', not 'hybrid'. hybrid settings will "
+                "be ignored. Pass --offload-backend hybrid to enable.",
                 stacklevel=2,
             )
         return self

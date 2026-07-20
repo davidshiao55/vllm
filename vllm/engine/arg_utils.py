@@ -37,10 +37,10 @@ from vllm.config import (
     CacheConfig,
     CompilationConfig,
     ConfigType,
-    CotsOffloadConfig,
     DeviceConfig,
     ECTransferConfig,
     EPLBConfig,
+    HybridOffloadConfig,
     KernelConfig,
     KVEventsConfig,
     KVTransferConfig,
@@ -468,18 +468,20 @@ class EngineArgs:
     offload_prefetch_step: int = PrefetchOffloadConfig.offload_prefetch_step
     offload_params: set[str] = get_field(PrefetchOffloadConfig, "offload_params")
     prefetch_dry_run: bool = PrefetchOffloadConfig.dry_run
-    cots_f_cpu_store: float = CotsOffloadConfig.f_cpu_store
-    cots_f_prefetch: float = CotsOffloadConfig.f_prefetch
-    cots_dispatch_table: dict[int, tuple[float, float]] | None = (
-        CotsOffloadConfig.dispatch_table
+    hybrid_f_cpu_store: float = HybridOffloadConfig.f_cpu_store
+    hybrid_f_prefetch: float = HybridOffloadConfig.f_prefetch
+    hybrid_dispatch_table: dict[int, tuple[float, float]] | None = (
+        HybridOffloadConfig.dispatch_table
     )
-    cots_weight_modules: set[str] = get_field(CotsOffloadConfig, "weight_modules")
-    cots_cpu_num_threads: int = CotsOffloadConfig.cpu_num_threads
-    cots_cpu_num_threads_by_bucket: dict[int, int] | None = (
-        CotsOffloadConfig.cpu_num_threads_by_bucket
+    hybrid_weight_modules: set[str] = get_field(HybridOffloadConfig, "weight_modules")
+    hybrid_cpu_num_threads: int = HybridOffloadConfig.cpu_num_threads
+    hybrid_cpu_num_threads_by_bucket: dict[int, int] | None = (
+        HybridOffloadConfig.cpu_num_threads_by_bucket
     )
-    cots_cpu_worker_affinity: list[int] | None = CotsOffloadConfig.cpu_worker_affinity
-    cots_dry_run: bool = CotsOffloadConfig.dry_run
+    hybrid_cpu_worker_affinity: list[int] | None = (
+        HybridOffloadConfig.cpu_worker_affinity
+    )
+    hybrid_dry_run: bool = HybridOffloadConfig.dry_run
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
     max_num_batched_tokens: int | None = None
@@ -1050,7 +1052,7 @@ class EngineArgs:
         offload_kwargs = get_kwargs(OffloadConfig)
         uva_kwargs = get_kwargs(UVAOffloadConfig)
         prefetch_kwargs = get_kwargs(PrefetchOffloadConfig)
-        cots_kwargs = get_kwargs(CotsOffloadConfig)
+        hybrid_kwargs = get_kwargs(HybridOffloadConfig)
         offload_group = parser.add_argument_group(
             title="OffloadConfig",
             description=OffloadConfig.__doc__,
@@ -1078,26 +1080,28 @@ class EngineArgs:
             "--offload-params", **prefetch_kwargs["offload_params"]
         )
         offload_group.add_argument("--prefetch-dry-run", **prefetch_kwargs["dry_run"])
-        offload_group.add_argument("--cots-f-cpu-store", **cots_kwargs["f_cpu_store"])
-        offload_group.add_argument("--cots-f-prefetch", **cots_kwargs["f_prefetch"])
         offload_group.add_argument(
-            "--cots-dispatch-table", **cots_kwargs["dispatch_table"]
+            "--hybrid-f-cpu-store", **hybrid_kwargs["f_cpu_store"]
+        )
+        offload_group.add_argument("--hybrid-f-prefetch", **hybrid_kwargs["f_prefetch"])
+        offload_group.add_argument(
+            "--hybrid-dispatch-table", **hybrid_kwargs["dispatch_table"]
         )
         offload_group.add_argument(
-            "--cots-weight-modules", **cots_kwargs["weight_modules"]
+            "--hybrid-weight-modules", **hybrid_kwargs["weight_modules"]
         )
         offload_group.add_argument(
-            "--cots-cpu-num-threads", **cots_kwargs["cpu_num_threads"]
+            "--hybrid-cpu-num-threads", **hybrid_kwargs["cpu_num_threads"]
         )
         offload_group.add_argument(
-            "--cots-cpu-num-threads-by-bucket",
-            **cots_kwargs["cpu_num_threads_by_bucket"],
+            "--hybrid-cpu-num-threads-by-bucket",
+            **hybrid_kwargs["cpu_num_threads_by_bucket"],
         )
         offload_group.add_argument(
-            "--cots-cpu-worker-affinity",
-            **cots_kwargs["cpu_worker_affinity"],
+            "--hybrid-cpu-worker-affinity",
+            **hybrid_kwargs["cpu_worker_affinity"],
         )
-        offload_group.add_argument("--cots-dry-run", **cots_kwargs["dry_run"])
+        offload_group.add_argument("--hybrid-dry-run", **hybrid_kwargs["dry_run"])
 
         # Multimodal related configs
         multimodal_kwargs = get_kwargs(MultiModalConfig)
@@ -1997,23 +2001,23 @@ class EngineArgs:
             offload_params=self.offload_params,
             dry_run=self.prefetch_dry_run,
         )
-        cots_offload_config = config_replace(
-            CotsOffloadConfig(),
-            f_cpu_store=self.cots_f_cpu_store,
-            f_prefetch=self.cots_f_prefetch,
-            dispatch_table=self.cots_dispatch_table,
-            weight_modules=self.cots_weight_modules,
-            cpu_num_threads=self.cots_cpu_num_threads,
-            cpu_num_threads_by_bucket=self.cots_cpu_num_threads_by_bucket,
-            cpu_worker_affinity=self.cots_cpu_worker_affinity,
-            dry_run=self.cots_dry_run,
+        hybrid_offload_config = config_replace(
+            HybridOffloadConfig(),
+            f_cpu_store=self.hybrid_f_cpu_store,
+            f_prefetch=self.hybrid_f_prefetch,
+            dispatch_table=self.hybrid_dispatch_table,
+            weight_modules=self.hybrid_weight_modules,
+            cpu_num_threads=self.hybrid_cpu_num_threads,
+            cpu_num_threads_by_bucket=self.hybrid_cpu_num_threads_by_bucket,
+            cpu_worker_affinity=self.hybrid_cpu_worker_affinity,
+            dry_run=self.hybrid_dry_run,
         )
         offload_config = config_replace(
             OffloadConfig(),
             offload_backend=self.offload_backend,
             uva=uva_offload_config,
             prefetch=prefetch_offload_config,
-            cots=cots_offload_config,
+            hybrid=hybrid_offload_config,
         )
 
         if self.gdn_prefill_backend is not None:

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
-// Natural-layout BF16 GEMM for COTS small-token CPU slices.
+// Natural-layout BF16 GEMM for Hybrid small-token CPU slices.
 //
 // x is (M, K), w is PyTorch-natural (N, K), and y is (M, N). The kernel
 // vectorizes along contiguous K, accumulates in FP32, horizontally reduces,
@@ -16,7 +16,7 @@
 #include <cstdint>
 
 namespace vllm {
-namespace cots {
+namespace hybrid {
 
 namespace {
 
@@ -147,5 +147,5 @@ void bf16_gemm_natural_at(const at::Tensor& x, const at::Tensor& w,
                     reinterpret_cast<uint16_t*>(y_out.data_ptr()), M, N, K);
 }
 
-}  // namespace cots
+}  // namespace hybrid
 }  // namespace vllm
