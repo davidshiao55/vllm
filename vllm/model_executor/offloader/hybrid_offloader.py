@@ -12,8 +12,8 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
-from cots.dispatch_buckets import cots_default_dispatch_buckets
-from cots.snap import COTS_SNAP_MODEL, qkvo_output_granularity
+from ptt.dispatch_buckets import cots_default_dispatch_buckets
+from ptt.snap import COTS_SNAP_MODEL, qkvo_output_granularity
 
 # Register prefetch custom ops; Hybrid reuses generic wait/start prefetch ops.
 import vllm.model_executor.offloader.hybrid_ops  # noqa: F401
