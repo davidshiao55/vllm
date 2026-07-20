@@ -9,13 +9,13 @@ from typing import Literal
 
 import torch
 import torch.nn as nn
-from ptt.snap import (
+from ptt.hybrid_snap import (
     DEFAULT_QKVO_HEAD_DIM,
 )
-from ptt.snap import (
+from ptt.hybrid_snap import (
     snap_mlp_channels as _snap_mlp_channels,
 )
-from ptt.snap import (
+from ptt.hybrid_snap import (
     snap_qkvo_output_channels as _snap_qkvo_output_channels,
 )
 

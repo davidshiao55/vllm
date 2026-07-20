@@ -12,8 +12,8 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
-from ptt.dispatch_buckets import cots_default_dispatch_buckets
-from ptt.snap import COTS_SNAP_MODEL, qkvo_output_granularity
+from ptt.hybrid_dispatch_buckets import hybrid_default_dispatch_buckets
+from ptt.hybrid_snap import HYBRID_SNAP_MODEL, qkvo_output_granularity
 
 # Register prefetch custom ops; Hybrid reuses generic wait/start prefetch ops.
 import vllm.model_executor.offloader.hybrid_ops  # noqa: F401
@@ -750,7 +750,7 @@ class HybridOffloader(BaseOffloader):
                 route=fop,
             )
 
-    def _cots_snap_payload(
+    def _hybrid_snap_payload(
         self,
         *,
         cpu_weight_bytes: int,
@@ -763,7 +763,7 @@ class HybridOffloader(BaseOffloader):
         storage_key = f"{float(self.f_cpu_store):.12g}"
         payload: dict[str, object] = {
             "schema_version": 1,
-            "snap_model": COTS_SNAP_MODEL,
+            "snap_model": HYBRID_SNAP_MODEL,
             "qkvo_granularity_channels": self._qkvo_granularity_channels(),
             "storage_by_store_fraction": {
                 storage_key: {
@@ -1035,7 +1035,7 @@ class HybridOffloader(BaseOffloader):
         if speculative_config and speculative_config.num_speculative_tokens:
             decode_query_len += int(speculative_config.num_speculative_tokens)
         return list(
-            cots_default_dispatch_buckets(
+            hybrid_default_dispatch_buckets(
                 max_num_seqs=int(scheduler_config.max_num_seqs),
                 max_num_batched_tokens=self._max_num_tokens,
                 decode_query_len=decode_query_len,
@@ -1203,9 +1203,9 @@ class HybridOffloader(BaseOffloader):
             self._dispatch_buckets,
         )
         logger.info(
-            "[HybridOffloader] cots_snap: %s",
+            "[HybridOffloader] hybrid_snap: %s",
             json.dumps(
-                self._cots_snap_payload(
+                self._hybrid_snap_payload(
                     cpu_weight_bytes=total_offloaded,
                     gpu_output_scratch_bytes=y_gpu_bytes,
                     gpu_prefetch_pool_bytes=prefetch_bytes,
