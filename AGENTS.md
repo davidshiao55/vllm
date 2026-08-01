@@ -39,18 +39,18 @@ If work is duplicate/trivial busywork, **do not proceed**. Return a short explan
 
 ## 2. Development Workflow
 
-### TTC thesis fork workflow
+### PTT thesis fork workflow
 
-When this checkout is used as the `vllm/` fork inside the TTC thesis repository,
+When this checkout is used as the `vllm/` fork inside the PTT thesis repository,
 use the parent repository's conda workflow for local thesis experiments:
-`conda activate thesis`, run Python from `FastTTS-thesis/` instead of the parent
-repo root, and use `/TTC/scripts/rebuild-vllm.sh` for C++/CUDA changes.
-For hook-aware vLLM commits in the TTC checkout, run Git through the parent
+`conda activate thesis`, run Python from `FastTTS/` instead of the parent repo
+root, and use `/PTT/scripts/rebuild-vllm.sh` for C++/CUDA changes.
+For hook-aware vLLM commits in the PTT checkout, run Git through the parent
 Docker helper because the installed hook path points at the container's
 `/opt/conda/envs/thesis`:
 
 ```bash
-TTC_DOCKER_WORKDIR=/TTC/vllm /TTC/scripts/ttc-docker-env.sh thesis \
+PTT_DOCKER_WORKDIR=/PTT/vllm /PTT/scripts/ptt-docker-env.sh \
   'git commit -m "Describe vLLM change"'
 ```
 
