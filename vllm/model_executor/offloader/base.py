@@ -25,10 +25,6 @@ class relation:
 BaseOffloader (ABC)
   * implemented by: UVAOffloader
   * implemented by: PrefetchOffloader
-  * implemented by: PrefetchDeferOffloader
-    * uses: _ModuleOffloader
-        * uses: _BaseParamOffloader (ABC)
-            * implemented by: _CpuParamOffloader
 """
 
 
@@ -93,11 +89,6 @@ class BaseOffloader(ABC):
         """Start layer prefetch. Override in subclasses."""
         pass
 
-    def _start_deferred_prefetch(self) -> None:  # noqa: B027
-        """Start the static deferred wraparound prefetch. Override in
-        backends that emit one (e.g., `PrefetchDeferOffloader`)."""
-        pass
-
 
 class NoopOffloader(BaseOffloader):
     """No-op offloader that returns modules as-is without any offloading."""
@@ -141,7 +132,6 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
     """
     from vllm.model_executor.offloader.hybrid import HybridOffloader
     from vllm.model_executor.offloader.prefetch import PrefetchOffloader
-    from vllm.model_executor.offloader.prefetch_defer import PrefetchDeferOffloader
     from vllm.model_executor.offloader.uva import UVAOffloader
 
     backend = offload_config.offload_backend
@@ -163,15 +153,6 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
             num_in_group=prefetch.offload_num_in_group,
             prefetch_step=prefetch.offload_prefetch_step,
             offload_params=prefetch.offload_params,
-            mode="cpu",
-        )
-    elif backend == "prefetch_defer":
-        return PrefetchDeferOffloader(
-            group_size=prefetch.offload_group_size,
-            num_in_group=prefetch.offload_num_in_group,
-            prefetch_step=prefetch.offload_prefetch_step,
-            offload_params=prefetch.offload_params,
-            dry_run=prefetch.dry_run,
             mode="cpu",
         )
     elif backend == "uva":

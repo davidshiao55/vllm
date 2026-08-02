@@ -467,7 +467,6 @@ class EngineArgs:
     offload_num_in_group: int = PrefetchOffloadConfig.offload_num_in_group
     offload_prefetch_step: int = PrefetchOffloadConfig.offload_prefetch_step
     offload_params: set[str] = get_field(PrefetchOffloadConfig, "offload_params")
-    prefetch_dry_run: bool = PrefetchOffloadConfig.dry_run
     hybrid_f_cpu_store: float = HybridOffloadConfig.f_cpu_store
     hybrid_f_prefetch: float = HybridOffloadConfig.f_prefetch
     hybrid_dispatch_table: dict[int, tuple[float, float]] | None = (
@@ -1079,7 +1078,6 @@ class EngineArgs:
         offload_group.add_argument(
             "--offload-params", **prefetch_kwargs["offload_params"]
         )
-        offload_group.add_argument("--prefetch-dry-run", **prefetch_kwargs["dry_run"])
         offload_group.add_argument(
             "--hybrid-f-cpu-store", **hybrid_kwargs["f_cpu_store"]
         )
@@ -1999,7 +1997,6 @@ class EngineArgs:
             offload_num_in_group=self.offload_num_in_group,
             offload_prefetch_step=self.offload_prefetch_step,
             offload_params=self.offload_params,
-            dry_run=self.prefetch_dry_run,
         )
         hybrid_offload_config = config_replace(
             HybridOffloadConfig(),

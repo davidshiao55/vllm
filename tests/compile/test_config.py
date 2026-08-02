@@ -18,6 +18,7 @@ from vllm.config import (
     HybridOffloadConfig,
     OffloadConfig,
     ParallelConfig,
+    PrefetchOffloadConfig,
     SchedulerConfig,
     VllmConfig,
 )
@@ -288,6 +289,13 @@ def test_hybrid_uses_vllm_default_graph_policy():
     assert "vllm::unified_kv_cache_update" in config.compilation_config.splitting_ops
     assert "vllm::hybrid_submit_gemm" not in config.compilation_config.splitting_ops
     assert "vllm::hybrid_sync_then_uva" not in config.compilation_config.splitting_ops
+
+
+def test_deferred_prefetch_backend_is_not_configurable():
+    with pytest.raises(ValidationError):
+        OffloadConfig(offload_backend="prefetch_defer")  # type: ignore[arg-type]
+
+    assert "dry_run" not in PrefetchOffloadConfig.model_fields
 
 
 def test_hybrid_full_graph_cpu_compute_has_no_hybrid_aot_policy():

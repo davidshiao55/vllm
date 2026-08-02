@@ -14,7 +14,7 @@ from vllm.config.hybrid import (
 )
 from vllm.config.utils import config
 
-OffloadBackend = Literal["auto", "uva", "prefetch", "prefetch_defer", "hybrid"]
+OffloadBackend = Literal["auto", "uva", "prefetch", "hybrid"]
 
 
 @config
@@ -79,12 +79,6 @@ class PrefetchOffloadConfig:
     Uses segment matching: "w13_weight" matches "mlp.experts.w13_weight"
     but not "mlp.experts.w13_weight_scale".
     """
-
-    dry_run: bool = Field(default=False)
-    """Diagnostic for `offload_backend="prefetch_defer"`: install wrappers
-    (forward hooks, custom ops, stream/event sync) but skip the actual H2D
-    copies. Token output is garbage; only host bookkeeping + stream/event cost
-    is measured. The stock `prefetch` backend ignores this field."""
 
 
 @config
@@ -250,8 +244,6 @@ class OffloadConfig:
       (prefetch if offload_group_size > 0, uva if cpu_offload_gb > 0).
     - "uva": UVA (Unified Virtual Addressing) zero-copy offloading.
     - "prefetch": Stock async prefetch with group-based layer offloading.
-    - "prefetch_defer": Thesis native-prefetch baseline with deferred
-      wrap-around scheduling.
     - "hybrid": Collaborative CPU-GPU offloading (thesis backend). Must be set
       explicitly; "auto" never selects "hybrid".
     """
@@ -268,7 +260,7 @@ class OffloadConfig:
     @model_validator(mode="after")
     def validate_offload_config(self) -> "OffloadConfig":
         """Validate offload configuration constraints."""
-        prefetch_backend = self.offload_backend in ("prefetch", "prefetch_defer")
+        prefetch_backend = self.offload_backend == "prefetch"
         if prefetch_backend or self.prefetch.offload_group_size > 0:
             if self.prefetch.offload_num_in_group > self.prefetch.offload_group_size:
                 raise ValueError(
@@ -300,13 +292,6 @@ class OffloadConfig:
                 f"'{self.offload_backend}'. UVA settings will be ignored.",
                 stacklevel=2,
             )
-        elif self.offload_backend == "prefetch" and self.prefetch.dry_run:
-            warnings.warn(
-                "prefetch.dry_run is set but offload_backend='prefetch'. "
-                "The stock prefetch backend ignores dry_run; use "
-                "offload_backend='prefetch_defer' for the diagnostic.",
-                stacklevel=2,
-            )
         elif self.offload_backend == "auto" and uva_active and prefetch_active:
             warnings.warn(
                 "Both UVA and prefetch offload fields are set with "
@@ -314,16 +299,6 @@ class OffloadConfig:
                 "Set offload_backend explicitly to suppress this warning.",
                 stacklevel=2,
             )
-        elif (
-            self.offload_backend == "auto" and prefetch_active and self.prefetch.dry_run
-        ):
-            warnings.warn(
-                "prefetch.dry_run is set with offload_backend='auto'. Auto "
-                "selects the stock prefetch backend, which ignores dry_run; "
-                "use offload_backend='prefetch_defer' for the diagnostic.",
-                stacklevel=2,
-            )
-
         if self.offload_backend == "hybrid":
             if uva_active:
                 raise ValueError(
