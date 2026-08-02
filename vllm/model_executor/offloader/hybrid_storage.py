@@ -664,7 +664,7 @@ class HybridLinearHandle:
 # Layer-ahead weight-prefetch destination. Allocates K=2 GPU slot views per
 # offloaded handle so prefetch for layer i+1 can overlap with layer i's
 # compute (every layer is offloaded → K=2 is the minimum slot count for any
-# overlap; see `phase0_findings.md §0.10.1d` and the Phase 1b plan).
+# overlap).
 # Slot shape mirrors `w_cpu`'s row-major storage per split axis:
 #   output split : (max_n_prefetch, in_dim)   — prefetch dim 0
 #   input split  : (max_n_prefetch, out_dim)  — prefetch dim 0

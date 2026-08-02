@@ -93,8 +93,8 @@ class HybridOffloadConfig:
     covers WQKV, MLP, and WO with a single storage fraction and fixed snapping
     policy.
 
-    See `docs/implementation_roadmap.md` and `docs/phase0_findings.md`
-    for the full design and the empirical numbers that justify it.
+    The full system design and evaluation contract live in the parent PTT
+    artifact's retained thesis and evaluation documentation.
     """
 
     f_cpu_store: float = Field(default=0.0, ge=0.0, le=1.0)
@@ -102,8 +102,7 @@ class HybridOffloadConfig:
     scalar applied to the selected module set (default WQKV / MLP1 / MLP2 /
     WO). The matched-index invariant between MLP1 col-parallel and
     MLP2 row-parallel is automatic under uniform dispatch. Default 0.0 means no
-    offload. Typical thesis value at 7B B=1 decode is ~0.09 ("free" regime per
-    phase0 §0.3.3)."""
+    offload. A typical measured thesis value at 7B B=1 decode is ~0.09."""
 
     f_prefetch: float = Field(default=0.0, ge=0.0, le=1.0)
     """Manual fallback for the layer-ahead weight-prefetch fraction. Only
@@ -138,10 +137,9 @@ class HybridOffloadConfig:
       task/sync cost."""
 
     cpu_dtype: Literal["bfloat16"] = "bfloat16"
-    """CPU weight dtype. Locked to BF16: phase0 §0.3.2 confirmed F.linear with
-    BF16 weights uses oneDNN's optimized BF16 path (2x faster than FP32 at
-    small batch on AVX2 hardware), while torch.mm with BF16 falls back to a
-    naive scalar path that is 100x slower."""
+    """CPU weight dtype. Locked to BF16 because the evaluated oneDNN F.linear
+    path is optimized for BF16, while the corresponding torch.mm path does not
+    provide a viable small-batch fallback on the target CPU."""
 
     cpu_num_threads: int = Field(default=16, ge=1)
     """PyTorch CPU intra-op thread count. Scalar fallback when
