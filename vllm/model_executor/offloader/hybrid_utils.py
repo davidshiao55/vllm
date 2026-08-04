@@ -20,7 +20,7 @@ if HAS_TRITON:
     def _uva_copy_kernel(
         src_ptr,
         dst_ptr,
-        n_elements: tl.constexpr,
+        n_elements,
         BLOCK: tl.constexpr,
     ):
         pid = tl.program_id(axis=0)
