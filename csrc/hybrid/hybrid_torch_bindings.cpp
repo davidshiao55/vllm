@@ -8,6 +8,7 @@
 
 #include <torch/extension.h>
 
+#include "bf16_kernels.h"
 #include "hybrid_weight_task_runner.h"
 
 namespace py = pybind11;
@@ -15,6 +16,7 @@ using vllm::hybrid::HybridWeightTaskRunner;
 
 PYBIND11_MODULE(_hybrid_C, m) {
   m.doc() = "Hybrid native weight task runner (vllm/csrc/hybrid/).";
+  m.def("bf16_kernel_isa", &vllm::hybrid::bf16_kernel_isa);
 
   py::class_<HybridWeightTaskRunner>(m, "HybridWeightTaskRunner")
       .def(py::init<>())
@@ -58,10 +60,9 @@ PYBIND11_MODULE(_hybrid_C, m) {
       .def("run_at_linear_inline",
            &HybridWeightTaskRunner::run_at_linear_inline, py::arg("x"),
            py::arg("w"), py::arg("y_out"))
-      // Custom AVX2 BF16 GEMM kernel inline. Same signature shape as
+      // Runtime-dispatched BF16 GEMM kernel inline. Same signature shape as
       // run_at_linear_inline; w must be (K, N) row-major BF16 (the
-      // transposed-storage layout that oneDNN doesn't fast-path on
-      // AVX2).
+      // transposed-storage layout rather than the natural Linear layout).
       .def("run_bf16_gemm_transposed_inline",
            &HybridWeightTaskRunner::run_bf16_gemm_transposed_inline,
            py::arg("x"), py::arg("w"), py::arg("y_out"))

@@ -29,5 +29,8 @@ void bf16_mlp_gate_up_silu_down(const uint16_t* x, const uint16_t* w_gate,
                                 uint16_t* y, uint16_t* z_scratch, int64_t M,
                                 int64_t H, int64_t I, int64_t O);
 
+// Runtime-selected implementation for the complete hybrid BF16 kernel table.
+const char* bf16_kernel_isa();
+
 }  // namespace hybrid
 }  // namespace vllm

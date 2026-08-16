@@ -10,6 +10,7 @@
 
 #include "bf16_kernel_utils.h"
 #include "bf16_kernels.h"
+#include "bf16_kernels_internal.h"
 
 #include <ATen/Parallel.h>
 
@@ -82,8 +83,8 @@ inline void dot_pair(const uint16_t* x, const uint16_t* w, uint16_t* y,
 // Handles any (M, N, K): adjacent output pairs use M_TILE=4 plus one fused
 // M_TILE=1/2/3 remainder. An odd final output uses the single-row fallback.
 // Both paths retain the scalar K tail for arbitrary K.
-void bf16_gemm_natural(const uint16_t* x, const uint16_t* w, uint16_t* y,
-                       int64_t M, int64_t N, int64_t K) {
+void bf16_gemm_natural_avx2(const uint16_t* x, const uint16_t* w, uint16_t* y,
+                            int64_t M, int64_t N, int64_t K) {
   const int64_t n_pairs = N / 2;
   at::parallel_for(0, n_pairs, /*grain=*/1,
                    [x, w, y, M, N, K](int64_t n_begin, int64_t n_end) {

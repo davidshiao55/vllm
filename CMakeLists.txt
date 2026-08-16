@@ -1017,10 +1017,18 @@ endif()
 # See docs/implementation_roadmap.md Phase 1c.
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
-  set(VLLM_HYBRID_CPU_KERNEL_SRC
+  set(VLLM_HYBRID_AVX2_KERNEL_SRC
     "csrc/hybrid/bf16_gemm_transposed.cpp"
     "csrc/hybrid/bf16_gemm_natural.cpp"
     "csrc/hybrid/bf16_mlp_gate_up_silu.cpp")
+
+  set(VLLM_HYBRID_AVX512_KERNEL_SRC
+    "csrc/hybrid/bf16_kernels_avx512.cpp")
+
+  set(VLLM_HYBRID_CPU_KERNEL_SRC
+    "csrc/hybrid/bf16_kernels_dispatch.cpp"
+    ${VLLM_HYBRID_AVX2_KERNEL_SRC}
+    ${VLLM_HYBRID_AVX512_KERNEL_SRC})
 
   set(VLLM_HYBRID_EXT_SRC
     "csrc/hybrid/task_queue.cpp"
@@ -1031,15 +1039,24 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   include(CheckCXXCompilerFlag)
   check_cxx_compiler_flag("-mavx2" VLLM_HYBRID_COMPILER_HAS_MAVX2)
   check_cxx_compiler_flag("-mfma" VLLM_HYBRID_COMPILER_HAS_MFMA)
+  check_cxx_compiler_flag("-mavx512f" VLLM_HYBRID_COMPILER_HAS_MAVX512F)
+  check_cxx_compiler_flag("-mavx512bw" VLLM_HYBRID_COMPILER_HAS_MAVX512BW)
   if(NOT VLLM_HYBRID_COMPILER_HAS_MAVX2 OR NOT VLLM_HYBRID_COMPILER_HAS_MFMA)
     message(FATAL_ERROR
       "Hybrid Stage 7 BF16 kernels require compiler support for -mavx2 and -mfma")
   endif()
+  if(NOT VLLM_HYBRID_COMPILER_HAS_MAVX512F OR
+     NOT VLLM_HYBRID_COMPILER_HAS_MAVX512BW)
+    message(FATAL_ERROR
+      "Hybrid BF16 kernels require compiler support for -mavx512f and -mavx512bw")
+  endif()
 
   # -fopenmp makes ATen's inline parallel_for route through its OpenMP
   # backend. Without it these translation units silently execute serially.
-  set_source_files_properties(${VLLM_HYBRID_CPU_KERNEL_SRC}
+  set_source_files_properties(${VLLM_HYBRID_AVX2_KERNEL_SRC}
     PROPERTIES COMPILE_FLAGS "-mavx2 -mfma -fopenmp")
+  set_source_files_properties(${VLLM_HYBRID_AVX512_KERNEL_SRC}
+    PROPERTIES COMPILE_FLAGS "-mavx512f -mavx512bw -mfma -fopenmp")
 
   message(STATUS "Enabling hybrid_C extension.")
   define_extension_target(

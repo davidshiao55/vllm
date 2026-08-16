@@ -16,6 +16,7 @@
 
 #include "bf16_kernel_utils.h"
 #include "bf16_kernels.h"
+#include "bf16_kernels_internal.h"
 
 #include <ATen/Parallel.h>
 
@@ -78,15 +79,16 @@ void gate_up_silu_bf16_scratch(const uint16_t* x, const uint16_t* w_gate,
 
 }  // namespace
 
-void bf16_mlp_gate_up_silu_down(const uint16_t* x, const uint16_t* w_gate,
-                                const uint16_t* w_up, const uint16_t* w_down,
-                                uint16_t* y, uint16_t* z_scratch, int64_t M,
-                                int64_t H, int64_t I, int64_t O) {
+void bf16_mlp_gate_up_silu_down_avx2(const uint16_t* x, const uint16_t* w_gate,
+                                     const uint16_t* w_up,
+                                     const uint16_t* w_down, uint16_t* y,
+                                     uint16_t* z_scratch, int64_t M, int64_t H,
+                                     int64_t I, int64_t O) {
   if (M <= 0 || H <= 0 || I <= 0 || O <= 0) {
     return;
   }
   gate_up_silu_bf16_scratch(x, w_gate, w_up, z_scratch, M, H, I);
-  bf16_gemm_transposed(z_scratch, w_down, y, M, O, I);
+  bf16_gemm_transposed_avx2(z_scratch, w_down, y, M, O, I);
 }
 
 }  // namespace hybrid

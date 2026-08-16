@@ -10,6 +10,7 @@
 
 #include "bf16_kernel_utils.h"
 #include "bf16_kernels.h"
+#include "bf16_kernels_internal.h"
 
 #include <ATen/Parallel.h>
 
@@ -115,8 +116,8 @@ void run_m4_groups(const uint16_t* x, const uint16_t* w, uint16_t* y,
 
 }  // namespace
 
-void bf16_gemm_transposed(const uint16_t* x, const uint16_t* w, uint16_t* y,
-                          int64_t M, int64_t N, int64_t K) {
+void bf16_gemm_transposed_avx2(const uint16_t* x, const uint16_t* w,
+                               uint16_t* y, int64_t M, int64_t N, int64_t K) {
   const int64_t N_main = N / kNBlock * kNBlock;
 
   const int64_t m_groups = M / 4;
