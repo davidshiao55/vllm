@@ -338,6 +338,30 @@ void HybridWeightTaskRunner::sync_on_stream(uintptr_t cuda_stream) {
               cudaGetErrorString(err));
 }
 
+void HybridWeightTaskRunner::publish_live_num_tokens_on_stream(
+    int32_t n, uintptr_t cuda_stream) {
+  check_error();
+  TORCH_CHECK(n > 0, "publish_live_num_tokens_on_stream: n=", n,
+              " must be positive");
+
+  // The Python thread can enqueue multiple forwards before the CUDA stream
+  // reaches any of them. Give every publication immutable callback data;
+  // reusing one runner-global argument record would recreate the same race.
+  auto args = std::make_unique<LiveTokenPublishArgs>();
+  args->runner = static_cast<void*>(this);
+  args->live_num_tokens = n;
+  cudaError_t err =
+      cudaLaunchHostFunc(reinterpret_cast<cudaStream_t>(cuda_stream),
+                         &HybridWeightTaskRunner::PublishLiveTokenCallback,
+                         static_cast<void*>(args.get()));
+  TORCH_CHECK(err == cudaSuccess,
+              "cudaLaunchHostFunc(PublishLiveTokenCallback) failed: ",
+              cudaGetErrorString(err));
+  // PublishLiveTokenCallback owns and deletes the record after the CUDA stream
+  // reaches it.
+  args.release();
+}
+
 void HybridWeightTaskRunner::sync_blocking() {
   task_queue_->sync(0);
   // Surface any worker error that fired while we were waiting.
@@ -515,6 +539,22 @@ at::Tensor HybridWeightTaskRunner::y_pinned_view(int64_t task_id,
 
 // --- static cudaLaunchHostFunc callbacks -----------------------------------
 
+// Establish the live-row count in CUDA-stream order. on_dispatch can run far
+// ahead on the Python thread, but these callbacks remain ordered with the
+// eager forward / graph replay and its captured DispatchCallbacks.
+void HybridWeightTaskRunner::PublishLiveTokenCallback(void* user_data) {
+  std::unique_ptr<LiveTokenPublishArgs> args(
+      static_cast<LiveTokenPublishArgs*>(user_data));
+  auto* self = static_cast<HybridWeightTaskRunner*>(args->runner);
+  self->stream_live_num_tokens_.store(args->live_num_tokens,
+                                      std::memory_order_release);
+  if (hybrid_diag::counters_enabled()) {
+    self->live_set_calls_.fetch_add(1, std::memory_order_relaxed);
+    self->live_last_value_.store(args->live_num_tokens,
+                                 std::memory_order_relaxed);
+  }
+}
+
 // Submit-side host callback. Runs on the CUDA driver thread; must NOT
 // block (CUDA stream is paused while we run). Just enqueues to the
 // TaskQueue worker.
@@ -523,17 +563,31 @@ void HybridWeightTaskRunner::DispatchCallback(void* user_data) {
   TaskSlab* slab = static_cast<TaskSlab*>(user_data);
   HybridWeightTaskRunner* self =
       static_cast<HybridWeightTaskRunner*>(slab->self);
+  const int32_t live_num_tokens =
+      self->stream_live_num_tokens_.load(std::memory_order_acquire);
+  const int32_t slab_cap = slab->bucket_capacity_tokens;
+  // A zero live value occurs only in direct native fixtures / graph capture
+  // setup that did not publish a runtime dispatch. Preserve their historical
+  // bucket-sized behavior. Production on_dispatch always publishes > 0.
+  const int32_t effective_num_tokens =
+      live_num_tokens > 0 ? std::min(live_num_tokens, slab_cap) : slab_cap;
   // §1c.24 attribution: stamp enqueue time so the worker can later
   // compute queue_wait = worker_start - enqueue_time. Gated by
-  // VLLM_HYBRID_COUNTERS=1; in production-default mode neither now_ns()
-  // nor the atomic write fires. Worker reads enqueue_time_ns
-  // conditionally on the same flag, so a counter-disabled run leaves it
-  // at its initial value (0).
-  if (hybrid_diag::counters_enabled()) {
-    slab->enqueue_time_ns.store(now_ns(), std::memory_order_release);
+  // VLLM_HYBRID_COUNTERS=1. Carry the timestamp by value alongside the live
+  // rows so slab reuse cannot corrupt diagnostics either.
+  const bool diag = hybrid_diag::counters_enabled();
+  const int64_t enqueue_time_ns = diag ? now_ns() : 0;
+  if (diag) {
     self->dispatch_cb_count_.fetch_add(1, std::memory_order_relaxed);
+    if (live_num_tokens > slab_cap) {
+      self->worker_clamp_override_count_.fetch_add(1,
+                                                   std::memory_order_relaxed);
+    }
   }
-  self->task_queue_->enqueue([self, slab] { self->RunSlabOnWorker(slab); });
+  self->task_queue_->enqueue(
+      [self, slab, effective_num_tokens, enqueue_time_ns] {
+        self->RunSlabOnWorker(slab, effective_num_tokens, enqueue_time_ns);
+      });
 }
 
 // Sync-side host callback. Blocks the CUDA driver thread until the
@@ -561,19 +615,18 @@ void HybridWeightTaskRunner::SyncCallback(void* user_data) {
 
 // --- worker-thread task body ----------------------------------------------
 
-void HybridWeightTaskRunner::RunSlabOnWorker(TaskSlab* slab) {
+void HybridWeightTaskRunner::RunSlabOnWorker(TaskSlab* slab,
+                                             int32_t effective_num_tokens,
+                                             int64_t enqueue_time_ns) {
   // §1c.24 attribution: stamp worker start + queue wait, gated by
   // VLLM_HYBRID_COUNTERS. Production-default leaves worker_t0 at 0 (the
   // worker_busy_total_ns add at the end is also gated). NVTX scope
   // is independently gated inside NvtxScope's ctor.
   const bool diag = hybrid_diag::counters_enabled();
   const int64_t worker_t0 = diag ? now_ns() : 0;
-  if (diag) {
-    const int64_t enq = slab->enqueue_time_ns.load(std::memory_order_acquire);
-    if (enq > 0) {
-      worker_queue_wait_total_ns_.fetch_add(worker_t0 - enq,
-                                            std::memory_order_relaxed);
-    }
+  if (diag && enqueue_time_ns > 0) {
+    worker_queue_wait_total_ns_.fetch_add(worker_t0 - enqueue_time_ns,
+                                          std::memory_order_relaxed);
   }
   const char* nvtx_name = "hybrid:worker";
   switch (slab->op_kind) {
@@ -607,40 +660,10 @@ void HybridWeightTaskRunner::RunSlabOnWorker(TaskSlab* slab) {
     last_observed_num_threads_.store(at::get_num_threads(),
                                      std::memory_order_release);
 
-    // §1c.21: prefer live_num_tokens override (stored in runtime_num_tokens_,
-    // set OUT OF GRAPH by `set_live_num_tokens` before each captured replay)
-    // over `slab->num_tokens` (captured bucket capacity). Sentinel 0 → fall
-    // back to slab capacity.
-    //
-    // §1c.31 (commit-3-real fix): the override is a CAP, not a
-    // required row count. If it exceeds slab capacity, clamp to
-    // slab_cap and bump worker_clamp_override_count_ for
-    // observability. Pinned-buffer reads past slab_cap rows is UB,
-    // so the clamp is the safe behavior. This commonly happens in
-    // eager mode where set_live_num_tokens() applies globally to
-    // whatever slab fires next, regardless of which bucket sized
-    // that slab (e.g., B=4 prefill at input_len=8 → 32 tokens, but
-    // an MLP slab keyed by the smallest bucket has capacity 8).
-    const int32_t slab_cap = slab->num_tokens.load(std::memory_order_acquire);
-    const int32_t override_n =
-        runtime_num_tokens_.load(std::memory_order_acquire);
-    int32_t n;
-    if (override_n > 0) {
-      if (override_n > slab_cap) {
-        n = slab_cap;
-        // §1c.34 cleanup C: clamp counter is diag-gated. Production
-        // doesn't need observability of clamp events — the clamp
-        // itself is a safety behavior (correct vs reading past the
-        // pinned buffer); only the COUNT is observational.
-        if (diag) {
-          worker_clamp_override_count_.fetch_add(1, std::memory_order_relaxed);
-        }
-      } else {
-        n = override_n;
-      }
-    } else {
-      n = slab_cap;
-    }
+    // DispatchCallback already clamped and copied this value into the queue
+    // closure. Never reread mutable runner or slab state here: later forwards
+    // and graph replays may be published while this task waits.
+    const int32_t n = effective_num_tokens;
 
     // §1c.21 fix-validation + §1c.22 byte accounting: bin the
     // effective_n the worker actually used, plus per-replay bucket
@@ -764,7 +787,7 @@ void HybridWeightTaskRunner::RunSlabOnWorker(TaskSlab* slab) {
   }
 }
 
-// --- §1c.21 live-token override ---------------------------------------
+// --- §1c.21 live-token accounting -------------------------------------
 
 void HybridWeightTaskRunner::note_uva_request(int32_t num_tokens,
                                               int32_t cpu_out_dim) {
@@ -777,23 +800,6 @@ void HybridWeightTaskRunner::note_uva_request(int32_t num_tokens,
                         static_cast<int64_t>(sizeof(at::BFloat16));
   uva_record_bytes_.fetch_add(bytes, std::memory_order_relaxed);
   uva_record_count_.fetch_add(1, std::memory_order_relaxed);
-}
-
-void HybridWeightTaskRunner::set_live_num_tokens(int32_t n) {
-  TORCH_CHECK(n >= 0, "set_live_num_tokens: n=", n,
-              " < 0; pass 0 to clear the override.");
-  // Release store: the worker's acquire load in RunSlabOnWorker pairs
-  // with this. The caller's responsibility is to set this BEFORE the
-  // captured graph replay begins (i.e., from HybridOffloader.on_dispatch
-  // outside the captured region). This store
-  // is FUNCTIONAL (drives the worker's effective_n) and must stay
-  // always-on; the live_set_calls / live_last_value counters
-  // alongside are diagnostic only and diag-gated (§1c.34 cleanup C).
-  runtime_num_tokens_.store(n, std::memory_order_release);
-  if (hybrid_diag::counters_enabled()) {
-    live_set_calls_.fetch_add(1, std::memory_order_relaxed);
-    live_last_value_.store(n, std::memory_order_relaxed);
-  }
 }
 
 // --- §1c.21 perf-investigation counters --------------------------------

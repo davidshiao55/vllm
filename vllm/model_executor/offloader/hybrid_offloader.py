@@ -900,12 +900,13 @@ class HybridOffloader(BaseOffloader):
 
     # --- BaseOffloader lifecycle delegation ---
 
-    def _set_live_num_tokens(self, live_num_tokens: int) -> None:
-        """Push the live unpadded token count to the C++ worker.
+    def _publish_live_num_tokens(self, live_num_tokens: int) -> None:
+        """Publish live rows at the next compute-stream boundary.
 
         CUDA graph buckets and native slabs are capacity-sized. This
-        live-row cap lets the CPU worker skip padded rows inside the
-        selected bucket.
+        task-owned live-row cap lets the CPU worker skip padded rows inside
+        the selected bucket without allowing a later forward to overwrite an
+        older queued task's row count.
 
         No-op when there is no active CPU work or when
         `live_num_tokens <= 0` (sentinel).
@@ -917,7 +918,9 @@ class HybridOffloader(BaseOffloader):
             return
         from vllm.model_executor.offloader import hybrid_ops
 
-        hybrid_ops.set_live_num_tokens(self._runner._runner_id, int(live_num_tokens))
+        hybrid_ops.publish_live_num_tokens_on_stream(
+            self._runner._runner_id, int(live_num_tokens)
+        )
 
     def on_dispatch(
         self,
@@ -941,9 +944,9 @@ class HybridOffloader(BaseOffloader):
             authoritative vLLM dispatch bucket to Hybrid custom ops.
             CPU ops use it to resolve `(layer_idx, bucket, op_kind) -> task_id`;
             prefetch/scatter ops use it to resolve existing handle route tables.
-        3. `_set_live_num_tokens(num_tokens_unpadded)` — live-row cap
-            pushed to the C++ worker. This is independent from task
-            selection.
+        3. `_publish_live_num_tokens(num_tokens_unpadded)` — inserts a
+            stream-ordered publication before the forward. Captured task
+            callbacks copy the value into their CPU queue entries.
         """
         num_tokens_padded = int(batch_descriptor.num_tokens)
         num_tokens_unpadded = int(num_tokens_unpadded)
@@ -955,7 +958,7 @@ class HybridOffloader(BaseOffloader):
         # CPU work scales with the semantic batch size, not bucket
         # capacity. Task selection is handled by the active dispatch
         # state above.
-        self._set_live_num_tokens(num_tokens_unpadded)
+        self._publish_live_num_tokens(num_tokens_unpadded)
 
     def shutdown(self) -> None:
         """Drain and release the shared CPU runner at worker shutdown."""
@@ -1109,19 +1112,17 @@ class HybridOffloader(BaseOffloader):
         # Native weight offload is incompatible with vLLM microbatching/
         # ubatching (DBO or ubatch_size > 1). The live-token cap
         # (`GPUModelRunner._publish_forward_dispatch` →
-        # `BaseOffloader.set_live_num_tokens`)
-        # currently sets ONE global value per scheduler batch. Under
-        # ubatching, a Hybrid operator runs on a per-ubatch slice but
-        # sees the cap as the FULL batch token count, which can
-        # over-compute (the worker would read past the per-ubatch
-        # x_pinned slice into stale data). Hard-fail until per-ubatch live
-        # counts are plumbed.
+        # `HybridOffloader._publish_live_num_tokens`) currently publishes one
+        # task-owned value per scheduler batch. Under ubatching, a Hybrid
+        # operator runs on a per-ubatch slice but still receives the full-batch
+        # token count, which can over-compute against that slice. Hard-fail
+        # until per-ubatch live counts are plumbed.
         if self._has_cpu_compute_work and vllm_config.parallel_config.use_ubatching:
             raise RuntimeError(
                 "HybridOffloader is currently incompatible with vLLM "
                 "microbatching/ubatching "
                 "(`enable_dbo` or `ubatch_size > 1`). The live-token "
-                "cap sets one global live_num_tokens value per scheduler "
+                "cap publishes one live_num_tokens value per scheduler "
                 "batch; under ubatching a per-ubatch slice would "
                 "over-compute against the full-batch cap. Disable "
                 "ubatching until per-ubatch live counts are plumbed."

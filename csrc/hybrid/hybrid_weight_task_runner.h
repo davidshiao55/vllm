@@ -40,9 +40,11 @@ namespace hybrid {
 //   * Stage 7-C: down-proj is row-narrow on transposed `(n_cpu_total,
 //     out_dim)` storage → contiguous (dn_n_cpu, out_dim) view, no strides
 //     needed (kernel takes ContigCpuViewFromBlob, not StridedCpuViewFromBlob).
-//   * num_tokens is the only field written per-call (by the submit-callback
-//     before TaskQueue::enqueue). All other fields are constant after
-//     populate_slab() and remain valid across CUDA graph re-replays.
+//   * num_tokens is record/submission metadata for the captured D2H. Worker
+//     correctness never depends on it: replay-time live rows are published in
+//     CUDA-stream order and copied by value into each queued CPU task. All
+//     other fields are constant after populate_slab() and remain valid across
+//     CUDA graph re-replays.
 struct alignas(64) TaskSlab {
   enum OpKind : int32_t { kQkv = 0, kMlpBlock = 1, kDryrunNoop = 2 };
 
@@ -57,16 +59,10 @@ struct alignas(64) TaskSlab {
   int32_t op_kind = kDryrunNoop;
   int32_t n_threads = 1;
 
-  // Only field updated per submit. atomic<int32_t> with relaxed load is OK:
-  // the submit-callback's host-function dispatch happens-before TaskQueue
-  // worker dequeue (CUDA stream ordering + cv_ notify in TaskQueue::enqueue).
+  // Record/submission-time transfer rows. This remains observable for focused
+  // tests and diagnostics, but the worker uses the immutable bucket capacity
+  // plus the live-row value captured by DispatchCallback instead.
   std::atomic<int32_t> num_tokens{0};
-
-  // §1c.24 diagnostic-only: written in DispatchCallback when
-  // VLLM_HYBRID_COUNTERS=1 so the worker can attribute (worker_start -
-  // enqueue_time) as TaskQueue wait. 0 = unset (production-default
-  // mode never writes this).
-  std::atomic<int64_t> enqueue_time_ns{0};
 
   // §1c.22 review-fix: immutable bucket capacity, populated once at
   // install time from the (layer, bucket, op_kind) descriptor and
@@ -118,6 +114,14 @@ struct alignas(64) TaskSlab {
 struct SyncArgs {
   void* runner = nullptr;
   size_t allow_n_pending = 0;
+};
+
+// One-shot userData for the out-of-graph live-row publication callback. A
+// distinct record is allocated per forward because the Python thread may
+// enqueue several forwards before the CUDA stream reaches any callback.
+struct LiveTokenPublishArgs {
+  void* runner = nullptr;
+  int32_t live_num_tokens = 0;
 };
 
 class HybridWeightTaskRunner {
@@ -272,24 +276,16 @@ class HybridWeightTaskRunner {
   // HybridWeightTaskRunner instance).
   at::Tensor y_pinned_view(int64_t task_id, int32_t num_tokens) const;
 
-  // §1c.21 fix — live unpadded token count plumbed through OUT OF
-  // GRAPH. Under vLLM full CUDA graph capture, `slab->num_tokens` is
-  // frozen at the captured bucket size (e.g., 256). Replays at B=1
-  // decode would otherwise run CPU GEMMs for the bucket size, costing
-  // ~17 ms/GEMM × 7000 calls = ~120 s/generate wasted (see
-  // phase1c_findings.md §1c.21 counter-driven diagnosis).
+  // Publish the live unpadded token count OUT OF GRAPH but IN CUDA-stream
+  // order. The callback writes stream_live_num_tokens_ immediately before the
+  // corresponding eager forward or graph replay reaches its captured task
+  // callbacks. Each DispatchCallback then snapshots the value into the queued
+  // CPU closure, so a later forward cannot change an older task's row count.
   //
-  // Caller (HybridOffloader.prepare_before_forward, called by
-  // cudagraph_utils.py before each captured replay) sets this to the
-  // live unpadded token count from
-  // `scheduler_output.total_num_scheduled_tokens`. The worker reads it via the
-  // loaded value and uses `effective_n` for all row-count arithmetic —
-  // at::from_blob shapes, GEMM input rows, scratch slicing — instead of
-  // `slab->num_tokens`. Always bounded by `effective_n <= slab->num_tokens`
-  // (the slab capacity) so no buffer overrun is possible.
-  //
-  // Sentinel 0 = unset → fall back to slab->num_tokens. Any positive
-  // value overrides. Validated `n >= 0` at the entry point.
+  // Under full CUDA graph capture, `slab->num_tokens` is frozen at the graph's
+  // bucket size. Replays at smaller live sizes would otherwise run bucket-sized
+  // CPU GEMMs. The task-owned live value keeps that optimization without the
+  // former runner-global late-read race.
   //
   // The captured cudaMemcpyAsync byte count and the captured Triton
   // UVA grid are still sized to the bucket — those nodes are baked
@@ -300,7 +296,7 @@ class HybridWeightTaskRunner {
   // Wasted PCIe / Triton bandwidth is a §1c.22 follow-up; the
   // dominant cost the counter data showed was CPU GEMM work, which
   // this fix collapses.
-  void set_live_num_tokens(int32_t n);
+  void publish_live_num_tokens_on_stream(int32_t n, uintptr_t cuda_stream);
 
   // §1c.22: invoked from `hybrid_sync_then_uva`'s Python impl to
   // record the captured Triton kernel's bucket-sized H2D request
@@ -328,13 +324,16 @@ class HybridWeightTaskRunner {
   void reset_counters();
 
  private:
-  // Static dispatchers used by cudaLaunchHostFunc. Both must be
+  // Static dispatchers used by cudaLaunchHostFunc. All must be
   // `void(*)(void*)`.
+  static void PublishLiveTokenCallback(void* user_data);
   static void DispatchCallback(void* user_data);
   static void SyncCallback(void* user_data);
 
-  // Worker-thread task body; runs whatever op_kind says.
-  void RunSlabOnWorker(TaskSlab* slab);
+  // Worker-thread task body. effective_num_tokens and enqueue_time_ns are
+  // immutable submission state captured by value in the queue closure.
+  void RunSlabOnWorker(TaskSlab* slab, int32_t effective_num_tokens,
+                       int64_t enqueue_time_ns);
 
   std::unique_ptr<TaskQueue> task_queue_;
 
@@ -368,12 +367,10 @@ class HybridWeightTaskRunner {
 
   std::atomic<int32_t> last_observed_num_threads_{0};
 
-  // §1c.21 live-token override. Sentinel 0 = unset; positive values
-  // override slab->num_tokens for row-count arithmetic in the
-  // worker. Updated OUT OF GRAPH by set_live_num_tokens() before
-  // each captured replay; read on the worker thread via acquire
-  // load. See header comment on set_live_num_tokens.
-  std::atomic<int32_t> runtime_num_tokens_{0};
+  // Live rows established by PublishLiveTokenCallback in compute-stream order.
+  // DispatchCallback reads this value on the same stream and copies it into
+  // the queued CPU closure. The worker itself never reads this mutable state.
+  std::atomic<int32_t> stream_live_num_tokens_{0};
 
   // Worker exception surfacing (see has_error / take_error above).
   std::atomic<bool> has_error_{false};
@@ -422,15 +419,10 @@ class HybridWeightTaskRunner {
   std::atomic<int64_t> uva_replay_bucket_bytes_{0};
 
   // §1c.21 fix-validation counters: distinct from the submit-time
-  // num_tokens histogram. `live_set_calls_` counts how often
-  // `set_live_num_tokens` was called (proves the plumb-through
-  // is reaching C++); `live_last_value_` is the most recent
-  // value (proves what's being pushed); `worker_effective_n_hist_`
-  // bins what the worker actually used after the
-  // `effective_n = override > 0 ? override : slab.num_tokens`
-  // resolution. If submit-time histogram is dominated by `nt_gt_64`
-  // but `worker_effective_n_hist` shows mostly `nt_le_1`, the
-  // worker is correctly using the override.
+  // num_tokens histogram. `live_set_calls_` counts stream-ordered
+  // publications and `live_last_value_` records the last published value.
+  // `worker_effective_n_hist_` bins the immutable value carried by queued
+  // tasks.
   std::atomic<int64_t> live_set_calls_{0};
   std::atomic<int64_t> live_last_value_{0};
   std::array<std::atomic<int64_t>, 8> worker_effective_n_hist_{};
@@ -479,12 +471,9 @@ class HybridWeightTaskRunner {
   // it up. Distinct from `sync_cb_wait_total_ns_` (the driver
   // thread's wait inside SyncCallback).
   std::atomic<int64_t> worker_queue_wait_total_ns_{0};
-  // §1c.31: counts replays where `live_num_tokens > slab.num_tokens`
-  // — the global live-token override was set for a larger row count
-  // than this slab's bucket can hold. The worker clamps to slab
-  // capacity rather than reading past the pinned buffer's tail. Most
-  // common under eager mode where the global override applies to
-  // whatever slab fires next, regardless of which bucket sized it.
+  // Counts callbacks where live_num_tokens exceeds the immutable slab bucket.
+  // The callback clamps before enqueueing so the worker cannot read beyond the
+  // pinned buffers.
   // Surfaced via get_counters(); non-zero means at least one
   // submit/replay was clamped (informational, not an error).
   std::atomic<int64_t> worker_clamp_override_count_{0};

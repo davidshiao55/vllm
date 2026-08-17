@@ -76,8 +76,9 @@ PYBIND11_MODULE(_hybrid_C, m) {
            py::arg("y_out"))
       .def("y_pinned_view", &HybridWeightTaskRunner::y_pinned_view,
            py::arg("task_id"), py::arg("num_tokens"))
-      .def("set_live_num_tokens", &HybridWeightTaskRunner::set_live_num_tokens,
-           py::arg("n"))
+      .def("publish_live_num_tokens_on_stream",
+           &HybridWeightTaskRunner::publish_live_num_tokens_on_stream,
+           py::arg("n"), py::arg("cuda_stream"))
       .def("note_uva_request", &HybridWeightTaskRunner::note_uva_request,
            py::arg("num_tokens"), py::arg("cpu_out_dim"))
       .def("get_counters",

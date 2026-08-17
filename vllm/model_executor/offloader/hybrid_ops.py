@@ -363,13 +363,13 @@ def add_python_timing(name: str, elapsed_ns: int, *, count: int = 1) -> None:
     add_python_counter(f"{name}_count", int(count))
 
 
-def set_live_num_tokens(runner_id: int, n: int) -> None:
-    """Publish the live-token row cap to the native Hybrid worker.
+def publish_live_num_tokens_on_stream(runner_id: int, n: int) -> None:
+    """Publish a forward's live rows in CUDA-stream order.
 
-    `n` is the number of semantically live rows in the active bucket.
-    Slab capacity, graph capture, and buffer sizing stay bucket-based;
-    the worker reads this value on the next host-callback fire and
-    avoids CPU GEMM work for padded rows.
+    The native publication callback runs immediately before the corresponding
+    eager forward or CUDA Graph replay callbacks. Each task callback snapshots
+    the value into its queue closure, so later forwards cannot change the row
+    count of already-submitted CPU work.
     """
     runner = _HYBRID_WEIGHT_RUNNERS.get(runner_id)
     if runner is None:
@@ -377,7 +377,8 @@ def set_live_num_tokens(runner_id: int, n: int) -> None:
         # just skip. The next custom-op call will surface the missing
         # registry entry with a clearer error.
         return
-    runner.set_live_num_tokens(int(n))
+    stream = torch.cuda.current_stream().cuda_stream
+    runner.publish_live_num_tokens_on_stream(int(n), stream)
 
 
 def sync_blocking(runner_id: int) -> None:
