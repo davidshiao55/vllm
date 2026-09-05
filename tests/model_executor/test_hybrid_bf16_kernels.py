@@ -40,7 +40,10 @@ def test_hybrid_bf16_gemms_match_reference(runner, m: int, k: int, n: int):
     torch.testing.assert_close(natural, transposed, rtol=0.04, atol=0.04)
 
 
-@pytest.mark.parametrize("m,h,i,o", [(1, 31, 19, 17), (2, 32, 64, 64), (5, 33, 67, 65)])
+@pytest.mark.parametrize(
+    "m,h,i,o",
+    [(1, 31, 19, 17), (2, 32, 64, 64), (5, 33, 67, 65), (8, 33, 129, 513)],
+)
 def test_hybrid_bf16_mlp_matches_reference(runner, m: int, h: int, i: int, o: int):
     torch.manual_seed(20260831 + m)
     x = _bf16_randn(m, h, scale=0.2)
@@ -56,3 +59,49 @@ def test_hybrid_bf16_mlp_matches_reference(runner, m: int, h: int, i: int, o: in
     expected = (z_ref.float() @ down.float()).to(torch.bfloat16)
 
     torch.testing.assert_close(output, expected, rtol=0.04, atol=0.04)
+
+
+@pytest.mark.parametrize(
+    "m,k,n",
+    [
+        (0, 65, 513),
+        (5, 65, 0),
+        (1, 0, 17),
+        (1, 63, 511),
+        (2, 64, 512),
+        (3, 65, 513),
+        (4, 129, 1025),
+        (5, 257, 67),
+        (8, 129, 4096),
+        (16, 65, 3584),
+        (8, 65, 5120),
+    ],
+)
+def test_hybrid_transposed_preserves_reduction_order(runner, m, k, n):
+    """K/N panel edges, token remainders, and offset contiguous weight views.
+
+    Products of these finite BF16 operands are exactly representable in FP32,
+    so sequential FP32 adds reproduce the increasing-K FMA reduction exactly.
+    Check bit equality, not a GEMM tolerance that could hide early BF16 rounding.
+    """
+    torch.manual_seed(20260905 + m + k + n)
+    x = _bf16_randn(m + 2, k, scale=0.25)[1:-1]
+    weight = _bf16_randn(k + 2, n, scale=0.25)[1:-1]
+    output = torch.full((m, n), float("nan"), dtype=torch.bfloat16)
+    expected = torch.zeros(m, n, dtype=torch.float32)
+    xf, wf = x.float(), weight.float()
+    for reduction in range(k):
+        expected.add_(xf[:, reduction : reduction + 1] * wf[reduction])
+    runner.run_bf16_gemm_transposed_inline(x, weight, output)
+    torch.testing.assert_close(output, expected.bfloat16(), rtol=0, atol=0)
+
+
+def test_hybrid_transposed_scratch_reuse_does_not_keep_stale_rows(runner):
+    # Larger-to-smaller calls and changing N reinterpret the reusable scratch.
+    # Every first K panel must overwrite it, including the zero-K case.
+    for m, k, n in [(16, 129, 1025), (1, 0, 17), (3, 65, 513), (8, 63, 64)]:
+        x = torch.ones(m, k, dtype=torch.bfloat16)
+        weight = torch.ones(k, n, dtype=torch.bfloat16)
+        output = torch.empty(m, n, dtype=torch.bfloat16)
+        runner.run_bf16_gemm_transposed_inline(x, weight, output)
+        torch.testing.assert_close(output, torch.full_like(output, k), rtol=0, atol=0)

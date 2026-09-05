@@ -7,6 +7,7 @@
 // accumulators to prevent hot-loop stack materialization by GCC.
 
 #include "bf16_kernels_internal.h"
+#include "bf16_transposed_blocking.h"
 
 #if !defined(__AVX512F__) || !defined(__AVX512BW__) || !defined(__FMA__)
   #error "Hybrid AVX-512 kernels require AVX512F, AVX512BW, and FMA"
@@ -240,15 +241,10 @@ inline void run_m_tiles(int64_t M, Tile4&& tile4, Tile3&& tile3, Tile2&& tile2,
   }
 }
 
-constexpr int64_t kNBlock = 16;
-constexpr int64_t kPrefetchDistance = 24;
-
 template <int M_TILE>
-__attribute__((noinline)) void transposed_tile4(const uint16_t* x,
-                                                const uint16_t* w, uint16_t* y,
-                                                int64_t K, int64_t N,
-                                                int64_t m_start,
-                                                int64_t n_start) {
+__attribute__((noinline)) void transposed_tile4(
+    const uint16_t* x, const uint16_t* w, float* accum, int64_t K, int64_t N,
+    int64_t m_start, int64_t n_start, int64_t k0, int64_t k_end) {
   static_assert(M_TILE >= 1 && M_TILE <= 4);
   const __m512 zero = _mm512_setzero_ps();
   __m512 a00 = zero, a01 = zero, a02 = zero, a03 = zero;
@@ -256,13 +252,37 @@ __attribute__((noinline)) void transposed_tile4(const uint16_t* x,
   __m512 a20 = zero, a21 = zero, a22 = zero, a23 = zero;
   __m512 a30 = zero, a31 = zero, a32 = zero, a33 = zero;
 
-  for (int64_t k = 0; k < K; ++k) {
-    if (k + kPrefetchDistance < K) {
+  if (k0 != 0) {
+    a00 = _mm512_loadu_ps(accum + (m_start + 0) * N + n_start + 0);
+    a01 = _mm512_loadu_ps(accum + (m_start + 0) * N + n_start + 16);
+    a02 = _mm512_loadu_ps(accum + (m_start + 0) * N + n_start + 32);
+    a03 = _mm512_loadu_ps(accum + (m_start + 0) * N + n_start + 48);
+    if constexpr (M_TILE >= 2) {
+      a10 = _mm512_loadu_ps(accum + (m_start + 1) * N + n_start + 0);
+      a11 = _mm512_loadu_ps(accum + (m_start + 1) * N + n_start + 16);
+      a12 = _mm512_loadu_ps(accum + (m_start + 1) * N + n_start + 32);
+      a13 = _mm512_loadu_ps(accum + (m_start + 1) * N + n_start + 48);
+    }
+    if constexpr (M_TILE >= 3) {
+      a20 = _mm512_loadu_ps(accum + (m_start + 2) * N + n_start + 0);
+      a21 = _mm512_loadu_ps(accum + (m_start + 2) * N + n_start + 16);
+      a22 = _mm512_loadu_ps(accum + (m_start + 2) * N + n_start + 32);
+      a23 = _mm512_loadu_ps(accum + (m_start + 2) * N + n_start + 48);
+    }
+    if constexpr (M_TILE >= 4) {
+      a30 = _mm512_loadu_ps(accum + (m_start + 3) * N + n_start + 0);
+      a31 = _mm512_loadu_ps(accum + (m_start + 3) * N + n_start + 16);
+      a32 = _mm512_loadu_ps(accum + (m_start + 3) * N + n_start + 32);
+      a33 = _mm512_loadu_ps(accum + (m_start + 3) * N + n_start + 48);
+    }
+  }
+
+  constexpr int64_t kPrefetchDistance = detail::kTransposedPrefetch;
+  for (int64_t k = k0; k < k_end; ++k) {
+    if (k + kPrefetchDistance < k_end) {
       const uint16_t* w_pf = w + (k + kPrefetchDistance) * N + n_start;
       _mm_prefetch(reinterpret_cast<const char*>(w_pf + 0), _MM_HINT_T0);
-      _mm_prefetch(reinterpret_cast<const char*>(w_pf + 16), _MM_HINT_T0);
       _mm_prefetch(reinterpret_cast<const char*>(w_pf + 32), _MM_HINT_T0);
-      _mm_prefetch(reinterpret_cast<const char*>(w_pf + 48), _MM_HINT_T0);
     }
     const __m512 w0 = load_bf16x16(w + k * N + n_start + 0);
     const __m512 w1 = load_bf16x16(w + k * N + n_start + 16);
@@ -296,54 +316,27 @@ __attribute__((noinline)) void transposed_tile4(const uint16_t* x,
     }
   }
 
-#define STORE_TRANSPOSED_ROW(M)                                         \
-  _mm256_storeu_si256(                                                  \
-      reinterpret_cast<__m256i*>(y + (m_start + M) * N + n_start),      \
-      float16_to_bf16_rne(a##M##0));                                    \
-  _mm256_storeu_si256(                                                  \
-      reinterpret_cast<__m256i*>(y + (m_start + M) * N + n_start + 16), \
-      float16_to_bf16_rne(a##M##1));                                    \
-  _mm256_storeu_si256(                                                  \
-      reinterpret_cast<__m256i*>(y + (m_start + M) * N + n_start + 32), \
-      float16_to_bf16_rne(a##M##2));                                    \
-  _mm256_storeu_si256(                                                  \
-      reinterpret_cast<__m256i*>(y + (m_start + M) * N + n_start + 48), \
-      float16_to_bf16_rne(a##M##3))
-  STORE_TRANSPOSED_ROW(0);
+  _mm512_storeu_ps(accum + (m_start + 0) * N + n_start + 0, a00);
+  _mm512_storeu_ps(accum + (m_start + 0) * N + n_start + 16, a01);
+  _mm512_storeu_ps(accum + (m_start + 0) * N + n_start + 32, a02);
+  _mm512_storeu_ps(accum + (m_start + 0) * N + n_start + 48, a03);
   if constexpr (M_TILE >= 2) {
-    STORE_TRANSPOSED_ROW(1);
+    _mm512_storeu_ps(accum + (m_start + 1) * N + n_start + 0, a10);
+    _mm512_storeu_ps(accum + (m_start + 1) * N + n_start + 16, a11);
+    _mm512_storeu_ps(accum + (m_start + 1) * N + n_start + 32, a12);
+    _mm512_storeu_ps(accum + (m_start + 1) * N + n_start + 48, a13);
   }
   if constexpr (M_TILE >= 3) {
-    STORE_TRANSPOSED_ROW(2);
+    _mm512_storeu_ps(accum + (m_start + 2) * N + n_start + 0, a20);
+    _mm512_storeu_ps(accum + (m_start + 2) * N + n_start + 16, a21);
+    _mm512_storeu_ps(accum + (m_start + 2) * N + n_start + 32, a22);
+    _mm512_storeu_ps(accum + (m_start + 2) * N + n_start + 48, a23);
   }
   if constexpr (M_TILE >= 4) {
-    STORE_TRANSPOSED_ROW(3);
-  }
-#undef STORE_TRANSPOSED_ROW
-}
-
-template <int M_TILE>
-inline void transposed_tile1(const uint16_t* x, const uint16_t* w, uint16_t* y,
-                             int64_t K, int64_t N, int64_t m_start,
-                             int64_t n_start) {
-  __m512 acc[M_TILE];
-  for (int m = 0; m < M_TILE; ++m) acc[m] = _mm512_setzero_ps();
-  for (int64_t k = 0; k < K; ++k) {
-    if (k + kPrefetchDistance < K) {
-      _mm_prefetch(reinterpret_cast<const char*>(
-                       w + (k + kPrefetchDistance) * N + n_start),
-                   _MM_HINT_T0);
-    }
-    const __m512 wv = load_bf16x16(w + k * N + n_start);
-    for (int m = 0; m < M_TILE; ++m) {
-      const __m512 xv = _mm512_set1_ps(bf16_to_float(x[(m_start + m) * K + k]));
-      acc[m] = _mm512_fmadd_ps(xv, wv, acc[m]);
-    }
-  }
-  for (int m = 0; m < M_TILE; ++m) {
-    _mm256_storeu_si256(
-        reinterpret_cast<__m256i*>(y + (m_start + m) * N + n_start),
-        float16_to_bf16_rne(acc[m]));
+    _mm512_storeu_ps(accum + (m_start + 3) * N + n_start + 0, a30);
+    _mm512_storeu_ps(accum + (m_start + 3) * N + n_start + 16, a31);
+    _mm512_storeu_ps(accum + (m_start + 3) * N + n_start + 32, a32);
+    _mm512_storeu_ps(accum + (m_start + 3) * N + n_start + 48, a33);
   }
 }
 
@@ -475,46 +468,49 @@ void bf16_gemm_natural_avx512(const uint16_t* x, const uint16_t* w, uint16_t* y,
 
 void bf16_gemm_transposed_avx512(const uint16_t* x, const uint16_t* w,
                                  uint16_t* y, int64_t M, int64_t N, int64_t K) {
-  const int64_t n_tiles = N / 64;
-  at::parallel_for(0, n_tiles, 1, [=](int64_t begin, int64_t end) {
-    for (int64_t tile = begin; tile < end; ++tile) {
-      const int64_t n = tile * 64;
-      run_m_tiles(
-          M, [&](int64_t m) { transposed_tile4<4>(x, w, y, K, N, m, n); },
-          [&](int64_t m) { transposed_tile4<3>(x, w, y, K, N, m, n); },
-          [&](int64_t m) { transposed_tile4<2>(x, w, y, K, N, m, n); },
-          [&](int64_t m) { transposed_tile4<1>(x, w, y, K, N, m, n); });
-    }
-  });
-
-  const int64_t covered = n_tiles * 64;
-  const int64_t n_blocks_end = N / kNBlock * kNBlock;
-  at::parallel_for(
-      covered / kNBlock, n_blocks_end / kNBlock, 1,
-      [=](int64_t begin, int64_t end) {
-        for (int64_t block = begin; block < end; ++block) {
-          const int64_t n = block * kNBlock;
+  detail::run_transposed_blocked(
+      y, M, N, K,
+      [=](float* accum, int64_t n0, int64_t n_end, int64_t k0, int64_t k_end) {
+        int64_t n = n0;
+        for (; n + 64 <= n_end; n += 64) {
           run_m_tiles(
-              M, [&](int64_t m) { transposed_tile1<4>(x, w, y, K, N, m, n); },
-              [&](int64_t m) { transposed_tile1<3>(x, w, y, K, N, m, n); },
-              [&](int64_t m) { transposed_tile1<2>(x, w, y, K, N, m, n); },
-              [&](int64_t m) { transposed_tile1<1>(x, w, y, K, N, m, n); });
+              M,
+              [&](int64_t m) {
+                transposed_tile4<4>(x, w, accum, K, N, m, n, k0, k_end);
+              },
+              [&](int64_t m) {
+                transposed_tile4<3>(x, w, accum, K, N, m, n, k0, k_end);
+              },
+              [&](int64_t m) {
+                transposed_tile4<2>(x, w, accum, K, N, m, n, k0, k_end);
+              },
+              [&](int64_t m) {
+                transposed_tile4<1>(x, w, accum, K, N, m, n, k0, k_end);
+              });
+        }
+        // Defensive column tail, following exactly the same increasing-K FMA
+        // order as vector tiles. Production down widths are 64-aligned.
+        for (; n < n_end; ++n) {
+          for (int64_t m = 0; m < M; ++m) {
+            float acc = k0 == 0 ? 0.0f : accum[m * N + n];
+            for (int64_t k = k0; k < k_end; ++k)
+              acc = std::fma(bf16_to_float(x[m * K + k]),
+                             bf16_to_float(w[k * N + n]), acc);
+            accum[m * N + n] = acc;
+          }
+        }
+      },
+      [=](const float* accum, int64_t n0, int64_t n_end) {
+        for (int64_t m = 0; m < M; ++m) {
+          int64_t n = n0;
+          for (; n + 16 <= n_end; n += 16)
+            _mm256_storeu_si256(
+                reinterpret_cast<__m256i*>(y + m * N + n),
+                float16_to_bf16_rne(_mm512_loadu_ps(accum + m * N + n)));
+          for (; n < n_end; ++n)
+            y[m * N + n] = float_to_bf16_rne(accum[m * N + n]);
         }
       });
-
-  if (n_blocks_end < N) {
-    at::parallel_for(0, M, 1, [=](int64_t begin, int64_t end) {
-      for (int64_t m = begin; m < end; ++m) {
-        for (int64_t n = n_blocks_end; n < N; ++n) {
-          float sum = 0.0f;
-          for (int64_t k = 0; k < K; ++k) {
-            sum += bf16_to_float(x[m * K + k]) * bf16_to_float(w[k * N + n]);
-          }
-          y[m * N + n] = float_to_bf16_rne(sum);
-        }
-      }
-    });
-  }
 }
 
 void bf16_mlp_gate_up_silu_down_avx512(const uint16_t* x,
