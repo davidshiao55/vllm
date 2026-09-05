@@ -16,7 +16,7 @@ constexpr int64_t kTransposedKPanel = 64;
 constexpr int64_t kTransposedNPanel = 512;
 constexpr int64_t kTransposedPrefetch = 8;
 
-// Common cache traversal for both ISAs. Keep weight storage and GPU transfers
+// AVX-512 cache traversal. Keep weight storage and GPU transfers
 // contiguous and unchanged; only CPU traversal and FP32 scratch are different.
 // Each output visits K in increasing order, with a single final BF16 rounding.
 // Scratch belongs to the calling thread (the native task worker in production),
